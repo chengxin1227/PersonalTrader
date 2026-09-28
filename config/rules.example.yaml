@@ -1,0 +1,36 @@
+# Copy to config/rules.yaml and edit.
+# The monitor reloads this file on every poll, so you can change rules without restarting.
+
+poll_interval_seconds: 1
+scanner_interval_seconds: 1
+poll_when_closed: true
+feed: iex
+scanner_feed: iex
+stream_all_trades: false
+
+watchlist: []
+
+rules:
+  - id: premarket-smallcap-10pct
+    name: 盘前涨幅超10%，总市值不超过1亿美元，成交量超过1万
+    symbol: "*"
+    enabled: true
+    cooldown_minutes: 240
+    condition:
+      type: premarket_gain
+      value: 10
+      max_market_cap: 100000000
+      min_volume: 10000
+    slack_message: "{symbol} 盘前 {change_pct:+.1f}%  ${price:.2f}  量 {volume:,.0f}"
+
+  - id: afterhours-smallcap-10pct
+    name: 盘后涨幅超10%，总市值不超过1亿美元，成交量超过1万
+    symbol: "*"
+    enabled: true
+    cooldown_minutes: 240
+    condition:
+      type: afterhours_gain
+      value: 10
+      max_market_cap: 100000000
+      min_volume: 10000
+    slack_message: "{symbol} 盘后 {change_pct:+.1f}%  ${price:.2f}  量 {volume:,.0f}"

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.personaltrader.monitor</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/xin/Documents/Project/PersonalTrader</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/xin/Documents/Project/PersonalTrader/.venv/bin/python</string>
+    <string>-m</string>
+    <string>monitor</string>
+    <string>--source</string>
+    <string>moomoo</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/xin/Library/Logs/PersonalTrader/monitor.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/xin/Library/Logs/PersonalTrader/monitor.log</string>
+</dict>
+</plist>

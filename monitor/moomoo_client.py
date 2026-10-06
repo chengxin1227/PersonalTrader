@@ -14,8 +14,32 @@ from monitor.session import ET
 logger = logging.getLogger("personaltrader.moomoo")
 
 US_OPEN_STATES = {"MORNING", "AFTERNOON"}
+CIRCUIT_BREAKER_STATUSES = {
+    "RECOVERABLE_CIRCUIT_BREAKER",
+    "UNRECOVERABLE_CIRCUIT_BREAKER",
+}
 _PAGE_SIZE = 200
 _MAX_PAGES = 5
+
+
+def is_circuit_breaker(status: str | None) -> bool:
+    return status in CIRCUIT_BREAKER_STATUSES
+
+
+def is_upward_halt(quote: Quote) -> bool:
+    """A gain halt pauses at the session high. A drop halt pauses at the low."""
+    if not is_circuit_breaker(quote.sec_status):
+        return False
+    price = quote.price
+    high = quote.daily_high
+    if price is None or high is None or high <= 0 or price <= 0:
+        return False
+    if price < high * 0.999:
+        return False
+    low = quote.daily_low
+    if low is not None and low > 0 and high > low * 1.001 and price <= low * 1.001:
+        return False
+    return True
 
 
 def bare_symbol(code: str) -> str:
@@ -52,6 +76,35 @@ def is_test_name(name: str) -> bool:
     return "test symbol" in name.lower()
 
 
+def line_slope(values: list[float]) -> float:
+    count = len(values)
+    if count < 2:
+        return 0.0
+    x_mean = (count - 1) / 2
+    y_mean = sum(values) / count
+    numerator = 0.0
+    denominator = 0.0
+    for index, value in enumerate(values):
+        dx = index - x_mean
+        numerator += dx * (value - y_mean)
+        denominator += dx * dx
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator
+
+
+def regular_session_uptrend(bars: list[tuple[float, float]], *, minimum_bars: int = 20) -> bool:
+    """True when the regular-session path rises: fitted slope > 0 and close > open."""
+    if len(bars) < minimum_bars:
+        return False
+    open_px = bars[0][0]
+    close_px = bars[-1][1]
+    if open_px <= 0:
+        return False
+    closes = [close for _open_px, close in bars]
+    return line_slope(closes) > 0 and close_px > open_px
+
+
 def quote_from_snapshot(row: dict[str, Any]) -> Quote:
     symbol = bare_symbol(str(row.get("code") or ""))
     price = _float(row.get("last_price"))
@@ -60,6 +113,9 @@ def quote_from_snapshot(row: dict[str, Any]) -> Quote:
     if price is not None and prev_close:
         change_pct = ((price - prev_close) / prev_close) * 100
     volume = _float(row.get("volume"))
+    status = str(row.get("sec_status") or "").strip()
+    if status in {"", "N/A", "NONE"}:
+        status = ""
     return Quote(
         symbol=symbol,
         price=price,
@@ -71,6 +127,8 @@ def quote_from_snapshot(row: dict[str, Any]) -> Quote:
         prev_close=prev_close,
         change_pct=change_pct,
         volume=int(volume) if volume is not None else None,
+        company=str(row.get("name") or "").strip() or None,
+        sec_status=status or None,
         updated_at=_parse_et(row.get("update_time")),
     )
 
@@ -94,7 +152,9 @@ def quote_from_rank(
         price=_float(row.get(price_key)),
         prev_close=_float(row.get("close_price")),
         change_pct=_float(row.get(change_key)),
+        regular_change_pct=_float(row.get("change_ratio")),
         volume=int(volume) if volume is not None else None,
+        company=name.strip() or None,
     )
 
 
@@ -190,6 +250,22 @@ class MoomooClient:
     async def snapshots(self, symbols: list[str]) -> dict[str, Quote]:
         return await asyncio.to_thread(self._snapshots_sync, symbols)
 
+    def _after_hours_change_sync(self, symbol: str) -> float | None:
+        code = f"US.{symbol.strip().upper()}"
+        with self._lock:
+            rows = self._snapshot_rows(self._context(), [code])
+        if not rows:
+            return None
+        row = rows[0]
+        price = _float(row.get("after_price"))
+        change = _float(row.get("after_change_rate"))
+        if price is None or price <= 0 or change is None:
+            return None
+        return change
+
+    async def after_hours_change(self, symbol: str) -> float | None:
+        return await asyncio.to_thread(self._after_hours_change_sync, symbol)
+
     def _clock_sync(self) -> MarketClock:
         from moomoo import RET_OK
 
@@ -284,13 +360,136 @@ class MoomooClient:
         return found
 
     async def scan_afterhours(
-        self, min_change_pct: float, max_market_cap: float
+        self, min_change_pct: float, max_market_cap: float | None = None
     ) -> list[tuple[Quote, float | None]]:
-        logger.info(
-            "Moomoo after-hours rank, gain >= %.1f%%, total cap <= %.0f",
-            min_change_pct,
-            max_market_cap,
-        )
+        if max_market_cap is None:
+            logger.info("Moomoo after-hours rank, gain >= %.1f%%", min_change_pct)
+        else:
+            logger.info(
+                "Moomoo after-hours rank, gain >= %.1f%%, total cap <= %.0f",
+                min_change_pct,
+                max_market_cap,
+            )
         found = await asyncio.to_thread(self._scan_sync, min_change_pct, "afterhours", max_market_cap)
         logger.info("Moomoo after-hours names above threshold: %s", len(found))
+        return found
+
+    def _session_uptrend_sync(self, symbol: str, session_day: str) -> bool | None:
+        from moomoo import RET_OK, AuType, KLType, Session
+
+        code = f"US.{symbol.strip().upper()}"
+        with self._lock:
+            ret, data, _page = self._context().request_history_kline(
+                code,
+                start=f"{session_day} 09:30:00",
+                end=f"{session_day} 16:00:00",
+                ktype=KLType.K_5M,
+                autype=AuType.NONE,
+                max_count=120,
+                session=Session.RTH,
+            )
+        if ret != RET_OK:
+            message = str(data)
+            if "frequency" in message:
+                logger.warning("Kline quota hit while checking %s", symbol)
+                return None
+            logger.warning("Kline failed for %s: %s", symbol, message)
+            return False
+        if data is None or data.empty:
+            return False
+        start = datetime.strptime(f"{session_day} 09:30:00", "%Y-%m-%d %H:%M:%S")
+        end = datetime.strptime(f"{session_day} 16:00:00", "%Y-%m-%d %H:%M:%S")
+        bars: list[tuple[float, float]] = []
+        for row in data.to_dict(orient="records"):
+            raw_time = str(row.get("time_key") or "").split(".")[0]
+            try:
+                stamp = datetime.strptime(raw_time, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if stamp < start or stamp >= end:
+                continue
+            open_px = _float(row.get("open"))
+            close_px = _float(row.get("close"))
+            if open_px is None or close_px is None:
+                continue
+            bars.append((open_px, close_px))
+        return regular_session_uptrend(bars)
+
+    async def session_uptrend(self, symbol: str, session_day: str) -> bool | None:
+        return await asyncio.to_thread(self._session_uptrend_sync, symbol, session_day)
+
+    def _regular_gainers_sync(
+        self,
+        min_change_pct: float,
+        max_pages: int = 15,
+        max_market_cap: float | None = None,
+    ) -> list[Quote]:
+        from moomoo import RET_OK, AccumulateFilter, Market, SortDir, StockField
+
+        acc = AccumulateFilter()
+        acc.stock_field = StockField.CHANGE_RATE
+        acc.filter_min = min_change_pct
+        acc.is_no_filter = False
+        acc.sort = SortDir.DESCEND
+        acc.days = 1
+        filters = [acc]
+        if max_market_cap is not None:
+            from moomoo import SimpleFilter
+
+            cap = SimpleFilter()
+            cap.stock_field = StockField.MARKET_VAL
+            cap.filter_max = max_market_cap
+            cap.is_no_filter = False
+            filters.append(cap)
+        quotes: list[Quote] = []
+        begin = 0
+        with self._lock:
+            context = self._context()
+            for _page in range(max_pages):
+                ret, data = context.get_stock_filter(Market.US, filters, begin=begin, num=_PAGE_SIZE)
+                if ret != RET_OK:
+                    raise RuntimeError(f"Moomoo regular-session screen failed: {data}")
+                last_page, all_count, rows = data
+                if not rows:
+                    break
+                stop = False
+                for item in rows:
+                    change = _float(item.__dict__.get(("change_rate", 1)))
+                    if change is None:
+                        continue
+                    if change <= min_change_pct:
+                        stop = True
+                        break
+                    name = str(getattr(item, "stock_name", "") or "")
+                    if is_test_name(name):
+                        continue
+                    symbol = bare_symbol(str(getattr(item, "stock_code", "") or ""))
+                    if not symbol:
+                        continue
+                    quotes.append(
+                        Quote(symbol=symbol, company=name.strip() or None, change_pct=change)
+                    )
+                begin += len(rows)
+                if stop or last_page or begin >= int(all_count):
+                    break
+        return quotes
+
+    async def regular_gainers(
+        self,
+        min_change_pct: float,
+        max_pages: int = 15,
+        max_market_cap: float | None = None,
+    ) -> list[Quote]:
+        if max_market_cap is None:
+            logger.info("Moomoo regular-session screen, gain > %.1f%%", min_change_pct)
+        else:
+            logger.info(
+                "Moomoo regular-session screen, gain > %.1f%%, total cap <= %.0f",
+                min_change_pct,
+                max_market_cap,
+            )
+        found = await asyncio.to_thread(
+            self._regular_gainers_sync, min_change_pct, max_pages, max_market_cap
+        )
+        logger.info("Moomoo regular-session names above threshold: %s", len(found))
         return found

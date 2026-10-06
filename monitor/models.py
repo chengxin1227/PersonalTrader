@@ -22,6 +22,13 @@ class Condition(BaseModel):
     value: float
     max_market_cap: Optional[float] = None
     min_volume: Optional[float] = None
+    min_regular_change: Optional[float] = None
+    min_regular_volume: Optional[float] = None
+    min_prior_change: Optional[float] = None
+    prior_change_lag_minutes: int = Field(default=5, ge=0)
+    require_uptrend: bool = False
+    require_circuit_breaker: bool = False
+    skip_market_cap: bool = False
 
 
 class Rule(BaseModel):
@@ -92,6 +99,7 @@ class RulesConfig(BaseModel):
 
 class Quote(BaseModel):
     symbol: str
+    company: Optional[str] = None
     price: Optional[float] = None
     bid: Optional[float] = None
     ask: Optional[float] = None
@@ -100,7 +108,14 @@ class Quote(BaseModel):
     daily_low: Optional[float] = None
     prev_close: Optional[float] = None
     change_pct: Optional[float] = None
+    regular_change_pct: Optional[float] = None
+    after_hours_change_pct: Optional[float] = None
     volume: Optional[int] = None
+    regular_volume: Optional[int] = None
+    session_uptrend: Optional[bool] = None
+    prior_session_spike: Optional[bool] = None
+    session_circuit_breaker: Optional[bool] = None
+    sec_status: Optional[str] = None
     updated_at: Optional[datetime] = None
     trade_at: Optional[datetime] = None
     quote_at: Optional[datetime] = None
@@ -121,6 +136,7 @@ class Alert(BaseModel):
     message: str
     price: Optional[float] = None
     change_pct: Optional[float] = None
+    url: Optional[str] = None
     fired_at: datetime
 
 

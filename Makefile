@@ -1,11 +1,11 @@
-.PHONY: setup monitor once test-slack test agent agent-stop
+.PHONY: setup monitor once test-slack test-pushover test agent agent-stop
 
 setup:
 	python3 -m venv .venv
 	.venv/bin/pip install -r requirements.txt
 	@if [ ! -f .env ]; then cp .env.example .env; fi
 	@if [ ! -f config/rules.yaml ]; then cp config/rules.example.yaml config/rules.yaml; fi
-	@echo "Fill in ALPACA_API_KEY, ALPACA_API_SECRET, and SLACK_WEBHOOK_URL in .env"
+	@echo "Fill in API keys in .env. Slack or Pushover is required for alerts."
 
 monitor:
 	.venv/bin/python -m monitor
@@ -18,6 +18,9 @@ once-moomoo:
 
 test-slack:
 	.venv/bin/python -m monitor --test-slack
+
+test-pushover:
+	.venv/bin/python -m monitor --test-pushover
 
 test:
 	.venv/bin/python -m pytest tests

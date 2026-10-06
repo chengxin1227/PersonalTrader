@@ -24,6 +24,25 @@ def save_rules(path: Path, config: RulesConfig) -> None:
         yaml.safe_dump(payload, handle, sort_keys=False)
 
 
+def _reject_without_earlier_spike(rule: Rule, quote: Quote, session_name: str) -> RuleEvaluation | None:
+    minimum = rule.condition.min_prior_change
+    if minimum is None:
+        return None
+    if quote.change_pct is None or quote.change_pct <= rule.condition.value:
+        shown = "n/a" if quote.change_pct is None else f"{quote.change_pct:.2f}%"
+        return RuleEvaluation(
+            matched=False,
+            reason=f"{session_name} {shown} <= {rule.condition.value:.2f}%",
+        )
+    if quote.prior_session_spike is not True:
+        lag = rule.condition.prior_change_lag_minutes
+        return RuleEvaluation(
+            matched=False,
+            reason=f"no {session_name} gain > {minimum:.2f}% before the last {lag}m",
+        )
+    return None
+
+
 def _reject_low_volume(rule: Rule, quote: Quote) -> RuleEvaluation | None:
     minimum = rule.condition.min_volume
     if minimum is None:
@@ -47,7 +66,10 @@ def evaluate_premarket_scan(
         return RuleEvaluation(matched=False, reason="not pre-market")
     if quote.change_pct is None:
         return RuleEvaluation(matched=False, reason="no pre-market change")
-    if quote.change_pct < rule.condition.value:
+    prior = _reject_without_earlier_spike(rule, quote, "pre-market")
+    if prior is not None:
+        return prior
+    if rule.condition.min_prior_change is None and quote.change_pct < rule.condition.value:
         return RuleEvaluation(
             matched=False,
             reason=f"change {quote.change_pct:.2f}% < {rule.condition.value:.2f}%",
@@ -92,14 +114,59 @@ def evaluate_afterhours_scan(
         return RuleEvaluation(matched=False, reason="not after-hours")
     if quote.change_pct is None:
         return RuleEvaluation(matched=False, reason="no after-hours change")
-    if quote.change_pct < rule.condition.value:
+    prior = _reject_without_earlier_spike(rule, quote, "after-hours")
+    if prior is not None:
+        return prior
+    regular_min = rule.condition.min_regular_change
+    if rule.condition.min_prior_change is None and regular_min is None:
+        if quote.change_pct < rule.condition.value:
+            return RuleEvaluation(
+                matched=False,
+                reason=f"change {quote.change_pct:.2f}% < {rule.condition.value:.2f}%",
+            )
+    elif rule.condition.min_prior_change is None and quote.change_pct <= rule.condition.value:
         return RuleEvaluation(
             matched=False,
-            reason=f"change {quote.change_pct:.2f}% < {rule.condition.value:.2f}%",
+            reason=f"after-hours {quote.change_pct:.2f}% <= {rule.condition.value:.2f}%",
         )
+    if regular_min is not None:
+        regular = quote.regular_change_pct
+        if regular is None or regular <= regular_min:
+            shown = "n/a" if regular is None else f"{regular:.2f}%"
+            return RuleEvaluation(
+                matched=False,
+                reason=f"regular change {shown} <= {regular_min:.2f}%",
+            )
     low_volume = _reject_low_volume(rule, quote)
     if low_volume is not None:
         return low_volume
+    regular_volume_min = rule.condition.min_regular_volume
+    if regular_volume_min is not None:
+        regular_volume = quote.regular_volume
+        if regular_volume is None or regular_volume <= regular_volume_min:
+            shown = regular_volume if regular_volume is not None else 0
+            return RuleEvaluation(
+                matched=False,
+                reason=f"regular volume {shown:g} <= {regular_volume_min:g}",
+            )
+    if rule.condition.require_uptrend and quote.session_uptrend is not True:
+        return RuleEvaluation(matched=False, reason="regular session trend is not up")
+    if rule.condition.require_circuit_breaker and quote.session_circuit_breaker is not True:
+        return RuleEvaluation(matched=False, reason="no regular-session circuit breaker")
+    if rule.condition.skip_market_cap or (
+        rule.condition.require_circuit_breaker and rule.condition.max_market_cap is None
+    ):
+        trend = " and regular-session trend up" if rule.condition.require_uptrend else ""
+        breaker = (
+            " and regular-session circuit breaker" if rule.condition.require_circuit_breaker else ""
+        )
+        return RuleEvaluation(
+            matched=True,
+            reason=(
+                f"after-hours {quote.change_pct:.2f}% > {rule.condition.value:.2f}%"
+                f"{trend}{breaker}"
+            ),
+        )
     max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
     if market_cap is None:
         if cap_filtered:
@@ -192,6 +259,52 @@ def evaluate_rule(
     return RuleEvaluation(matched=False, reason="unknown condition")
 
 
+def format_price(price: float) -> str:
+    if price >= 1:
+        return f"${price:,.2f}"
+    text = f"{price:.4f}".rstrip("0").rstrip(".")
+    return f"${text}"
+
+
+def format_volume(volume: float) -> str:
+    number = int(volume)
+    if number >= 100_000_000:
+        return f"{number / 100_000_000:.2f}亿"
+    if number >= 10_000:
+        wan = number / 10_000
+        if abs(wan - round(wan)) < 0.05:
+            return f"{wan:.0f}万"
+        return f"{wan:.1f}万"
+    return f"{number:,}"
+
+
+_MOVE_LABELS = ("盘后涨幅",)
+FIELD_GAP = "\u00a0" * 4
+
+
+def split_alert_name(prefix: str) -> tuple[str, str]:
+    """Keep the company name separate from a session label before the percent."""
+    text = prefix.rstrip()
+    for label in _MOVE_LABELS:
+        if text.endswith(label):
+            name = text[: -len(label)].strip()
+            if name:
+                return name, label
+    return text.strip(), ""
+
+
+def _move_text(rule: Rule, quote: Quote) -> str:
+    if rule.condition.type is ConditionType.AFTERHOURS_GAIN:
+        value = quote.regular_change_pct
+    elif rule.condition.type is ConditionType.PREMARKET_GAIN:
+        value = quote.after_hours_change_pct
+    else:
+        return ""
+    if value is None:
+        return ""
+    return f"{value:+.1f}%{FIELD_GAP}"
+
+
 def render_message(rule: Rule, quote: Quote, extra: dict | None = None) -> str:
     price = quote.price or 0.0
     change = quote.change_pct if quote.change_pct is not None else 0.0
@@ -206,11 +319,20 @@ def render_message(rule: Rule, quote: Quote, extra: dict | None = None) -> str:
         "market_cap": 0.0,
         "market_cap_m": 0.0,
         "volume": quote.volume or 0,
+        "stock_name": (quote.company or "").strip() or (quote.symbol or rule.symbol),
     }
     if extra:
         values.update(extra)
+    values["field_gap"] = FIELD_GAP
+    values["move_text"] = _move_text(rule, quote)
+    values["price_text"] = format_price(float(values["price"]))
+    values["volume_text"] = format_volume(float(values["volume"]))
     template = rule.slack_message or "{name}: {symbol} is ${price:.2f} ({change_pct:+.2f}% today)"
     try:
-        return template.format(**values)
+        body = template.format(**values)
     except (KeyError, ValueError):
-        return f"{rule.name}: {values['symbol']} is ${price:.2f}"
+        body = f"{rule.name}: {values['symbol']} is ${price:.2f}"
+    reason = rule.name.strip()
+    if reason and reason not in body:
+        return f"{body}\n{reason}"
+    return body

@@ -8,9 +8,10 @@ from typing import Optional
 from monitor.alpaca import AlpacaClient
 from monitor.config import Settings
 from monitor.marketcap import MarketCapClient
-from monitor.moomoo_client import MoomooClient
+from monitor.moomoo_client import MoomooClient, is_upward_halt
 from monitor.models import Alert, ConditionType, MonitorStatus, Quote, Rule, RulesConfig
 from monitor.quotes import apply_quote, apply_trade, previous_price
+from monitor.pushover import PushoverClient
 from monitor.rules import (
     evaluate_afterhours_scan,
     evaluate_premarket_scan,
@@ -23,17 +24,40 @@ from monitor.session import (
     extended_session_open,
     is_afterhours,
     is_premarket,
+    is_regular_session,
     is_trading_day,
     now_et,
     premarket_mark,
     seconds_until_extended_open,
 )
 from monitor.slack import SlackClient
+from monitor.quote_link import quote_url
 from monitor.store import Store
 from monitor.stream import AlpacaStream, StreamEvent
 from monitor.universe import UniverseCache
 
 logger = logging.getLogger("personaltrader.monitor")
+
+
+def _is_trend_rule(rule: Rule) -> bool:
+    return rule.condition.skip_market_cap or rule.condition.require_uptrend
+
+
+def _is_spike_rule(rule: Rule) -> bool:
+    return rule.condition.min_prior_change is not None
+
+
+def _is_breaker_rule(rule: Rule) -> bool:
+    return rule.condition.require_circuit_breaker
+
+
+def opend_is_down(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if "network interruption" in text:
+        return True
+    return "moomoo" in text and any(
+        part in text for part in ("disconnect", "interruption", "connect", "timeout", "timed out")
+    )
 
 
 class MonitorEngine:
@@ -45,11 +69,13 @@ class MonitorEngine:
         store: Store,
         verbose: bool = False,
         moomoo: MoomooClient | None = None,
+        pushover: PushoverClient | None = None,
     ) -> None:
         self.settings = settings
         self.alpaca = alpaca
         self.moomoo = moomoo
         self.slack = slack
+        self.pushover = pushover
         self.store = store
         self.verbose = verbose
         self.quotes: dict[str, Quote] = {}
@@ -69,6 +95,14 @@ class MonitorEngine:
         self._cached_config: Optional[RulesConfig] = None
         self._last_market_log: str | None = None
         self._scan_log: dict[str, tuple[tuple[str, ...], datetime]] = {}
+        self._uptrend_cache: dict[tuple[str, str], bool] = {}
+        self._kline_blocked_until: Optional[datetime] = None
+        self._trend_moomoo = MoomooClient(settings) if moomoo is not None else None
+        self._trend_loop_running = False
+        self._spike_loop_running = False
+        self._regular_loop_running = False
+        self._opend_down_notified = False
+        self._opend_ok_at: Optional[datetime] = None
 
     def load_config(self, force: bool = False) -> RulesConfig:
         now = datetime.now(timezone.utc)
@@ -171,8 +205,44 @@ class MonitorEngine:
             fired.append(alert)
 
         if self._should_scan(config):
-            for rule in config.rules:
-                if not rule.enabled or not rule.is_scanner or not self._rule_session_open(rule):
+            open_rules = [
+                rule
+                for rule in config.rules
+                if rule.enabled and rule.is_scanner and self._rule_session_open(rule)
+            ]
+            afterhours_rules = [
+                rule
+                for rule in open_rules
+                if self.moomoo is not None and rule.condition.type is ConditionType.AFTERHOURS_GAIN
+            ]
+            trend_rules = [rule for rule in afterhours_rules if _is_trend_rule(rule)]
+            ranked_rules = [
+                rule
+                for rule in afterhours_rules
+                if not _is_trend_rule(rule)
+                and not _is_spike_rule(rule)
+                and not _is_breaker_rule(rule)
+            ]
+            if ranked_rules:
+                scanned, scan_error = await self._run_afterhours_rules(ranked_rules, state)
+                fired.extend(scanned)
+                slack_error = slack_error or scan_error
+            if trend_rules and not self._trend_loop_running:
+                for rule in trend_rules:
+                    matched = await self._match_trend_afterhours(rule)
+                    fired.extend(await self._emit_trend_matches(rule, matched, state))
+            spike_rules = [rule for rule in open_rules if _is_spike_rule(rule)]
+            if spike_rules and not self._spike_loop_running:
+                for rule in spike_rules:
+                    matched = await self._match_spike_rule(rule)
+                    fired.extend(await self._emit_trend_matches(rule, matched, state))
+            breaker_rules = [rule for rule in open_rules if _is_breaker_rule(rule)]
+            if breaker_rules and not self._regular_loop_running:
+                for rule in breaker_rules:
+                    matched = await self._match_breaker_afterhours(rule)
+                    fired.extend(await self._emit_trend_matches(rule, matched, state))
+            for rule in open_rules:
+                if rule in afterhours_rules or _is_spike_rule(rule) or _is_breaker_rule(rule):
                     continue
                 scanned, scan_error = await self._run_scanner(rule, config, state)
                 fired.extend(scanned)
@@ -184,6 +254,8 @@ class MonitorEngine:
         self.store.save_state(state)
         self.last_poll_at = datetime.now(timezone.utc)
         self.last_error = slack_error
+        if self.moomoo is not None:
+            self._note_opend_ok()
         return fired
 
     async def run_forever(self, transport: str = "rest") -> None:
@@ -194,8 +266,31 @@ class MonitorEngine:
 
     async def _run_rest_loop(self) -> None:
         self._running = True
+        self._trend_loop_running = self._trend_moomoo is not None
+        self._spike_loop_running = self._trend_moomoo is not None
+        self._regular_loop_running = self._trend_moomoo is not None
+        trend_task = asyncio.create_task(self._trend_scan_loop()) if self._trend_loop_running else None
+        spike_task = asyncio.create_task(self._spike_scan_loop()) if self._spike_loop_running else None
+        regular_task = (
+            asyncio.create_task(self._regular_scan_loop()) if self._regular_loop_running else None
+        )
         logger.info("Monitor loop started (REST poll)")
         idle_logged = False
+        try:
+            await self._rest_poll_loop(idle_logged)
+        finally:
+            self._trend_loop_running = False
+            self._spike_loop_running = False
+            self._regular_loop_running = False
+            tasks = [
+                task for task in (trend_task, spike_task, regular_task) if task is not None
+            ]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _rest_poll_loop(self, idle_logged: bool) -> None:
         while self._running:
             interval = 15
             try:
@@ -223,7 +318,134 @@ class MonitorEngine:
                     await asyncio.sleep(30)
                     continue
                 logger.exception("Poll failed: %s", exc)
+                await self._note_opend_failure(exc)
             await asyncio.sleep(interval)
+
+    async def _trend_scan_loop(self) -> None:
+        logger.info("Trend rules scan on a separate OpenD connection")
+        while self._running:
+            interval = 1
+            try:
+                config = self.load_config()
+                interval = config.poll_interval_seconds
+                if not is_afterhours():
+                    await asyncio.sleep(30)
+                    continue
+                rules = [
+                    rule
+                    for rule in config.rules
+                    if rule.enabled and _is_trend_rule(rule) and self._rule_session_open(rule)
+                ]
+                if not rules:
+                    await asyncio.sleep(interval)
+                    continue
+                for rule in rules:
+                    matched = await self._match_trend_afterhours(rule)
+                    self._note_opend_ok()
+                    if not matched:
+                        continue
+                    async with self._lock:
+                        state = self.store.load_state()
+                        await self._emit_trend_matches(rule, matched, state)
+                        self.store.save_state(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Trend scan failed: %s", exc)
+                await self._note_opend_failure(exc)
+            await asyncio.sleep(interval)
+
+    async def _spike_scan_loop(self) -> None:
+        logger.info("Pullback rules scan on a separate OpenD connection")
+        while self._running:
+            interval = 1
+            try:
+                config = self.load_config()
+                interval = config.poll_interval_seconds
+                if not extended_session_open():
+                    await asyncio.sleep(30)
+                    continue
+                rules = [
+                    rule
+                    for rule in config.rules
+                    if rule.enabled and _is_spike_rule(rule) and self._rule_session_open(rule)
+                ]
+                if not rules:
+                    await asyncio.sleep(interval)
+                    continue
+                for rule in rules:
+                    matched = await self._match_spike_rule(rule)
+                    self._note_opend_ok()
+                    if not matched:
+                        continue
+                    async with self._lock:
+                        state = self.store.load_state()
+                        await self._emit_trend_matches(rule, matched, state)
+                        self.store.save_state(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Pullback scan failed: %s", exc)
+                await self._note_opend_failure(exc)
+            await asyncio.sleep(interval)
+
+    async def _regular_scan_loop(self) -> None:
+        logger.info("Circuit breaker watch on a separate OpenD connection")
+        while self._running:
+            try:
+                config = self.load_config()
+                rules = [
+                    rule for rule in config.rules if rule.enabled and _is_breaker_rule(rule)
+                ]
+                if not rules:
+                    await asyncio.sleep(30)
+                    continue
+                if is_regular_session():
+                    for rule in rules:
+                        await self._record_circuit_breakers(rule)
+                        self._note_opend_ok()
+                elif is_afterhours():
+                    for rule in rules:
+                        matched = await self._match_breaker_afterhours(rule)
+                        self._note_opend_ok()
+                        if not matched:
+                            continue
+                        async with self._lock:
+                            state = self.store.load_state()
+                            await self._emit_trend_matches(rule, matched, state)
+                            self.store.save_state(state)
+                else:
+                    await asyncio.sleep(30)
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Circuit breaker scan failed: %s", exc)
+                await self._note_opend_failure(exc)
+            await asyncio.sleep(10)
+
+    def _note_opend_ok(self) -> None:
+        self._opend_ok_at = datetime.now(timezone.utc)
+        self._opend_down_notified = False
+
+    async def _note_opend_failure(self, exc: BaseException) -> None:
+        if not opend_is_down(exc) or self._opend_down_notified:
+            return
+        if self._opend_ok_at is not None:
+            quiet = (datetime.now(timezone.utc) - self._opend_ok_at).total_seconds()
+            if quiet < 15:
+                return
+        self._opend_down_notified = True
+        if self.pushover is None:
+            logger.warning("OpenD disconnected")
+            return
+        try:
+            await self.pushover.send_text(
+                f"OpenD 行情断开，扫描已暂停。{now_et().strftime('%H:%M')} ET",
+                title="OpenD 断开",
+            )
+        except Exception as send_exc:  # noqa: BLE001
+            logger.warning("Could not send OpenD disconnect alert: %s", send_exc)
 
     async def _run_stream_loop(self) -> None:
         self._running = True
@@ -527,6 +749,288 @@ class MonitorEngine:
 
         return fired, slack_error
 
+    async def _run_afterhours_rules(
+        self,
+        rules: list[Rule],
+        state: dict,
+    ) -> tuple[list[Alert], str | None]:
+        if self.moomoo is None or not rules:
+            return [], None
+        caps = {rule.condition.max_market_cap or 100_000_000 for rule in rules}
+        if len(caps) > 1:
+            fired: list[Alert] = []
+            slack_error: str | None = None
+            for rule in rules:
+                scanned, scan_error = await self._run_moomoo_scanner(rule, state)
+                fired.extend(scanned)
+                slack_error = slack_error or scan_error
+            return fired, slack_error
+        found = await self.moomoo.scan_afterhours(min(rule.condition.value for rule in rules), caps.pop())
+        fired = []
+        slack_error = None
+        for rule in rules:
+            matched: list[tuple[Quote, float | None]] = []
+            for quote, cap in found:
+                evaluation = evaluate_afterhours_scan(
+                    rule, quote, market_cap=cap, in_afterhours=True, cap_filtered=True
+                )
+                if self.verbose:
+                    logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
+                if evaluation.matched:
+                    matched.append((quote, cap))
+            signature = tuple(sorted(quote.symbol for quote, _cap in matched))
+            now = datetime.now(timezone.utc)
+            previous = self._scan_log.get(rule.id)
+            if (
+                previous is None
+                or previous[0] != signature
+                or (now - previous[1]).total_seconds() >= 60
+            ):
+                logger.info("After-hours matches for %s: %s", rule.id, len(matched))
+                self._scan_log[rule.id] = (signature, now)
+            for quote, cap in matched:
+                extra = None
+                if cap is not None:
+                    extra = {"market_cap": cap, "market_cap_m": cap / 1_000_000}
+                alert = await self._fire_alert(
+                    rule,
+                    quote,
+                    state,
+                    extra=extra,
+                    cooldown_key=f"{rule.id}:{quote.symbol}",
+                )
+                if alert is not None:
+                    fired.append(alert)
+        return fired, slack_error
+
+    async def _match_trend_afterhours(self, rule: Rule) -> list[Quote]:
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return []
+        max_cap = None if rule.condition.skip_market_cap else (rule.condition.max_market_cap or 100_000_000)
+        found = await client.scan_afterhours(rule.condition.value, max_cap)
+        candidates: list[Quote] = []
+        regular_min = rule.condition.min_regular_change
+        volume_min = rule.condition.min_volume
+        for quote, _cap in found:
+            if quote.change_pct is None or quote.change_pct <= rule.condition.value:
+                continue
+            if regular_min is not None and (
+                quote.regular_change_pct is None or quote.regular_change_pct <= regular_min
+            ):
+                continue
+            if volume_min is not None and (quote.volume is None or quote.volume <= volume_min):
+                continue
+            candidates.append(quote)
+        if rule.condition.min_regular_volume is not None and candidates:
+            snapshots = await client.snapshots([quote.symbol for quote in candidates])
+            for quote in candidates:
+                snap = snapshots.get(quote.symbol)
+                if snap is not None and snap.volume is not None:
+                    quote.regular_volume = snap.volume
+        if rule.condition.require_uptrend:
+            await self._fill_session_uptrends(candidates, rule, client)
+        matched: list[Quote] = []
+        for quote in candidates:
+            evaluation = evaluate_afterhours_scan(
+                rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+            )
+            if self.verbose:
+                logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
+            if evaluation.matched:
+                matched.append(quote)
+        signature = tuple(sorted(quote.symbol for quote in matched))
+        now = datetime.now(timezone.utc)
+        previous = self._scan_log.get(rule.id)
+        if (
+            previous is None
+            or previous[0] != signature
+            or (now - previous[1]).total_seconds() >= 60
+        ):
+            logger.info("After-hours matches for %s: %s", rule.id, len(matched))
+            self._scan_log[rule.id] = (signature, now)
+        return matched
+
+    async def _match_spike_rule(self, rule: Rule) -> list[Quote]:
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return []
+        afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
+        max_cap = rule.condition.max_market_cap or 100_000_000
+        if afterhours:
+            found = await client.scan_afterhours(rule.condition.value, max_cap)
+        else:
+            found = await client.scan_premarket(rule.condition.value, max_cap)
+        candidates: list[Quote] = []
+        volume_min = rule.condition.min_volume
+        for quote, _cap in found:
+            if quote.change_pct is None or quote.change_pct <= rule.condition.value:
+                continue
+            if volume_min is not None and (quote.volume is None or quote.volume <= volume_min):
+                continue
+            candidates.append(quote)
+        session = "afterhours" if afterhours else "premarket"
+        self._mark_observed_spikes(found, rule, session)
+        self._apply_observed_spikes(candidates, rule, session)
+        matched: list[Quote] = []
+        for quote in candidates:
+            if afterhours:
+                evaluation = evaluate_afterhours_scan(
+                    rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+                )
+            else:
+                evaluation = evaluate_premarket_scan(
+                    rule, quote, market_cap=None, in_premarket=True, cap_filtered=True
+                )
+            if self.verbose:
+                logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
+            if evaluation.matched:
+                matched.append(quote)
+        signature = tuple(sorted(quote.symbol for quote in matched))
+        now = datetime.now(timezone.utc)
+        previous = self._scan_log.get(rule.id)
+        if (
+            previous is None
+            or previous[0] != signature
+            or (now - previous[1]).total_seconds() >= 60
+        ):
+            session_name = "After-hours" if afterhours else "Pre-market"
+            logger.info("%s pullback matches for %s: %s", session_name, rule.id, len(matched))
+            self._scan_log[rule.id] = (signature, now)
+        return matched
+
+    async def _record_circuit_breakers(self, rule: Rule) -> None:
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return
+        found = await client.regular_gainers(20, max_market_cap=rule.condition.max_market_cap)
+        symbols = [quote.symbol for quote in found]
+        snaps: dict[str, Quote] = {}
+        for start in range(0, len(symbols), 200):
+            snaps.update(await client.snapshots(symbols[start : start + 200]))
+        day = now_et().date().isoformat()
+        seen_at = datetime.now(timezone.utc)
+        noted: list[str] = []
+        for symbol, snap in snaps.items():
+            if not is_upward_halt(snap):
+                continue
+            if self.store.spike_seen_at(day, "upward_halt", symbol) is None:
+                change = snap.change_pct
+                shown = f"{change:+.1f}%" if change is not None else "n/a"
+                noted.append(f"{symbol} {shown}")
+            self.store.note_spike(day, "upward_halt", symbol, seen_at)
+        signature = tuple(sorted(noted))
+        now = datetime.now(timezone.utc)
+        previous = self._scan_log.get(f"{rule.id}:halt")
+        if noted and (previous is None or previous[0] != signature):
+            logger.info("Noted upward halts: %s", ", ".join(noted))
+            self._scan_log[f"{rule.id}:halt"] = (signature, now)
+
+    async def _match_breaker_afterhours(self, rule: Rule) -> list[Quote]:
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return []
+        found = await client.scan_afterhours(rule.condition.value, rule.condition.max_market_cap)
+        day = now_et().date().isoformat()
+        regular_min = rule.condition.min_regular_change
+        matched: list[Quote] = []
+        for quote, _cap in found:
+            if quote.change_pct is None or quote.change_pct <= rule.condition.value:
+                continue
+            if regular_min is not None and (
+                quote.regular_change_pct is None or quote.regular_change_pct <= regular_min
+            ):
+                continue
+            quote.session_circuit_breaker = (
+                self.store.spike_seen_at(day, "upward_halt", quote.symbol) is not None
+            )
+            evaluation = evaluate_afterhours_scan(
+                rule,
+                quote,
+                market_cap=None,
+                in_afterhours=True,
+                cap_filtered=rule.condition.max_market_cap is not None,
+            )
+            if self.verbose:
+                logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
+            if evaluation.matched:
+                matched.append(quote)
+        signature = tuple(sorted(quote.symbol for quote in matched))
+        now = datetime.now(timezone.utc)
+        previous = self._scan_log.get(rule.id)
+        if (
+            previous is None
+            or previous[0] != signature
+            or (now - previous[1]).total_seconds() >= 60
+        ):
+            logger.info("After-hours circuit breaker matches for %s: %s", rule.id, len(matched))
+            self._scan_log[rule.id] = (signature, now)
+        return matched
+
+    def _mark_observed_spikes(
+        self,
+        found: list[tuple[Quote, float | None]],
+        rule: Rule,
+        session: str,
+    ) -> None:
+        minimum = rule.condition.min_prior_change
+        if minimum is None:
+            return
+        day = now_et().date().isoformat()
+        seen_at = datetime.now(timezone.utc)
+        for quote, _cap in found:
+            if quote.change_pct is None or quote.change_pct <= minimum:
+                continue
+            self.store.note_spike(day, session, quote.symbol, seen_at)
+
+    def _apply_observed_spikes(self, quotes: list[Quote], rule: Rule, session: str) -> None:
+        minimum = rule.condition.min_prior_change
+        if minimum is None:
+            return
+        day = now_et().date().isoformat()
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=rule.condition.prior_change_lag_minutes)
+        for quote in quotes:
+            seen = self.store.spike_seen_at(day, session, quote.symbol)
+            quote.prior_session_spike = seen is not None and seen <= cutoff
+
+    async def _emit_trend_matches(self, rule: Rule, quotes: list[Quote], state: dict) -> list[Alert]:
+        fired: list[Alert] = []
+        for quote in quotes:
+            alert = await self._fire_alert(
+                rule,
+                quote,
+                state,
+                extra=None,
+                cooldown_key=f"{rule.id}:{quote.symbol}",
+            )
+            if alert is not None:
+                fired.append(alert)
+        return fired
+
+    async def _fill_session_uptrends(
+        self, quotes: list[Quote], rule: Rule, client: MoomooClient
+    ) -> None:
+        minimum = rule.condition.min_regular_volume
+        session_day = now_et().date().isoformat()
+        now = datetime.now(timezone.utc)
+        for quote in quotes:
+            if minimum is not None and (
+                quote.regular_volume is None or quote.regular_volume <= minimum
+            ):
+                continue
+            cached = self._uptrend_cache.get((session_day, quote.symbol))
+            if cached is not None:
+                quote.session_uptrend = cached
+                continue
+            if self._kline_blocked_until is not None and now < self._kline_blocked_until:
+                continue
+            result = await client.session_uptrend(quote.symbol, session_day)
+            if result is None:
+                self._kline_blocked_until = datetime.now(timezone.utc) + timedelta(seconds=31)
+                break
+            self._uptrend_cache[(session_day, quote.symbol)] = result
+            quote.session_uptrend = result
+
     async def _run_moomoo_scanner(
         self,
         rule: Rule,
@@ -593,7 +1097,7 @@ class MonitorEngine:
             if not rule.enabled or not rule.is_scanner or self._rule_session_open(rule):
                 continue
             afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
-            max_cap = rule.condition.max_market_cap or 100_000_000
+            max_cap = None if rule.condition.skip_market_cap else (rule.condition.max_market_cap or 100_000_000)
             if afterhours:
                 found = await self.moomoo.scan_afterhours(rule.condition.value, max_cap)
             else:
@@ -650,6 +1154,11 @@ class MonitorEngine:
         if self.store.in_cooldown(state, key, rule.cooldown_minutes):
             logger.info("Rule %s matched %s but is in cooldown", rule.id, quote.symbol)
             return None
+        if rule.condition.type is ConditionType.PREMARKET_GAIN and self.moomoo is not None:
+            try:
+                quote.after_hours_change_pct = await self.moomoo.after_hours_change(quote.symbol)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("After-hours change unavailable for %s: %s", quote.symbol, exc)
         alert = self.store.new_alert(
             rule_id=rule.id,
             rule_name=rule.name,
@@ -658,11 +1167,8 @@ class MonitorEngine:
             price=quote.price,
             change_pct=quote.change_pct,
         )
-        try:
-            await self.slack.send_alert(alert)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Slack send failed for %s: %s", rule.id, exc)
-            self.last_error = f"Slack send failed: {exc}"
+        alert.url = quote_url(quote.symbol)
+        await self._deliver(alert)
         self.store.append_alert(alert)
         self.store.mark_fired(state, key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, alert.message)
@@ -684,6 +1190,8 @@ class MonitorEngine:
 
     async def close(self) -> None:
         await self._marketcap.close()
+        if self._trend_moomoo is not None:
+            await self._trend_moomoo.close()
         if self.moomoo is not None:
             await self.moomoo.close()
 
@@ -712,10 +1220,28 @@ class MonitorEngine:
             price=quote.price,
             change_pct=quote.change_pct,
         )
-        await self.slack.send_alert(alert)
+        alert.url = quote_url(symbol)
+        await self._deliver(alert)
         self.store.append_alert(alert)
         logger.info("Sent test alert for %s at %s", symbol, quote.price)
         return alert
+
+    async def _deliver(self, alert: Alert) -> None:
+        errors: list[str] = []
+        if self.settings.slack_configured:
+            try:
+                await self.slack.send_alert(alert)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Slack send failed for %s: %s", alert.rule_id, exc)
+                errors.append(f"Slack send failed: {exc}")
+        if self.pushover is not None and self.settings.pushover_configured:
+            try:
+                await self.pushover.send_alert(alert)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Pushover send failed for %s: %s", alert.rule_id, exc)
+                errors.append(f"Pushover send failed: {exc}")
+        if errors:
+            self.last_error = "; ".join(errors)
 
     def _log_market(self) -> None:
         if self.market is None:

@@ -12,6 +12,7 @@ from monitor.alpaca import AlpacaClient
 from monitor.config import Settings, get_settings
 from monitor.engine import MonitorEngine
 from monitor.models import Alert, MonitorStatus, Quote, Rule, RulesConfig
+from monitor.pushover import PushoverClient
 from monitor.slack import SlackClient
 from monitor.store import Store
 
@@ -25,7 +26,8 @@ async def lifespan(app: FastAPI):
     store = Store(settings.data_dir)
     alpaca = AlpacaClient(settings)
     slack = SlackClient(settings)
-    monitor = MonitorEngine(settings, alpaca, slack, store)
+    pushover = PushoverClient(settings)
+    monitor = MonitorEngine(settings, alpaca, slack, store, pushover=pushover)
     app.state.engine = monitor
     global engine
     engine = monitor
@@ -40,6 +42,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(task, return_exceptions=True)
         await alpaca.close()
         await slack.close()
+        await pushover.close()
         engine = None
 
 

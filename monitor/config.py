@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     alpaca_trade_url: str = "https://paper-api.alpaca.markets"
     alpaca_feed: str = "iex"
     slack_webhook_url: str = ""
+    pushover_token: str = ""
+    pushover_user: str = ""
     moomoo_host: str = "127.0.0.1"
     moomoo_port: int = 11111
     monitor_host: str = "0.0.0.0"
@@ -36,6 +38,10 @@ class Settings(BaseSettings):
     @property
     def slack_configured(self) -> bool:
         return bool(self.slack_webhook_url)
+
+    @property
+    def pushover_configured(self) -> bool:
+        return bool(self.pushover_token and self.pushover_user)
 
 
 @lru_cache

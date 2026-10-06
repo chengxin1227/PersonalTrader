@@ -59,4 +59,4 @@ def test_crosses_need_previous_price():
 def test_render_message_uses_template_fields():
     rule = _rule(ConditionType.PRICE_ABOVE, 200)
     rule.slack_message = "{symbol} {price:.2f} {change_pct:+.1f}"
-    assert render_message(rule, _quote(210.5, 2.25)) == "AAPL 210.50 +2.2"
+    assert render_message(rule, _quote(210.5, 2.25)) == "AAPL 210.50 +2.2\nTest rule"

@@ -7,6 +7,7 @@ from monitor.models import MarketClock, Quote
 from monitor.session import (
     is_afterhours,
     is_premarket,
+    is_regular_session,
     is_trading_day,
     premarket_mark,
     seconds_until_extended_open,
@@ -22,6 +23,14 @@ def test_premarket_window():
     assert not is_premarket(datetime(2026, 9, 23, 9, 30, tzinfo=ET))
     assert not is_premarket(datetime(2026, 9, 23, 15, 0, tzinfo=ET))
     assert not is_premarket(datetime(2026, 9, 26, 6, 0, tzinfo=ET))  # Saturday
+
+
+def test_regular_session_window():
+    assert is_regular_session(datetime(2026, 9, 23, 9, 30, tzinfo=ET))
+    assert is_regular_session(datetime(2026, 9, 23, 15, 59, tzinfo=ET))
+    assert not is_regular_session(datetime(2026, 9, 23, 9, 29, tzinfo=ET))
+    assert not is_regular_session(datetime(2026, 9, 23, 16, 0, tzinfo=ET))
+    assert not is_regular_session(datetime(2026, 9, 26, 12, 0, tzinfo=ET))
 
 
 def test_afterhours_window():

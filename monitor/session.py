@@ -10,6 +10,8 @@ PREMARKET_START = time(4, 0)
 PREMARKET_END = time(9, 30)
 AFTERHOURS_START = time(16, 0)
 AFTERHOURS_END = time(20, 0)
+REGULAR_START = time(9, 30)
+REGULAR_END = time(16, 0)
 
 
 def now_et(moment: datetime | None = None) -> datetime:
@@ -31,6 +33,13 @@ def is_afterhours(moment: datetime | None = None) -> bool:
     if current.weekday() >= 5:
         return False
     return AFTERHOURS_START <= current.time() < AFTERHOURS_END
+
+
+def is_regular_session(moment: datetime | None = None) -> bool:
+    current = now_et(moment)
+    if current.weekday() >= 5:
+        return False
+    return REGULAR_START <= current.time() < REGULAR_END
 
 
 def extended_session_open(moment: datetime | None = None) -> bool:

@@ -15,6 +15,7 @@ class ConditionType(str, Enum):
     CROSSES_BELOW = "crosses_below"
     PREMARKET_GAIN = "premarket_gain"
     AFTERHOURS_GAIN = "afterhours_gain"
+    LATE_SESSION_GAIN = "late_session_gain"
 
 
 class Condition(BaseModel):
@@ -29,11 +30,16 @@ class Condition(BaseModel):
     require_uptrend: bool = False
     require_circuit_breaker: bool = False
     skip_market_cap: bool = False
+    top_n: Optional[int] = Field(default=None, ge=1)
+    min_recent_day_change: Optional[float] = None
+    recent_day_count: int = Field(default=5, ge=1)
 
 
 class Rule(BaseModel):
     id: str
     name: str
+    label: Optional[str] = None
+    notify: Optional[str] = None
     symbol: str
     enabled: bool = True
     cooldown_minutes: int = Field(default=60, ge=0)
@@ -50,6 +56,7 @@ class Rule(BaseModel):
         return self.condition.type in {
             ConditionType.PREMARKET_GAIN,
             ConditionType.AFTERHOURS_GAIN,
+            ConditionType.LATE_SESSION_GAIN,
         } or self.symbol in {"*", "ALL"}
 
     @field_validator("id")
@@ -64,6 +71,7 @@ class Rule(BaseModel):
 class RulesConfig(BaseModel):
     poll_interval_seconds: int = Field(default=1, ge=1)
     scanner_interval_seconds: int = Field(default=1, ge=1)
+    background_scan_interval_seconds: int = Field(default=5, ge=1)
     poll_when_closed: bool = True
     feed: str = "iex"
     scanner_feed: str = "iex"
@@ -115,6 +123,7 @@ class Quote(BaseModel):
     session_uptrend: Optional[bool] = None
     prior_session_spike: Optional[bool] = None
     session_circuit_breaker: Optional[bool] = None
+    recent_day_spike: Optional[bool] = None
     sec_status: Optional[str] = None
     updated_at: Optional[datetime] = None
     trade_at: Optional[datetime] = None
@@ -132,6 +141,8 @@ class Alert(BaseModel):
     id: str
     rule_id: str
     rule_name: str
+    label: Optional[str] = None
+    notify: Optional[str] = None
     symbol: str
     message: str
     price: Optional[float] = None

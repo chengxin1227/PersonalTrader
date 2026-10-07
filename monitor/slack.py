@@ -36,17 +36,19 @@ class SlackClient:
         if self._owns_client:
             await self._client.aclose()
 
-    async def send_alert(self, alert: Alert) -> None:
-        if not self._settings.slack_configured:
+    async def send_alert(self, alert: Alert, webhook_url: str | None = None) -> None:
+        url = webhook_url or self._settings.slack_webhook_url
+        if not url:
             raise RuntimeError("SLACK_WEBHOOK_URL is not set")
         color = "#34C759" if (alert.change_pct or 0) < 0 else "#FF3B30"
+        fallback = f"{alert.label}\n{alert.message}" if alert.label else alert.message
         response = await self._client.post(
-            self._settings.slack_webhook_url,
+            url,
             json={
                 "attachments": [
                     {
                         "color": color,
-                        "fallback": alert.message,
+                        "fallback": fallback,
                         "blocks": self._blocks(alert),
                     }
                 ]
@@ -54,11 +56,42 @@ class SlackClient:
         )
         response.raise_for_status()
 
-    async def send_text(self, text: str) -> None:
-        if not self._settings.slack_configured:
+    async def send_digest(
+        self, title: str, rows: list[tuple[str, str]], webhook_url: str | None = None
+    ) -> None:
+        url = webhook_url or self._settings.slack_webhook_url
+        if not url:
+            raise RuntimeError("SLACK_WEBHOOK_URL is not set")
+        blocks: list[dict] = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": title}},
+        ]
+        for symbol, line in rows:
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": _link_name(line, page_url(symbol))},
+                }
+            )
+        response = await self._client.post(
+            url,
+            json={
+                "attachments": [
+                    {
+                        "color": "#FF3B30",
+                        "fallback": title,
+                        "blocks": blocks,
+                    }
+                ]
+            },
+        )
+        response.raise_for_status()
+
+    async def send_text(self, text: str, webhook_url: str | None = None) -> None:
+        url = webhook_url or self._settings.slack_webhook_url
+        if not url:
             raise RuntimeError("SLACK_WEBHOOK_URL is not set")
         response = await self._client.post(
-            self._settings.slack_webhook_url,
+            url,
             json={"text": text},
         )
         response.raise_for_status()
@@ -66,7 +99,10 @@ class SlackClient:
     def _blocks(self, alert: Alert) -> list[dict]:
         lines = [raw for raw in alert.message.splitlines() if raw.strip()]
         headline = _link_name(lines[0], page_url(alert.symbol)) if lines else alert.message
-        blocks: list[dict] = [{"type": "section", "text": {"type": "mrkdwn", "text": headline}}]
+        blocks: list[dict] = []
+        if alert.label:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{alert.label}*"}})
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": headline}})
         reason = "\n".join(lines[1:])
         if reason:
             blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": reason}]})

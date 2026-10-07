@@ -54,6 +54,55 @@ def _reject_low_volume(rule: Rule, quote: Quote) -> RuleEvaluation | None:
     return None
 
 
+def hour_change_pct(baseline: float | None, price: float | None) -> float | None:
+    if baseline is None or price is None or baseline <= 0 or price <= 0:
+        return None
+    return round((price - baseline) / baseline * 100, 4)
+
+
+def evaluate_last_hour_scan(
+    rule: Rule,
+    quote: Quote,
+    *,
+    in_last_hour: bool,
+    market_cap: float | None,
+    cap_filtered: bool = False,
+) -> RuleEvaluation:
+    if not in_last_hour:
+        return RuleEvaluation(matched=False, reason="not the last regular hour")
+    change = quote.change_pct
+    if change is None:
+        return RuleEvaluation(matched=False, reason="no last-hour change")
+    if change <= rule.condition.value:
+        return RuleEvaluation(
+            matched=False,
+            reason=f"last hour {change:.2f}% <= {rule.condition.value:.2f}%",
+        )
+    low_volume = _reject_low_volume(rule, quote)
+    if low_volume is not None:
+        return low_volume
+    max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
+    if market_cap is None:
+        if cap_filtered:
+            return RuleEvaluation(
+                matched=True,
+                reason=(
+                    f"last hour {change:.2f}% > {rule.condition.value:.2f}% "
+                    f"and total cap <= ${max_cap:,.0f}"
+                ),
+            )
+        return RuleEvaluation(matched=False, reason="no total market cap")
+    if market_cap > max_cap:
+        return RuleEvaluation(
+            matched=False,
+            reason=f"total cap ${market_cap:,.0f} > ${max_cap:,.0f}",
+        )
+    return RuleEvaluation(
+        matched=True,
+        reason=f"last hour {change:.2f}% > {rule.condition.value:.2f}% and total cap ${market_cap:,.0f}",
+    )
+
+
 def evaluate_premarket_scan(
     rule: Rule,
     quote: Quote,
@@ -69,14 +118,27 @@ def evaluate_premarket_scan(
     prior = _reject_without_earlier_spike(rule, quote, "pre-market")
     if prior is not None:
         return prior
-    if rule.condition.min_prior_change is None and quote.change_pct < rule.condition.value:
+    day_min = rule.condition.min_recent_day_change
+    if rule.condition.min_prior_change is None and day_min is None and quote.change_pct < rule.condition.value:
         return RuleEvaluation(
             matched=False,
             reason=f"change {quote.change_pct:.2f}% < {rule.condition.value:.2f}%",
         )
+    if day_min is not None and quote.change_pct <= rule.condition.value:
+        return RuleEvaluation(
+            matched=False,
+            reason=f"pre-market {quote.change_pct:.2f}% <= {rule.condition.value:.2f}%",
+        )
     low_volume = _reject_low_volume(rule, quote)
     if low_volume is not None:
         return low_volume
+    if day_min is not None and quote.recent_day_spike is not True:
+        return RuleEvaluation(
+            matched=False,
+            reason=(
+                f"no day gain > {day_min:.2f}% in the last {rule.condition.recent_day_count} days"
+            ),
+        )
     max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
     if market_cap is None:
         if cap_filtered:
@@ -118,7 +180,9 @@ def evaluate_afterhours_scan(
     if prior is not None:
         return prior
     regular_min = rule.condition.min_regular_change
-    if rule.condition.min_prior_change is None and regular_min is None:
+    day_min = rule.condition.min_recent_day_change
+    strict_session = regular_min is not None or day_min is not None
+    if rule.condition.min_prior_change is None and not strict_session:
         if quote.change_pct < rule.condition.value:
             return RuleEvaluation(
                 matched=False,
@@ -153,6 +217,11 @@ def evaluate_afterhours_scan(
         return RuleEvaluation(matched=False, reason="regular session trend is not up")
     if rule.condition.require_circuit_breaker and quote.session_circuit_breaker is not True:
         return RuleEvaluation(matched=False, reason="no regular-session circuit breaker")
+    if day_min is not None and quote.recent_day_spike is not True:
+        return RuleEvaluation(
+            matched=False,
+            reason=f"no day gain > {day_min:.2f}% in the last {rule.condition.recent_day_count} days",
+        )
     if rule.condition.skip_market_cap or (
         rule.condition.require_circuit_breaker and rule.condition.max_market_cap is None
     ):
@@ -253,10 +322,19 @@ def evaluate_rule(
             ),
         )
 
-    if condition.type in {ConditionType.PREMARKET_GAIN, ConditionType.AFTERHOURS_GAIN}:
+    if condition.type in {
+        ConditionType.PREMARKET_GAIN,
+        ConditionType.AFTERHOURS_GAIN,
+        ConditionType.LATE_SESSION_GAIN,
+    }:
         return RuleEvaluation(matched=False, reason="scanner rule")
 
     return RuleEvaluation(matched=False, reason="unknown condition")
+
+
+def leaderboard_line(quote: Quote) -> str:
+    change = quote.change_pct if quote.change_pct is not None else 0.0
+    return f"{quote.symbol}{FIELD_GAP}{change:+.1f}%{FIELD_GAP}{format_price(quote.price or 0.0)}"
 
 
 def format_price(price: float) -> str:

@@ -9,6 +9,8 @@ from monitor.session import (
     is_premarket,
     is_regular_session,
     is_trading_day,
+    afterhours_board_slot,
+    last_hour_phase,
     premarket_mark,
     seconds_until_extended_open,
     trade_is_premarket,
@@ -31,6 +33,34 @@ def test_regular_session_window():
     assert not is_regular_session(datetime(2026, 9, 23, 9, 29, tzinfo=ET))
     assert not is_regular_session(datetime(2026, 9, 23, 16, 0, tzinfo=ET))
     assert not is_regular_session(datetime(2026, 9, 26, 12, 0, tzinfo=ET))
+
+
+def test_last_hour_records_before_the_close_and_alerts_from_15():
+    assert last_hour_phase(datetime(2026, 10, 7, 14, 44, tzinfo=ET)) is None
+    assert last_hour_phase(datetime(2026, 10, 7, 14, 45, tzinfo=ET)) == "baseline"
+    assert last_hour_phase(datetime(2026, 10, 7, 14, 59, tzinfo=ET)) == "baseline"
+    assert last_hour_phase(datetime(2026, 10, 7, 15, 0, tzinfo=ET)) == "alert"
+    assert last_hour_phase(datetime(2026, 10, 7, 15, 59, tzinfo=ET)) == "alert"
+    assert last_hour_phase(datetime(2026, 10, 7, 16, 0, tzinfo=ET)) is None
+    assert last_hour_phase(datetime(2026, 10, 10, 15, 10, tzinfo=ET)) is None
+
+
+def test_afterhours_board_slot_is_each_half_hour():
+    assert afterhours_board_slot(datetime(2026, 10, 6, 15, 59, tzinfo=ET)) is None
+    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 0, tzinfo=ET)) == datetime(
+        2026, 10, 6, 16, 0, tzinfo=ET
+    )
+    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 29, tzinfo=ET)) == datetime(
+        2026, 10, 6, 16, 0, tzinfo=ET
+    )
+    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 30, tzinfo=ET)) == datetime(
+        2026, 10, 6, 16, 30, tzinfo=ET
+    )
+    assert afterhours_board_slot(datetime(2026, 10, 6, 19, 59, tzinfo=ET)) == datetime(
+        2026, 10, 6, 19, 30, tzinfo=ET
+    )
+    assert afterhours_board_slot(datetime(2026, 10, 6, 20, 0, tzinfo=ET)) is None
+    assert afterhours_board_slot(datetime(2026, 10, 10, 17, 0, tzinfo=ET)) is None
 
 
 def test_afterhours_window():

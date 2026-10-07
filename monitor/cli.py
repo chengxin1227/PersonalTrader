@@ -10,6 +10,8 @@ from typing import TypeVar
 from monitor.alpaca import AlpacaClient
 from monitor.config import Settings, get_settings
 from monitor.engine import MonitorEngine
+from monitor.models import ConditionType
+from monitor.notify import NotifyRoutes
 from monitor.moomoo_client import MoomooClient
 from monitor.pushover import PushoverClient
 from monitor.rules import load_rules
@@ -18,6 +20,24 @@ from monitor.slack import SlackClient
 from monitor.store import Store
 
 T = TypeVar("T")
+
+
+def _print_routes(settings: Settings, rules: list) -> None:
+    routed = [rule for rule in rules if rule.notify]
+    if not routed:
+        return
+    routes = NotifyRoutes.load(settings)
+    own = sum(
+        1 for rule in routed if routes.has_slack(rule.notify) and routes.has_pushover(rule.notify)
+    )
+    print(f"  routes    {own}/{len(routed)} rules have their own Slack channel and Pushover app")
+    for rule in routed:
+        slack = "own" if routes.has_slack(rule.notify) else "default"
+        pushover = "own" if routes.has_pushover(rule.notify) else "default"
+        print(f"    - {rule.label or rule.notify}: slack {slack}, pushover {pushover}")
+    slack = "own" if routes.has_slack("opend") else "default"
+    pushover = "own" if routes.has_pushover("opend") else "default"
+    print(f"    - OpenD: slack {slack}, pushover {pushover}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -106,6 +126,7 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
         print(f"  transport REST poll every {config.poll_interval_seconds}s ({config.feed})")
         print(f"  slack     {'yes' if settings.slack_configured else 'NO'}")
         print(f"  pushover  {'yes' if settings.pushover_configured else 'NO'}")
+        _print_routes(settings, enabled)
         if source == "alpaca":
             print(f"  alpaca    {'yes' if settings.alpaca_configured else 'NO'}")
         else:
@@ -116,6 +137,28 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
             print("  watching")
             for rule in enabled:
                 if rule.is_scanner:
+                    if rule.condition.top_n is not None:
+                        cap = rule.condition.max_market_cap or 100_000_000
+                        volume = ""
+                        if rule.condition.min_volume is not None:
+                            volume = (
+                                f", volume > {rule.condition.min_volume:,.0f} after the open"
+                            )
+                        print(
+                            f"    - {rule.name}: top {rule.condition.top_n} "
+                            f"after-hours names every 30m, total cap <= ${cap:,.0f}{volume}"
+                        )
+                        continue
+                    if rule.condition.type is ConditionType.LATE_SESSION_GAIN:
+                        cap = rule.condition.max_market_cap or 100_000_000
+                        volume = ""
+                        if rule.condition.min_volume is not None:
+                            volume = f" and volume > {rule.condition.min_volume:,.0f}"
+                        print(
+                            f"    - {rule.name}: last regular hour "
+                            f">{rule.condition.value:g}% and total cap <= ${cap:,.0f}{volume}"
+                        )
+                        continue
                     volume = ""
                     if rule.condition.min_volume is not None:
                         volume = f" and volume > {rule.condition.min_volume:,.0f}"
@@ -132,6 +175,11 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                         volume += " and regular-session trend up"
                     if rule.condition.require_circuit_breaker:
                         volume += " and upward circuit breaker"
+                    if rule.condition.min_recent_day_change is not None:
+                        volume += (
+                            f" and a day gain > {rule.condition.min_recent_day_change:g}% "
+                            f"in the last {rule.condition.recent_day_count} days"
+                        )
                     if rule.condition.skip_market_cap or (
                         rule.condition.max_market_cap is None
                         and rule.condition.require_circuit_breaker
@@ -144,6 +192,7 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                         ">"
                         if rule.condition.min_regular_change is not None
                         or rule.condition.min_prior_change is not None
+                        or rule.condition.min_recent_day_change is not None
                         else ">="
                     )
                     print(

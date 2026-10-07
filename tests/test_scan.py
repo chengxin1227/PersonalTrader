@@ -5,7 +5,10 @@ from monitor.models import Condition, ConditionType, Quote, Rule, RulesConfig
 from monitor.rules import (
     FIELD_GAP,
     evaluate_afterhours_scan,
+    evaluate_last_hour_scan,
     evaluate_premarket_scan,
+    hour_change_pct,
+    leaderboard_line,
     render_message,
 )
 
@@ -277,6 +280,13 @@ def test_message_uses_the_other_session_change():
     assert "+10.0%" not in premarket
 
 
+def test_leaderboard_line_shows_the_afterhours_gain_and_price():
+    quote = _quote(price=1.12, prev_close=1.0)
+    quote.company = "Acme"
+    quote.change_pct = 18.4
+    assert leaderboard_line(quote) == f"ABCD{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
+
+
 def test_afterhours_circuit_breaker_needs_regular_gain_and_a_halt():
     rule = Rule(
         id="afterhours-circuit-breaker-day10-ah5",
@@ -342,3 +352,95 @@ def test_afterhours_circuit_breaker_needs_regular_gain_and_a_halt():
     assert "+6.2%" not in message
 
     assert "+12.0%" not in message
+
+
+def test_last_hour_gain_is_strict_and_needs_volume():
+    assert hour_change_pct(1.0, 1.2) == 20
+    assert hour_change_pct(1.0, 1.25) == 25
+    assert hour_change_pct(0, 1.2) is None
+    rule = Rule(
+        id="regular-last-hour-20",
+        name="盘中收盘前1小时突然涨幅超20%",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.LATE_SESSION_GAIN,
+            value=20,
+            max_market_cap=100_000_000,
+            min_volume=100_000,
+        ),
+    )
+    quote = _quote(price=1.21, prev_close=1.0, volume=100_001)
+    quote.change_pct = 21
+    assert evaluate_last_hour_scan(
+        rule, quote, in_last_hour=True, market_cap=None, cap_filtered=True
+    ).matched
+    quote.change_pct = 20
+    assert not evaluate_last_hour_scan(
+        rule, quote, in_last_hour=True, market_cap=None, cap_filtered=True
+    ).matched
+    quote.change_pct = 25
+    quote.volume = 100_000
+    assert not evaluate_last_hour_scan(
+        rule, quote, in_last_hour=True, market_cap=None, cap_filtered=True
+    ).matched
+    quote.volume = 100_001
+    assert not evaluate_last_hour_scan(
+        rule, quote, in_last_hour=False, market_cap=None, cap_filtered=True
+    ).matched
+    assert not evaluate_last_hour_scan(
+        rule, quote, in_last_hour=True, market_cap=100_000_001
+    ).matched
+
+
+def _day_spike_rule(session: ConditionType) -> Rule:
+    return Rule(
+        id="day50-ext5",
+        name="过去5天有一天涨幅超50%",
+        symbol="*",
+        condition=Condition(
+            type=session,
+            value=5,
+            max_market_cap=100_000_000,
+            min_volume=100_000,
+            min_recent_day_change=50,
+            recent_day_count=5,
+        ),
+    )
+
+
+def test_recent_day_spike_requires_session_gain_volume_and_a_prior_day():
+    rule = _day_spike_rule(ConditionType.AFTERHOURS_GAIN)
+    quote = _quote(volume=100_001)
+    quote.change_pct = 5.1
+    quote.recent_day_spike = True
+    assert evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    quote.change_pct = 5
+    assert not evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    quote.change_pct = 8
+    quote.recent_day_spike = False
+    assert not evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    quote.recent_day_spike = None
+    assert not evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    quote.recent_day_spike = True
+    quote.volume = 100_000
+    assert not evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+
+    premarket = _day_spike_rule(ConditionType.PREMARKET_GAIN)
+    quote.volume = 100_001
+    quote.change_pct = 5.1
+    assert evaluate_premarket_scan(
+        premarket, quote, market_cap=100_000_000, in_premarket=True
+    ).matched
+    assert not evaluate_premarket_scan(
+        premarket, quote, market_cap=100_000_001, in_premarket=True
+    ).matched

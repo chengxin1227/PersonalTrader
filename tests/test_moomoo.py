@@ -1,15 +1,82 @@
 import pytest
 
 from monitor.moomoo_client import (
+    afterhours_leaders,
+    completed_daily_changes,
+    day_gain_exceeded,
     is_circuit_breaker,
     is_test_name,
     is_upward_halt,
+    quote_from_filter,
     quote_from_rank,
     quote_from_snapshot,
     regular_session_uptrend,
     total_market_cap,
     yesterday_cap,
 )
+
+
+def test_filter_row_reads_price_and_today_volume():
+    class Row:
+        stock_name = "Acme"
+        stock_code = "US.ABCD"
+
+        def __init__(self) -> None:
+            self.cur_price = 1.25
+            self.__dict__[("volume", 1)] = 150_000
+
+    quote = quote_from_filter(Row())
+    assert quote is not None
+    assert quote.symbol == "ABCD"
+    assert quote.price == 1.25
+    assert quote.volume == 150_000
+
+
+def test_day_gain_uses_the_last_five_completed_sessions():
+    bars = [
+        ("2026-09-25", 80.0),
+        ("2026-09-29", 10.0),
+        ("2026-09-30", 50.0),
+        ("2026-10-01", 10.0),
+        ("2026-10-02", 10.0),
+        ("2026-10-03", 10.0),
+        ("2026-10-06", 4.0),
+    ]
+    afterhours = completed_daily_changes(bars, today="2026-10-06", include_today=True)
+    assert afterhours[-5:] == [50.0, 10.0, 10.0, 10.0, 4.0]
+    assert not day_gain_exceeded(afterhours, 50, 5)
+    bars[2] = ("2026-09-30", 50.1)
+    afterhours = completed_daily_changes(bars, today="2026-10-06", include_today=True)
+    assert day_gain_exceeded(afterhours, 50, 5)
+    premarket = completed_daily_changes(bars, today="2026-10-07", include_today=False)
+    assert 50.1 in premarket[-5:]
+    assert day_gain_exceeded(premarket, 50, 5)
+    today_only = completed_daily_changes(
+        [("2026-10-07", 60.0), ("2026-10-06", 10.0)],
+        today="2026-10-07",
+        include_today=False,
+    )
+    assert today_only == [10.0]
+    assert not day_gain_exceeded(today_only, 50, 5)
+
+
+def test_afterhours_leaders_skip_zero_prices():
+    from monitor.models import Quote
+
+    zeros = [
+        Quote(symbol=f"Z{index}", company="Placeholder", price=0, change_pct=0)
+        for index in range(5)
+    ]
+    priced = [
+        Quote(symbol="GWHT", company="ESS Tech", price=0.3, change_pct=75.4),
+        Quote(symbol="VCIG", company="VCI Global", price=2.07, change_pct=46.7),
+    ]
+    assert afterhours_leaders(zeros + priced, 5) == priced
+    assert afterhours_leaders(zeros, 5) == []
+    thin = Quote(symbol="THIN", price=1.2, change_pct=90, volume=100_000)
+    thick = Quote(symbol="GWHT", price=0.3, change_pct=75.4, volume=100_001)
+    assert afterhours_leaders([thin, thick], 5, min_volume=100_000) == [thick]
+    assert afterhours_leaders([thin, thick], 5) == [thin, thick]
 
 
 def test_snapshot_uses_last_price_against_previous_close():

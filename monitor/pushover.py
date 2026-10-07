@@ -8,6 +8,7 @@ import httpx
 
 from monitor.config import Settings
 from monitor.models import Alert
+from monitor.quote_link import quote_url
 from monitor.rules import FIELD_GAP, split_alert_name
 
 _CHANGE = re.compile(r"[+-]\d+(?:\.\d+)?%")
@@ -15,6 +16,11 @@ _PRICE = re.compile(r"\$\d[\d,.]*")
 
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 _MUTED = "#8E8E93"
+
+
+def html_digest(rows: list[tuple[str, str]]) -> str:
+    """Each row is (url, line). Names stay full size and each one is a link."""
+    return "\n".join(_style_line(line, url) for url, line in rows)
 
 
 def html_message(text: str, url: str | None = None) -> str:
@@ -86,11 +92,21 @@ class PushoverClient:
         if self._owns_client:
             await self._client.aclose()
 
-    async def send_alert(self, alert: Alert) -> None:
+    async def send_alert(self, alert: Alert, token: str | None = None) -> None:
         title = alert.symbol
         if alert.change_pct is not None:
             title = f"{alert.symbol}  {alert.change_pct:+.1f}%"
-        await self.send_text(html_message(alert.message, alert.url), title=title, html=True)
+        if alert.label:
+            title = f"{alert.label}  {title}"
+        await self.send_text(
+            html_message(alert.message, alert.url), title=title, html=True, token=token
+        )
+
+    async def send_digest(
+        self, title: str, rows: list[tuple[str, str]], token: str | None = None
+    ) -> None:
+        linked = [(quote_url(symbol), line) for symbol, line in rows]
+        await self.send_text(html_digest(linked), title=title, html=True, token=token)
 
     async def send_text(
         self,
@@ -99,11 +115,13 @@ class PushoverClient:
         url: str | None = None,
         url_title: str = "打开同花顺",
         html: bool = False,
+        token: str | None = None,
     ) -> None:
-        if not self._settings.pushover_configured:
+        app_token = token or self._settings.pushover_token
+        if not app_token or not self._settings.pushover_user:
             raise RuntimeError("PUSHOVER_TOKEN and PUSHOVER_USER are not set")
         payload = {
-            "token": self._settings.pushover_token,
+            "token": app_token,
             "user": self._settings.pushover_user,
             "title": title[:250],
             "message": text[:1024],

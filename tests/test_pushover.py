@@ -9,6 +9,7 @@ from monitor.config import Settings
 from monitor.models import Alert
 from monitor.engine import MonitorEngine, opend_is_down
 from monitor.pushover import PushoverClient, html_message
+from monitor.slack import SlackClient
 
 
 def _settings() -> Settings:
@@ -57,6 +58,86 @@ def test_pushover_posts_symbol_and_message():
     assert "$1.50" in seen["message"]
     assert "盘前" not in seen["message"]
     assert seen["message"].index("+10.0%") < seen["message"].index("$1.50")
+
+
+def test_pushover_title_starts_with_the_rule_label():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        parsed = parse_qs(request.content.decode())
+        seen.update({key: values[0] for key, values in parsed.items()})
+        return httpx.Response(200, json={"status": 1})
+
+    async def run() -> None:
+        client = PushoverClient(
+            _settings(), httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        )
+        alert = Alert(
+            id="1",
+            rule_id="afterhours-smallcap-10pct",
+            rule_name="盘后",
+            label="After-hours pullback",
+            symbol="GYGY",
+            message="Game Your Game   +10.0%   $1.50",
+            price=1.5,
+            change_pct=10.0,
+            fired_at=datetime.now(timezone.utc),
+        )
+        await client.send_alert(alert)
+        await client.close()
+
+    asyncio.run(run())
+    assert seen["title"] == "After-hours pullback  GYGY  +10.0%"
+
+
+def test_slack_message_starts_with_the_rule_label():
+    alert = Alert(
+        id="1",
+        rule_id="afterhours-smallcap-10pct",
+        rule_name="盘后目前涨幅超15%",
+        label="After-hours pullback",
+        symbol="GYGY",
+        message="Game Your Game   +10.0%   $1.50\n盘后目前涨幅超15%",
+        price=1.5,
+        change_pct=10.0,
+        fired_at=datetime.now(timezone.utc),
+    )
+    async def run() -> list:
+        client = SlackClient(Settings(slack_webhook_url="https://hooks.slack.com/services/T/B/x"))
+        blocks = client._blocks(alert)
+        await client.close()
+        return blocks
+
+    blocks = asyncio.run(run())
+    assert blocks[0]["text"]["text"] == "*After-hours pullback*"
+    assert "Game Your Game" in blocks[1]["text"]["text"]
+
+
+def test_digest_links_each_name_like_other_alerts():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        parsed = parse_qs(request.content.decode())
+        seen.update({key: values[0] for key, values in parsed.items()})
+        return httpx.Response(200, json={"status": 1})
+
+    async def run() -> None:
+        client = PushoverClient(
+            _settings(), httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        )
+        await client.send_digest(
+            "16:00 Top 5",
+            [("GWHT", "GWHT    +75.4%    $0.30"), ("VCIG", "VCIG    +46.7%    $2.07")],
+        )
+        await client.close()
+
+    asyncio.run(run())
+    assert seen["title"] == "16:00 Top 5"
+    assert "url" not in seen
+    assert seen["message"].count('<a href="amihexin://">') == 2
+    assert '<a href="amihexin://">GWHT</a>' in seen["message"]
+    assert "stockpage.10jqka.com.cn" not in seen["message"]
+    assert '<font size="1"' not in seen["message"]
 
 
 def test_message_percent_is_labeled_and_name_stays_the_link():

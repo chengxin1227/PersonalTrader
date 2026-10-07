@@ -35,6 +35,28 @@ def is_afterhours(moment: datetime | None = None) -> bool:
     return AFTERHOURS_START <= current.time() < AFTERHOURS_END
 
 
+def afterhours_board_slot(moment: datetime | None = None) -> datetime | None:
+    """The current half-hour mark during after-hours, from 16:00 through 19:30 ET."""
+    current = now_et(moment)
+    if not is_afterhours(current):
+        return None
+    minute = 0 if current.minute < 30 else 30
+    return current.replace(minute=minute, second=0, microsecond=0)
+
+
+def last_hour_phase(moment: datetime | None = None) -> str | None:
+    """Prices are recorded from 14:45. Alerts run from 15:00 until the 16:00 close."""
+    current = now_et(moment)
+    if current.weekday() >= 5:
+        return None
+    clock = current.time()
+    if time(15, 0) <= clock < REGULAR_END:
+        return "alert"
+    if time(14, 45) <= clock < time(15, 0):
+        return "baseline"
+    return None
+
+
 def is_regular_session(moment: datetime | None = None) -> bool:
     current = now_et(moment)
     if current.weekday() >= 5:

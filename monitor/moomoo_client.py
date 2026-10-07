@@ -93,6 +93,30 @@ def line_slope(values: list[float]) -> float:
     return numerator / denominator
 
 
+def completed_daily_changes(
+    bars: list[tuple[str, float]],
+    *,
+    today: str,
+    include_today: bool,
+) -> list[float]:
+    """Daily percent changes, oldest first. Premarket drops the unfinished session."""
+    changes: list[float] = []
+    for day, change in sorted(bars):
+        if include_today:
+            if day > today:
+                continue
+        elif day >= today:
+            continue
+        changes.append(change)
+    return changes
+
+
+def day_gain_exceeded(changes: list[float], minimum: float, lookback: int) -> bool:
+    if lookback < 1:
+        return False
+    return any(change > minimum for change in changes[-lookback:])
+
+
 def regular_session_uptrend(bars: list[tuple[float, float]], *, minimum_bars: int = 20) -> bool:
     """True when the regular-session path rises: fitted slope > 0 and close > open."""
     if len(bars) < minimum_bars:
@@ -158,6 +182,42 @@ def quote_from_rank(
     )
 
 
+def quote_from_filter(item: Any) -> Quote | None:
+    name = str(getattr(item, "stock_name", "") or "")
+    if is_test_name(name):
+        return None
+    symbol = bare_symbol(str(getattr(item, "stock_code", "") or ""))
+    if not symbol:
+        return None
+    fields = getattr(item, "__dict__", {})
+    price = _float(fields.get("cur_price"))
+    volume = _float(fields.get(("volume", 1)))
+    return Quote(
+        symbol=symbol,
+        company=name.strip() or None,
+        price=price,
+        volume=int(volume) if volume is not None else None,
+    )
+
+
+def afterhours_leaders(
+    quotes: list[Quote],
+    limit: int,
+    min_volume: int | None = None,
+) -> list[Quote]:
+    """Skip zero prices, and thin names after the after-hours open."""
+    ready: list[Quote] = []
+    for quote in quotes:
+        if quote.price is None or quote.price <= 0:
+            continue
+        if min_volume is not None and (quote.volume is None or quote.volume <= min_volume):
+            continue
+        ready.append(quote)
+        if len(ready) >= limit:
+            break
+    return ready
+
+
 def total_market_cap(
     *,
     total_market_val: float | None,
@@ -191,6 +251,17 @@ class MoomooClient:
         self._port = settings.moomoo_port
         self._ctx: Any = None
         self._lock = threading.RLock()
+        self._pending_problem: str | None = None
+
+    def _remember_problem(self, message: str) -> None:
+        with self._lock:
+            self._pending_problem = str(message)
+
+    def take_problem(self) -> str | None:
+        with self._lock:
+            message = self._pending_problem
+            self._pending_problem = None
+            return message
 
     def _context(self) -> Any:
         if self._ctx is None:
@@ -290,6 +361,7 @@ class MoomooClient:
         min_change_pct: float,
         session: str = "premarket",
         max_market_cap: float | None = None,
+        limit: int | None = None,
     ) -> list[tuple[Quote, float | None]]:
         from moomoo import RET_OK, SimpleRankFilter, SimpleRankIndicatorType
 
@@ -340,6 +412,9 @@ class MoomooClient:
                     )
                     if quote is not None:
                         quotes.append(quote)
+                        if limit is not None and len(quotes) >= limit:
+                            stop = True
+                            break
                 offset += len(frame)
                 if stop or offset >= int(all_count):
                     break
@@ -374,6 +449,32 @@ class MoomooClient:
         logger.info("Moomoo after-hours names above threshold: %s", len(found))
         return found
 
+    async def top_afterhours(
+        self,
+        max_market_cap: float,
+        limit: int,
+        min_volume: int | None = None,
+    ) -> list[Quote]:
+        if min_volume is None:
+            logger.info(
+                "Moomoo after-hours rank, top %s, total cap <= %.0f",
+                limit,
+                max_market_cap,
+            )
+            page_limit = _PAGE_SIZE
+        else:
+            logger.info(
+                "Moomoo after-hours rank, top %s, total cap <= %.0f, volume > %s",
+                limit,
+                max_market_cap,
+                min_volume,
+            )
+            page_limit = _PAGE_SIZE * _MAX_PAGES
+        found = await asyncio.to_thread(
+            self._scan_sync, -1_000_000, "afterhours", max_market_cap, page_limit
+        )
+        return afterhours_leaders([quote for quote, _cap in found], limit, min_volume)
+
     def _session_uptrend_sync(self, symbol: str, session_day: str) -> bool | None:
         from moomoo import RET_OK, AuType, KLType, Session
 
@@ -390,7 +491,8 @@ class MoomooClient:
             )
         if ret != RET_OK:
             message = str(data)
-            if "frequency" in message:
+            self._remember_problem(message)
+            if "frequency" in message or "quota" in message.lower():
                 logger.warning("Kline quota hit while checking %s", symbol)
                 return None
             logger.warning("Kline failed for %s: %s", symbol, message)
@@ -417,6 +519,44 @@ class MoomooClient:
 
     async def session_uptrend(self, symbol: str, session_day: str) -> bool | None:
         return await asyncio.to_thread(self._session_uptrend_sync, symbol, session_day)
+
+    def _recent_daily_changes_sync(self, symbol: str, count: int) -> list[tuple[str, float]] | None:
+        from moomoo import RET_OK, AuType, KLType
+
+        code = f"US.{symbol.strip().upper()}"
+        with self._lock:
+            ret, data, _page = self._context().request_history_kline(
+                code,
+                ktype=KLType.K_DAY,
+                autype=AuType.NONE,
+                max_count=count,
+            )
+        if ret != RET_OK:
+            message = str(data)
+            self._remember_problem(message)
+            lowered = message.lower()
+            if "frequency" in lowered or "quota" in lowered:
+                logger.warning("Kline quota hit while checking %s", symbol)
+                return None
+            logger.warning("Daily kline failed for %s: %s", symbol, message)
+            return None
+        if data is None or data.empty:
+            return []
+        bars: list[tuple[str, float]] = []
+        for row in data.to_dict(orient="records"):
+            day = str(row.get("time_key") or "")[:10]
+            change = _float(row.get("change_rate"))
+            if change is None:
+                close_px = _float(row.get("close"))
+                last_close = _float(row.get("last_close"))
+                if close_px is not None and last_close is not None and last_close > 0:
+                    change = (close_px - last_close) / last_close * 100
+            if day and change is not None:
+                bars.append((day, change))
+        return bars
+
+    async def recent_daily_changes(self, symbol: str, count: int) -> list[tuple[str, float]] | None:
+        return await asyncio.to_thread(self._recent_daily_changes_sync, symbol, count)
 
     def _regular_gainers_sync(
         self,
@@ -493,3 +633,56 @@ class MoomooClient:
         )
         logger.info("Moomoo regular-session names above threshold: %s", len(found))
         return found
+
+    def _smallcap_page_sync(
+        self,
+        begin: int,
+        max_market_cap: float,
+        min_volume: float | None,
+    ) -> tuple[list[Quote], int]:
+        from moomoo import RET_OK, Market, SimpleFilter, StockField
+
+        cap = SimpleFilter()
+        cap.stock_field = StockField.MARKET_VAL
+        cap.filter_max = max_market_cap
+        cap.is_no_filter = False
+        price = SimpleFilter()
+        price.stock_field = StockField.CUR_PRICE
+        price.filter_min = 0
+        price.is_no_filter = False
+        filters: list[Any] = [cap, price]
+        if min_volume is not None:
+            from moomoo import AccumulateFilter
+
+            volume = AccumulateFilter()
+            volume.stock_field = StockField.VOLUME
+            volume.days = 1
+            volume.filter_min = min_volume
+            volume.is_no_filter = False
+            filters.append(volume)
+        with self._lock:
+            ret, data = self._context().get_stock_filter(
+                Market.US, filters, begin=begin, num=_PAGE_SIZE
+            )
+        if ret != RET_OK:
+            raise RuntimeError(f"Moomoo last-hour screen failed: {data}")
+        last_page, all_count, rows = data
+        quotes: list[Quote] = []
+        for item in rows or []:
+            quote = quote_from_filter(item)
+            if quote is not None:
+                quotes.append(quote)
+        next_begin = begin + len(rows or [])
+        if not rows or last_page or next_begin >= int(all_count):
+            next_begin = 0
+        return quotes, next_begin
+
+    async def smallcap_page(
+        self,
+        begin: int,
+        max_market_cap: float,
+        min_volume: float | None = None,
+    ) -> tuple[list[Quote], int]:
+        return await asyncio.to_thread(
+            self._smallcap_page_sync, begin, max_market_cap, min_volume
+        )

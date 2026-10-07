@@ -156,11 +156,15 @@ class Store:
         message: str,
         price: float | None,
         change_pct: float | None,
+        label: str | None = None,
+        notify: str | None = None,
     ) -> Alert:
         return Alert(
             id=str(uuid4()),
             rule_id=rule_id,
             rule_name=rule_name,
+            label=label,
+            notify=notify,
             symbol=symbol,
             message=message,
             price=price,

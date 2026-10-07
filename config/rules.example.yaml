@@ -1,8 +1,11 @@
 # Copy to config/rules.yaml and edit.
 # The monitor reloads this file on every poll, so you can change rules without restarting.
 
-poll_interval_seconds: 1
-scanner_interval_seconds: 1
+# The day-30 after-hours rule uses the poll interval. Uptrend, pullback, and
+# five-day rules use the background interval.
+poll_interval_seconds: 2
+scanner_interval_seconds: 2
+background_scan_interval_seconds: 5
 poll_when_closed: true
 feed: iex
 scanner_feed: iex
@@ -12,28 +15,32 @@ watchlist: []
 
 rules:
   - id: premarket-smallcap-10pct
-    name: 盘前目前涨幅超10%，5分钟前曾超20%，总市值不超过1亿美元，成交量超过10万
+    name: 盘前目前涨幅超15%，5分钟前曾超30%，总市值不超过1亿美元，成交量超过10万
+    label: Premarket boost
+    notify: Premarket-boost
     symbol: "*"
     enabled: true
     cooldown_minutes: 240
     condition:
       type: premarket_gain
-      value: 10
-      min_prior_change: 20
+      value: 15
+      min_prior_change: 30
       prior_change_lag_minutes: 5
       max_market_cap: 100000000
       min_volume: 100000
     slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
   - id: afterhours-smallcap-10pct
-    name: 盘后目前涨幅超10%，5分钟前曾超20%，总市值不超过1亿美元，成交量超过10万
+    name: 盘后目前涨幅超15%，5分钟前曾超30%，总市值不超过1亿美元，成交量超过10万
+    label: After-hours boost
+    notify: Afterhours-boost
     symbol: "*"
     enabled: true
     cooldown_minutes: 240
     condition:
       type: afterhours_gain
-      value: 10
-      min_prior_change: 20
+      value: 15
+      min_prior_change: 30
       prior_change_lag_minutes: 5
       max_market_cap: 100000000
       min_volume: 100000
@@ -41,6 +48,8 @@ rules:
 
   - id: afterhours-day30-ah4
     name: 盘中涨幅超30%，盘后涨幅超3%，市值低于1亿美元
+    label: Day 30% boost
+    notify: Day-30-boost
     symbol: "*"
     enabled: true
     cooldown_minutes: 240
@@ -53,6 +62,8 @@ rules:
 
   - id: afterhours-uptrend-day10-ah5
     name: 盘中涨幅超10%且走势向上，盘中成交量超100万，盘后涨幅超5%，盘后成交量超10万，市值不超过1亿美元
+    label: Trend boost
+    notify: Trend-boost
     symbol: "*"
     enabled: true
     cooldown_minutes: 240
@@ -68,6 +79,8 @@ rules:
 
   - id: afterhours-circuit-breaker-day10-ah5
     name: 盘中收盘涨幅超10%并触发涨幅熔断，盘后涨幅超5%，市值不超过1亿美元
+    label: Halt boost
+    notify: Halt-boost
     symbol: "*"
     enabled: true
     cooldown_minutes: 240
@@ -78,3 +91,64 @@ rules:
       max_market_cap: 100000000
       require_circuit_breaker: true
     slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+  - id: premarket-day50-ext5
+    name: 过去5天有一天涨幅超50%，盘前涨幅超5%，总市值不超过1亿美元，成交量超过10万
+    label: 5-day premarket boost
+    notify: 5-day-premarket-boost
+    symbol: "*"
+    enabled: true
+    cooldown_minutes: 240
+    condition:
+      type: premarket_gain
+      value: 5
+      min_recent_day_change: 50
+      recent_day_count: 5
+      max_market_cap: 100000000
+      min_volume: 100000
+    slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+  - id: afterhours-day50-ext5
+    name: 过去5天有一天涨幅超50%，盘后涨幅超5%，总市值不超过1亿美元，成交量超过10万
+    label: 5-day after-hours boost
+    notify: 5-day-afterhours-boost
+    symbol: "*"
+    enabled: true
+    cooldown_minutes: 240
+    condition:
+      type: afterhours_gain
+      value: 5
+      min_recent_day_change: 50
+      recent_day_count: 5
+      max_market_cap: 100000000
+      min_volume: 100000
+    slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+  - id: regular-last-hour-20
+    name: 盘中收盘前1小时突然涨幅超20%，总市值不超过1亿美元，成交量超过10万
+    label: Last hour boost
+    notify: Last-hour-boost
+    symbol: "*"
+    enabled: true
+    cooldown_minutes: 240
+    condition:
+      type: late_session_gain
+      value: 20
+      max_market_cap: 100000000
+      min_volume: 100000
+    slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+  - id: afterhours-top5
+    name: 盘后涨幅前5，总市值不超过1亿美元，成交量超过10万
+    label: Top 5 after-hours boost
+    notify: Top-5-afterhours-boost
+    symbol: "*"
+    enabled: true
+    cooldown_minutes: 30
+    condition:
+      type: afterhours_gain
+      value: 0
+      max_market_cap: 100000000
+      min_volume: 100000
+      top_n: 5
+    slack_message: "{stock_name}{field_gap}{price_text}"

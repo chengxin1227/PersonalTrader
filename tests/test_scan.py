@@ -5,6 +5,7 @@ from monitor.models import Condition, ConditionType, Quote, Rule, RulesConfig
 from monitor.rules import (
     FIELD_GAP,
     evaluate_afterhours_scan,
+    evaluate_stable_afterhours,
     evaluate_last_hour_scan,
     evaluate_premarket_scan,
     hour_change_pct,
@@ -143,6 +144,41 @@ def test_afterhours_followthrough_requires_regular_gain_above_30():
     assert not evaluate_afterhours_scan(
         rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
     ).matched
+
+
+def test_day30_stable_band_is_inclusive_through_the_open():
+    rule = Rule(
+        id="afterhours-day30-ah3",
+        name="盘中涨幅超30%，盘后5分钟内涨幅保持在-5%到5%，市值低于1亿美元",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.AFTERHOURS_GAIN,
+            value=5,
+            min_regular_change=30,
+            max_market_cap=100_000_000,
+            min_volume=100_000,
+            stable_minutes=5,
+            stable_low=-5,
+            stable_high=5,
+        ),
+    )
+    quote = _quote(price=10.0, volume=100_001)
+    quote.change_pct = 1.2
+    quote.regular_change_pct = 30.1
+    quote.session_low_pct = -5
+    quote.session_high_pct = 5
+    assert evaluate_stable_afterhours(rule, quote, cap_filtered=True).matched
+    quote.session_high_pct = 5.01
+    assert not evaluate_stable_afterhours(rule, quote, cap_filtered=True).matched
+    quote.session_high_pct = 5
+    quote.session_low_pct = -5.01
+    assert not evaluate_stable_afterhours(rule, quote, cap_filtered=True).matched
+    quote.session_low_pct = -4
+    quote.regular_change_pct = 30
+    assert not evaluate_stable_afterhours(rule, quote, cap_filtered=True).matched
+    quote.regular_change_pct = 40
+    quote.volume = 100_000
+    assert not evaluate_stable_afterhours(rule, quote, cap_filtered=True).matched
 
 
 def test_uptrend_afterhours_rule_uses_regular_volume_and_market_cap():
@@ -389,6 +425,17 @@ def test_last_hour_gain_is_strict_and_needs_volume():
     ).matched
     assert not evaluate_last_hour_scan(
         rule, quote, in_last_hour=True, market_cap=100_000_001
+    ).matched
+    priced = rule.model_copy(deep=True)
+    priced.condition.min_price = 0.1
+    quote.price = 0.1
+    quote.change_pct = 25
+    assert not evaluate_last_hour_scan(
+        priced, quote, in_last_hour=True, market_cap=None, cap_filtered=True
+    ).matched
+    quote.price = 0.11
+    assert evaluate_last_hour_scan(
+        priced, quote, in_last_hour=True, market_cap=None, cap_filtered=True
     ).matched
 
 

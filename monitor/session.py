@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from monitor.models import MarketClock, Quote
@@ -35,6 +35,53 @@ def is_afterhours(moment: datetime | None = None) -> bool:
     return AFTERHOURS_START <= current.time() < AFTERHOURS_END
 
 
+def regular_close_approach(moment: datetime | None = None, minutes: int = 10) -> bool:
+    """True during the last `minutes` of the regular session, before 16:00 ET."""
+    current = now_et(moment)
+    if not is_regular_session(current):
+        return False
+    close = datetime.combine(current.date(), AFTERHOURS_START, tzinfo=current.tzinfo)
+    return current >= close - timedelta(minutes=minutes)
+
+
+def afterhours_just_opened(moment: datetime | None = None, seconds: int = 45) -> bool:
+    """True in the first `seconds` after 16:00 ET, while the close is still the regular close."""
+    current = now_et(moment)
+    if not is_afterhours(current):
+        return False
+    start = datetime.combine(current.date(), AFTERHOURS_START, tzinfo=current.tzinfo)
+    return current < start + timedelta(seconds=seconds)
+
+
+def afterhours_stable_due(
+    moment: datetime | None,
+    minutes: int,
+    grace_seconds: int = 20,
+) -> bool:
+    """True only just after the opening window, so a late check does not use a longer range."""
+    current = now_et(moment)
+    if current.weekday() >= 5:
+        return False
+    end = datetime.combine(current.date(), AFTERHOURS_START, tzinfo=current.tzinfo) + timedelta(
+        minutes=minutes
+    )
+    return end <= current < end + timedelta(seconds=grace_seconds)
+
+
+def afterhours_stable_missed(
+    moment: datetime | None,
+    minutes: int,
+    grace_seconds: int = 20,
+) -> bool:
+    current = now_et(moment)
+    if current.weekday() >= 5 or current.time() < AFTERHOURS_START:
+        return False
+    end = datetime.combine(current.date(), AFTERHOURS_START, tzinfo=current.tzinfo) + timedelta(
+        minutes=minutes, seconds=grace_seconds
+    )
+    return current >= end
+
+
 def afterhours_board_slot(moment: datetime | None = None) -> datetime | None:
     """The current half-hour mark during after-hours, from 16:00 through 19:30 ET."""
     current = now_et(moment)
@@ -44,15 +91,37 @@ def afterhours_board_slot(moment: datetime | None = None) -> datetime | None:
     return current.replace(minute=minute, second=0, microsecond=0)
 
 
-def last_hour_phase(moment: datetime | None = None) -> str | None:
-    """Prices are recorded from 14:45. Alerts run from 15:00 until the 16:00 close."""
+def last_hour_phase(
+    moment: datetime | None = None,
+    hours: int = 1,
+    session: str = "regular",
+) -> str | None:
+    """Record prices for 15 minutes, then alert until the session ends.
+
+    `hours` is the alert window before the session end. The baseline is the
+    15 minutes just before that. Regular two hours start at 14:00. Premarket
+    two hours start at 7:30. After-hours two hours start at 18:00.
+    """
     current = now_et(moment)
     if current.weekday() >= 5:
         return None
+    bounds = {
+        "regular": (REGULAR_START, REGULAR_END),
+        "premarket": (PREMARKET_START, PREMARKET_END),
+        "afterhours": (AFTERHOURS_START, AFTERHOURS_END),
+    }.get(session)
+    if bounds is None:
+        return None
+    start_bound, end = bounds
     clock = current.time()
-    if time(15, 0) <= clock < REGULAR_END:
+    if clock < start_bound or clock >= end:
+        return None
+    close = datetime.combine(current.date(), end, tzinfo=current.tzinfo)
+    alert_start = close - timedelta(hours=hours)
+    baseline_start = alert_start - timedelta(minutes=15)
+    if current >= alert_start:
         return "alert"
-    if time(14, 45) <= clock < time(15, 0):
+    if current >= baseline_start:
         return "baseline"
     return None
 
@@ -82,6 +151,19 @@ def seconds_until_extended_open(moment: datetime | None = None) -> float:
             if stamp > current:
                 return (stamp - current).total_seconds()
     return 3600.0
+
+
+def recent_trading_days(end: date, count: int, *, include_end: bool) -> list[str]:
+    """Weekdays ending at `end`. Premarket leaves out the unfinished session."""
+    if count < 1:
+        return []
+    cursor = end if include_end else end - timedelta(days=1)
+    found: list[str] = []
+    while len(found) < count:
+        if cursor.weekday() < 5:
+            found.append(cursor.isoformat())
+        cursor -= timedelta(days=1)
+    return found
 
 
 def is_trading_day(clock: MarketClock | None, moment: datetime | None = None) -> bool:

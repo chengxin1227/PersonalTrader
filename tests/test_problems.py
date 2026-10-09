@@ -14,6 +14,15 @@ def test_rate_limit_and_quota_are_notices():
     assert "盘后涨幅榜" in limit[2]
     assert "60 times per 30 seconds" in limit[2]
 
+    snapshot = problem_notice(
+        "Get Market Snapshot request failed due to high frequency. "
+        "Maximum 60 times per 30 seconds."
+    )
+    assert snapshot is not None
+    assert snapshot[0] == "limit:snapshot"
+    assert snapshot[1] == "OpenD 超限"
+    assert "快照" in snapshot[2]
+
     quota = problem_notice(
         "Insufficient historical K-line quota. Request failed (stock: 100/100, option: 0/20)."
     )

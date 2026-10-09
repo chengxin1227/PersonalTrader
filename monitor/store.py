@@ -28,6 +28,8 @@ class Store:
         self._alerts_path = data_dir / "alerts.jsonl"
         self._spikes_path = data_dir / "session_spikes.json"
         self._spikes: dict[str, Any] | None = None
+        self._day_gains_path = data_dir / "day_gains.json"
+        self._day_gains: dict[str, Any] | None = None
         data_dir.mkdir(parents=True, exist_ok=True)
 
     def load_state(self) -> dict[str, Any]:
@@ -116,6 +118,61 @@ class Store:
         if not isinstance(row, dict):
             return []
         return sorted(symbol for symbol in row if isinstance(symbol, str))
+
+    def note_day_gains(self, day: str, minimum: float, symbols: list[str]) -> list[str]:
+        """Remember symbols whose regular-session gain exceeded `minimum` on `day`."""
+        gains = self._load_day_gains()
+        bucket = gains.setdefault(f"{minimum:g}", {})
+        row = bucket.setdefault(day, [])
+        if not isinstance(row, list):
+            row = []
+            bucket[day] = row
+        have = {symbol for symbol in row if isinstance(symbol, str)}
+        added: list[str] = []
+        for symbol in symbols:
+            key = symbol.upper()
+            if key in have:
+                continue
+            row.append(key)
+            have.add(key)
+            added.append(key)
+        if not added:
+            return []
+        cutoff = date.fromisoformat(day) - timedelta(days=21)
+        for days in gains.values():
+            if not isinstance(days, dict):
+                continue
+            for stale in [
+                item
+                for item in days
+                if _is_iso_date(item) and date.fromisoformat(item) < cutoff
+            ]:
+                days.pop(stale, None)
+        self._save_day_gains(gains)
+        return added
+
+    def saw_day_gain(self, symbol: str, minimum: float, days: list[str]) -> bool:
+        bucket = self._load_day_gains().get(f"{minimum:g}", {})
+        if not isinstance(bucket, dict):
+            return False
+        key = symbol.upper()
+        return any(isinstance(bucket.get(day), list) and key in bucket[day] for day in days)
+
+    def _load_day_gains(self) -> dict[str, Any]:
+        if self._day_gains is not None:
+            return self._day_gains
+        if not self._day_gains_path.exists():
+            self._day_gains = {}
+            return self._day_gains
+        with self._day_gains_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self._day_gains = payload if isinstance(payload, dict) else {}
+        return self._day_gains
+
+    def _save_day_gains(self, gains: dict[str, Any]) -> None:
+        self._day_gains = gains
+        with self._day_gains_path.open("w", encoding="utf-8") as handle:
+            json.dump(gains, handle, indent=2)
 
     def _load_spikes(self) -> dict[str, Any]:
         if self._spikes is not None:

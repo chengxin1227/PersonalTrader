@@ -149,13 +149,46 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             f"after-hours names every 30m, total cap <= ${cap:,.0f}{volume}"
                         )
                         continue
+                    if (
+                        rule.condition.stable_minutes is not None
+                        and rule.condition.stable_low is not None
+                        and rule.condition.stable_high is not None
+                    ):
+                        cap = rule.condition.max_market_cap or 100_000_000
+                        volume = ""
+                        if rule.condition.min_volume is not None:
+                            volume = f" and volume > {rule.condition.min_volume:,.0f}"
+                        regular = ""
+                        if rule.condition.min_regular_change is not None:
+                            regular = (
+                                f"regular change > {rule.condition.min_regular_change:g}% and "
+                            )
+                        print(
+                            f"    - {rule.name}: first {rule.condition.stable_minutes}m "
+                            f"after-hours stays within {rule.condition.stable_low:g}%.."
+                            f"{rule.condition.stable_high:g}%, {regular}"
+                            f"total cap <= ${cap:,.0f}{volume}"
+                        )
+                        continue
                     if rule.condition.type is ConditionType.LATE_SESSION_GAIN:
                         cap = rule.condition.max_market_cap or 100_000_000
                         volume = ""
                         if rule.condition.min_volume is not None:
                             volume = f" and volume > {rule.condition.min_volume:,.0f}"
+                        if rule.condition.min_price is not None:
+                            volume += f" and price > ${rule.condition.min_price:g}"
+                        hours = rule.condition.late_session_hours
+                        session = {
+                            "premarket": "pre-market",
+                            "afterhours": "after-hours",
+                        }.get(rule.condition.late_session, "regular")
+                        span = (
+                            f"last {session} hour"
+                            if hours == 1
+                            else f"last {hours:g} {session} hours"
+                        )
                         print(
-                            f"    - {rule.name}: last regular hour "
+                            f"    - {rule.name}: {span} "
                             f">{rule.condition.value:g}% and total cap <= ${cap:,.0f}{volume}"
                         )
                         continue
@@ -176,10 +209,17 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                     if rule.condition.require_circuit_breaker:
                         volume += " and upward circuit breaker"
                     if rule.condition.min_recent_day_change is not None:
-                        volume += (
-                            f" and a day gain > {rule.condition.min_recent_day_change:g}% "
-                            f"in the last {rule.condition.recent_day_count} days"
-                        )
+                        if rule.condition.recent_day_count == 1:
+                            touched = "once " if rule.condition.intraday_touch else ""
+                            volume += (
+                                f" and the regular session {touched}gained "
+                                f"> {rule.condition.min_recent_day_change:g}%"
+                            )
+                        else:
+                            volume += (
+                                f" and a recorded day gain > {rule.condition.min_recent_day_change:g}% "
+                                f"in the last {rule.condition.recent_day_count} sessions"
+                            )
                     if rule.condition.skip_market_cap or (
                         rule.condition.max_market_cap is None
                         and rule.condition.require_circuit_breaker

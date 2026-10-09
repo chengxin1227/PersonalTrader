@@ -33,6 +33,13 @@ class Condition(BaseModel):
     top_n: Optional[int] = Field(default=None, ge=1)
     min_recent_day_change: Optional[float] = None
     recent_day_count: int = Field(default=5, ge=1)
+    intraday_touch: bool = False
+    stable_minutes: Optional[int] = Field(default=None, ge=1)
+    stable_low: Optional[float] = None
+    stable_high: Optional[float] = None
+    late_session_hours: int = Field(default=1, ge=1)
+    late_session: str = "regular"
+    min_price: Optional[float] = None
 
 
 class Rule(BaseModel):
@@ -120,6 +127,8 @@ class Quote(BaseModel):
     after_hours_change_pct: Optional[float] = None
     volume: Optional[int] = None
     regular_volume: Optional[int] = None
+    session_low_pct: Optional[float] = None
+    session_high_pct: Optional[float] = None
     session_uptrend: Optional[bool] = None
     prior_session_spike: Optional[bool] = None
     session_circuit_breaker: Optional[bool] = None

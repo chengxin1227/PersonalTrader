@@ -15,23 +15,23 @@ watchlist: []
 
 rules:
   - id: premarket-smallcap-10pct
-    name: 盘前目前涨幅超15%，5分钟前曾超30%，总市值不超过1亿美元，成交量超过10万
+    name: 盘前目前涨幅超15%，10分钟前曾超30%，总市值不超过1亿美元，成交量超过10万
     label: Premarket boost
     notify: Premarket-boost
     symbol: "*"
     enabled: true
-    cooldown_minutes: 240
+    cooldown_minutes: 330
     condition:
       type: premarket_gain
       value: 15
       min_prior_change: 30
-      prior_change_lag_minutes: 5
+      prior_change_lag_minutes: 10
       max_market_cap: 100000000
       min_volume: 100000
     slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
   - id: afterhours-smallcap-10pct
-    name: 盘后目前涨幅超15%，5分钟前曾超30%，总市值不超过1亿美元，成交量超过10万
+    name: 盘后目前涨幅超15%，10分钟前曾超30%，总市值不超过1亿美元，成交量超过10万
     label: After-hours boost
     notify: Afterhours-boost
     symbol: "*"
@@ -41,13 +41,13 @@ rules:
       type: afterhours_gain
       value: 15
       min_prior_change: 30
-      prior_change_lag_minutes: 5
+      prior_change_lag_minutes: 10
       max_market_cap: 100000000
       min_volume: 100000
     slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
   - id: afterhours-day30-ah4
-    name: 盘中涨幅超30%，盘后涨幅超3%，市值低于1亿美元
+    name: 盘中涨幅超30%，盘后5分钟内涨幅保持在-5%到5%，市值低于1亿美元
     label: Day 30% boost
     notify: Day-30-boost
     symbol: "*"
@@ -55,13 +55,17 @@ rules:
     cooldown_minutes: 240
     condition:
       type: afterhours_gain
-      value: 3
+      value: 5
       min_regular_change: 30
       max_market_cap: 100000000
+      min_volume: 100000
+      stable_minutes: 5
+      stable_low: -5
+      stable_high: 5
     slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
   - id: afterhours-uptrend-day10-ah5
-    name: 盘中涨幅超10%且走势向上，盘中成交量超100万，盘后涨幅超5%，盘后成交量超10万，市值不超过1亿美元
+    name: 盘中涨幅超20%且走势向上，盘中成交量超100万，盘后涨幅超5%，盘后成交量超10万，市值不超过1亿美元
     label: Trend boost
     notify: Trend-boost
     symbol: "*"
@@ -70,7 +74,7 @@ rules:
     condition:
       type: afterhours_gain
       value: 5
-      min_regular_change: 10
+      min_regular_change: 20
       min_regular_volume: 1000000
       min_volume: 100000
       max_market_cap: 100000000
@@ -98,7 +102,7 @@ rules:
     notify: 5-day-premarket-boost
     symbol: "*"
     enabled: true
-    cooldown_minutes: 240
+    cooldown_minutes: 330
     condition:
       type: premarket_gain
       value: 5
@@ -124,16 +128,69 @@ rules:
       min_volume: 100000
     slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
+  - id: afterhours-day90-ah5
+    name: 盘中涨幅一度超90%，成交量超过1万，盘后涨幅超5%，市值不超过1亿美元
+    label: Day 90% boost
+    notify: Day-90-boost
+    symbol: "*"
+    enabled: true
+    cooldown_minutes: 240
+    condition:
+      type: afterhours_gain
+      value: 5
+      min_recent_day_change: 90
+      recent_day_count: 1
+      intraday_touch: true
+      max_market_cap: 100000000
+      min_volume: 10000
+    slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
   - id: regular-last-hour-20
-    name: 盘中收盘前1小时突然涨幅超20%，总市值不超过1亿美元，成交量超过10万
+    name: 盘中收盘前2小时突然涨幅超20%，总市值不超过1亿美元，成交量超过10万，价格高于0.1美元
     label: Last hour boost
     notify: Last-hour-boost
+    symbol: "*"
+    enabled: true
+    cooldown_minutes: 390
+    condition:
+      type: late_session_gain
+      value: 20
+      late_session_hours: 2
+      min_price: 0.1
+      max_market_cap: 100000000
+      min_volume: 100000
+    slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+  - id: premarket-last-2h-20
+    name: 盘前结束前2小时突然涨幅超20%，总市值不超过1亿美元，成交量超过10万，价格高于0.1美元
+    label: Premarket last 2 hours
+    notify: Premarket-last-2-hours
+    symbol: "*"
+    enabled: true
+    cooldown_minutes: 330
+    condition:
+      type: late_session_gain
+      value: 20
+      late_session_hours: 2
+      late_session: premarket
+      min_price: 0.1
+      max_market_cap: 100000000
+      min_volume: 100000
+    slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+  - id: afterhours-last-2h-20
+    name: 盘后结束前2小时突然涨幅超20%，总市值不超过1亿美元，成交量超过10万，价格高于0.1美元
+    label: After-hours last 2 hours
+    notify: Afterhours-last-2-hours
     symbol: "*"
     enabled: true
     cooldown_minutes: 240
     condition:
       type: late_session_gain
       value: 20
+      late_session_hours: 2
+      late_session: afterhours
+      min_price: 0.1
       max_market_cap: 100000000
       min_volume: 100000
     slack_message: "{stock_name}{field_gap}{move_text}{price_text}"

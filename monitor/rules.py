@@ -78,6 +78,10 @@ def evaluate_last_hour_scan(
             matched=False,
             reason=f"last hour {change:.2f}% <= {rule.condition.value:.2f}%",
         )
+    min_price = rule.condition.min_price
+    if min_price is not None and (quote.price is None or quote.price <= min_price):
+        shown = 0 if quote.price is None else quote.price
+        return RuleEvaluation(matched=False, reason=f"price {shown:g} <= {min_price:g}")
     low_volume = _reject_low_volume(rule, quote)
     if low_volume is not None:
         return low_volume
@@ -257,6 +261,62 @@ def evaluate_afterhours_scan(
         reason=(
             f"after-hours {quote.change_pct:.2f}% >= {rule.condition.value:.2f}% "
             f"and total cap ${market_cap:,.0f}"
+        ),
+    )
+
+
+def evaluate_stable_afterhours(
+    rule: Rule,
+    quote: Quote,
+    *,
+    cap_filtered: bool = False,
+) -> RuleEvaluation:
+    """Match when the after-hours high and low stayed inside the band."""
+    low = rule.condition.stable_low
+    high = rule.condition.stable_high
+    minutes = rule.condition.stable_minutes
+    if low is None or high is None or minutes is None:
+        return RuleEvaluation(matched=False, reason="no stable band")
+    if quote.change_pct is None:
+        return RuleEvaluation(matched=False, reason="no after-hours change")
+    band_low = quote.session_low_pct
+    band_high = quote.session_high_pct
+    if band_low is None or band_high is None:
+        return RuleEvaluation(matched=False, reason="no after-hours range")
+    if (
+        band_low < low
+        or band_high > high
+        or quote.change_pct < low
+        or quote.change_pct > high
+    ):
+        return RuleEvaluation(
+            matched=False,
+            reason=(
+                f"after-hours range {band_low:.2f}%..{band_high:.2f}% "
+                f"outside {low:.2f}%..{high:.2f}%"
+            ),
+        )
+    regular_min = rule.condition.min_regular_change
+    if regular_min is not None:
+        regular = quote.regular_change_pct
+        if regular is None or regular <= regular_min:
+            shown = "n/a" if regular is None else f"{regular:.2f}%"
+            return RuleEvaluation(
+                matched=False,
+                reason=f"regular change {shown} <= {regular_min:.2f}%",
+            )
+    low_volume = _reject_low_volume(rule, quote)
+    if low_volume is not None:
+        return low_volume
+    max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
+    if not cap_filtered and rule.condition.max_market_cap is not None:
+        return RuleEvaluation(matched=False, reason="no total market cap")
+    return RuleEvaluation(
+        matched=True,
+        reason=(
+            f"after-hours range {band_low:.2f}%..{band_high:.2f}% "
+            f"stayed within {low:.2f}%..{high:.2f}% for {minutes:g}m "
+            f"and total cap <= ${max_cap:,.0f}"
         ),
     )
 

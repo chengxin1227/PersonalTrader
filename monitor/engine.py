@@ -10,9 +10,8 @@ from monitor.config import Settings
 from monitor.marketcap import MarketCapClient
 from monitor.moomoo_client import (
     MoomooClient,
-    completed_daily_changes,
-    day_gain_exceeded,
     is_upward_halt,
+    regular_high_change_pct,
 )
 from monitor.models import Alert, ConditionType, MonitorStatus, Quote, Rule, RulesConfig
 from monitor.notify import NotifyRoutes
@@ -23,6 +22,7 @@ from monitor.rules import (
     evaluate_afterhours_scan,
     evaluate_last_hour_scan,
     evaluate_premarket_scan,
+    evaluate_stable_afterhours,
     evaluate_rule,
     hour_change_pct,
     leaderboard_line,
@@ -33,12 +33,17 @@ from monitor.rules import (
 from monitor.session import (
     AFTERHOURS_START,
     extended_session_open,
+    afterhours_just_opened,
+    afterhours_stable_due,
+    afterhours_stable_missed,
     is_afterhours,
     is_premarket,
     is_regular_session,
     is_trading_day,
     last_hour_phase,
+    regular_close_approach,
     now_et,
+    recent_trading_days,
     afterhours_board_slot,
     premarket_mark,
     seconds_until_extended_open,
@@ -70,6 +75,15 @@ def _is_leaderboard_rule(rule: Rule) -> bool:
 
 def _is_day_spike_rule(rule: Rule) -> bool:
     return rule.condition.min_recent_day_change is not None
+
+
+def _is_stable_rule(rule: Rule) -> bool:
+    condition = rule.condition
+    return (
+        condition.stable_minutes is not None
+        and condition.stable_low is not None
+        and condition.stable_high is not None
+    )
 
 
 def _is_last_hour_rule(rule: Rule) -> bool:
@@ -123,10 +137,10 @@ class MonitorEngine:
         self._scan_log: dict[str, tuple[tuple[str, ...], datetime]] = {}
         self._uptrend_cache: dict[tuple[str, str], bool] = {}
         self._day_spike_cache: dict[tuple[str, bool, str], bool] = {}
-        self._late_baselines: dict[str, float] = {}
+        self._late_baselines: dict[str, dict[str, float]] = {}
         self._late_begin: dict[str, int] = {}
         self._late_day: str | None = None
-        self._late_phase: str | None = None
+        self._late_phase: dict[str, str] = {}
         self._kline_blocked_until: Optional[datetime] = None
         self._trend_moomoo = MoomooClient(settings) if moomoo is not None else None
         self._trend_loop_running = False
@@ -137,6 +151,13 @@ class MonitorEngine:
         self._opend_ok_at: Optional[datetime] = None
         self._problems = ProblemLatch()
         self._board_retry_at: Optional[datetime] = None
+        self._breaker_checked_at: Optional[datetime] = None
+        self._day_gain_recorded_at: Optional[datetime] = None
+        self._stable_pool: dict[str, dict[str, Quote]] = {}
+        self._stable_ready_day: dict[str, str] = {}
+        self._stable_done: set[str] = set()
+        self._stable_captured_at: Optional[datetime] = None
+        self._stable_frozen_day: str | None = None
 
     def load_config(self, force: bool = False) -> RulesConfig:
         now = datetime.now(timezone.utc)
@@ -205,7 +226,7 @@ class MonitorEngine:
         quotes: dict[str, Quote] = {}
         if symbols:
             if self.moomoo is not None:
-                quotes = await self.moomoo.snapshots(symbols)
+                quotes = await self._moomoo_snapshots(self.moomoo, symbols)
             else:
                 quotes = await self.alpaca.snapshots(
                     symbols, config.feed or self.settings.alpaca_feed
@@ -259,7 +280,17 @@ class MonitorEngine:
                 and not _is_breaker_rule(rule)
                 and not _is_leaderboard_rule(rule)
                 and not _is_day_spike_rule(rule)
+                and not _is_stable_rule(rule)
             ]
+            stable_rules = [rule for rule in afterhours_rules if _is_stable_rule(rule)]
+            if stable_rules and self.moomoo is not None and self._stable_freeze_due():
+                for rule in stable_rules:
+                    await self._capture_stable_names(rule, self.moomoo)
+                self._stable_frozen_day = now_et().date().isoformat()
+            for rule in stable_rules:
+                matched = await self._match_stable_afterhours(rule)
+                if matched:
+                    fired.extend(await self._emit_trend_matches(rule, matched, state))
             if ranked_rules:
                 scanned, scan_error = await self._run_afterhours_rules(ranked_rules, state)
                 fired.extend(scanned)
@@ -499,35 +530,44 @@ class MonitorEngine:
                 last_hour_rules = [
                     rule for rule in config.rules if rule.enabled and _is_last_hour_rule(rule)
                 ]
-                if not rules and not last_hour_rules:
+                stable_rules = [
+                    rule for rule in config.rules if rule.enabled and _is_stable_rule(rule)
+                ]
+                day_gain_rules = [
+                    rule for rule in config.rules if rule.enabled and _is_day_spike_rule(rule)
+                ]
+                if not rules and not last_hour_rules and not stable_rules and not day_gain_rules:
                     await asyncio.sleep(30)
                     continue
                 if is_regular_session():
-                    for rule in rules:
-                        await self._record_circuit_breakers(rule)
+                    if day_gain_rules and self._day_gain_due():
+                        await self._record_day_gains(day_gain_rules)
                         self._note_opend_ok()
-                    phase = last_hour_phase()
-                    for rule in last_hour_rules:
-                        if phase is None:
-                            break
-                        matched = await self._match_last_hour(rule, phase)
-                        self._note_opend_ok()
-                        if phase != "alert" or not matched:
-                            continue
-                        async with self._lock:
-                            state = self.store.load_state()
-                            await self._emit_trend_matches(rule, matched, state)
-                            self.store.save_state(state)
+                    if stable_rules and self._stable_capture_due():
+                        client = self._trend_moomoo or self.moomoo
+                        if client is not None:
+                            for rule in stable_rules:
+                                await self._capture_stable_names(rule, client)
+                                self._note_opend_ok()
+                    if rules and self._breaker_due():
+                        for rule in rules:
+                            await self._record_circuit_breakers(rule)
+                            self._note_opend_ok()
+                    await self._run_late_rules(last_hour_rules)
                 elif is_afterhours():
-                    for rule in rules:
-                        matched = await self._match_breaker_afterhours(rule)
-                        self._note_opend_ok()
-                        if not matched:
-                            continue
-                        async with self._lock:
-                            state = self.store.load_state()
-                            await self._emit_trend_matches(rule, matched, state)
-                            self.store.save_state(state)
+                    if rules and self._breaker_due():
+                        for rule in rules:
+                            matched = await self._match_breaker_afterhours(rule)
+                            self._note_opend_ok()
+                            if not matched:
+                                continue
+                            async with self._lock:
+                                state = self.store.load_state()
+                                await self._emit_trend_matches(rule, matched, state)
+                                self.store.save_state(state)
+                    await self._run_late_rules(last_hour_rules)
+                elif is_premarket():
+                    await self._run_late_rules(last_hour_rules)
                 else:
                     await asyncio.sleep(30)
                     continue
@@ -538,6 +578,70 @@ class MonitorEngine:
                 await self._note_opend_failure(exc)
                 await self._note_problem(str(exc))
             await asyncio.sleep(10)
+
+    def _day_gain_due(self) -> bool:
+        now = datetime.now(timezone.utc)
+        last = self._day_gain_recorded_at
+        if last is not None and (now - last).total_seconds() < 60:
+            return False
+        self._day_gain_recorded_at = now
+        return True
+
+    async def _record_day_gains(self, rules: list[Rule]) -> None:
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return
+        day = now_et().date().isoformat()
+        plain: dict[tuple[float, float | None], None] = {}
+        touched: dict[tuple[float, float | None], None] = {}
+        for rule in rules:
+            minimum = rule.condition.min_recent_day_change
+            if minimum is None:
+                continue
+            key = (minimum, rule.condition.max_market_cap)
+            if rule.condition.intraday_touch:
+                touched[key] = None
+            else:
+                plain[key] = None
+        for minimum, cap in plain:
+            found = await client.regular_gainers(minimum, max_market_cap=cap)
+            self._note_day_gain_names(day, minimum, [quote.symbol for quote in found])
+        for minimum, cap in touched:
+            await self._record_intraday_touch(client, day, minimum, cap)
+
+    def _note_day_gain_names(self, day: str, minimum: float, symbols: list[str]) -> None:
+        added = self.store.note_day_gains(day, minimum, symbols)
+        if added:
+            logger.info("Recorded day gain > %.0f%%: %s", minimum, ", ".join(added))
+
+    async def _record_intraday_touch(
+        self,
+        client: MoomooClient,
+        day: str,
+        minimum: float,
+        cap: float | None,
+    ) -> None:
+        """Remember a name that traded above the threshold, even if it later fell back."""
+        found = await client.regular_gainers(20, max_market_cap=cap)
+        snaps = await self._moomoo_snapshots(client, [quote.symbol for quote in found])
+        symbols = [
+            quote.symbol
+            for quote in found
+            if quote.change_pct is not None and quote.change_pct > minimum
+        ]
+        for symbol, snap in snaps.items():
+            change = regular_high_change_pct(snap.daily_high, snap.prev_close)
+            if change is not None and change > minimum:
+                symbols.append(symbol)
+        self._note_day_gain_names(day, minimum, symbols)
+
+    def _breaker_due(self) -> bool:
+        now = datetime.now(timezone.utc)
+        last = self._breaker_checked_at
+        if last is not None and (now - last).total_seconds() < 60:
+            return False
+        self._breaker_checked_at = now
+        return True
 
     def _note_opend_ok(self) -> None:
         self._opend_ok_at = datetime.now(timezone.utc)
@@ -583,6 +687,11 @@ class MonitorEngine:
                 await self.slack.send_text(f"{title}\n{message}", webhook_url=slack_url)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not send system alert to Slack: %s", exc)
+
+    async def _moomoo_snapshots(self, client: MoomooClient, symbols: list[str]) -> dict[str, Quote]:
+        quotes = await client.snapshots(symbols)
+        await self._drain_client_problem(client)
+        return quotes
 
     async def _drain_client_problem(self, client: MoomooClient) -> None:
         message = client.take_problem()
@@ -946,6 +1055,106 @@ class MonitorEngine:
                     fired.append(alert)
         return fired, slack_error
 
+    def _stable_capture_due(self) -> bool:
+        if not regular_close_approach():
+            return False
+        now = datetime.now(timezone.utc)
+        last = self._stable_captured_at
+        if last is not None and (now - last).total_seconds() < 60:
+            return False
+        self._stable_captured_at = now
+        return True
+
+    def _stable_freeze_due(self) -> bool:
+        if not afterhours_just_opened():
+            return False
+        return self._stable_frozen_day != now_et().date().isoformat()
+
+    async def _capture_stable_names(self, rule: Rule, client: MoomooClient) -> None:
+        minimum = rule.condition.min_regular_change
+        if minimum is None:
+            return
+        found = await client.regular_gainers(
+            minimum, max_market_cap=rule.condition.max_market_cap
+        )
+        pool: dict[str, Quote] = {}
+        for quote in found:
+            quote.regular_change_pct = quote.change_pct
+            quote.change_pct = None
+            pool[quote.symbol] = quote
+        self._stable_pool[rule.id] = pool
+        self._stable_ready_day[rule.id] = now_et().date().isoformat()
+        logger.info("%s regular names above %.0f%%: %s", rule.id, minimum, len(pool))
+
+    async def _stable_rank_fallback(self, rule: Rule) -> list[Quote]:
+        if self.moomoo is None or rule.condition.stable_low is None:
+            return []
+        found = await self.moomoo.scan_afterhours(
+            rule.condition.stable_low,
+            rule.condition.max_market_cap,
+            max_pages=8,
+        )
+        minimum = rule.condition.min_regular_change
+        quotes: list[Quote] = []
+        for quote, _cap in found:
+            if minimum is not None and (
+                quote.regular_change_pct is None or quote.regular_change_pct <= minimum
+            ):
+                continue
+            quotes.append(quote)
+        logger.info("%s stable fallback from after-hours rank: %s", rule.id, len(quotes))
+        return quotes
+
+    async def _match_stable_afterhours(self, rule: Rule) -> list[Quote]:
+        minutes = rule.condition.stable_minutes
+        if minutes is None or self.moomoo is None:
+            return []
+        day = now_et().date().isoformat()
+        key = f"{day}:{rule.id}"
+        if key in self._stable_done:
+            return []
+        if not afterhours_stable_due(now_et(), minutes):
+            if afterhours_stable_missed(now_et(), minutes):
+                self._stable_done.add(key)
+            return []
+        ready = self._stable_ready_day.get(rule.id) == day
+        if ready:
+            quotes = list(self._stable_pool.get(rule.id, {}).values())
+        else:
+            quotes = await self._stable_rank_fallback(rule)
+        if not quotes:
+            logger.info("%s stable window: no regular-session names above the minimum", rule.id)
+            self._stable_done.add(key)
+            return []
+        marks = await self.moomoo.after_hours_quotes([quote.symbol for quote in quotes])
+        await self._drain_client_problem(self.moomoo)
+        if marks is None:
+            logger.info("%s stable window: snapshot paused, will retry", rule.id)
+            return []
+        matched: list[Quote] = []
+        for quote in quotes:
+            mark = marks.get(quote.symbol)
+            if mark is None:
+                logger.info("  %s %s: no after-hours range", rule.id, quote.symbol)
+                continue
+            merged = quote.model_copy(
+                update={
+                    "price": mark.price,
+                    "change_pct": mark.change_pct,
+                    "volume": mark.volume,
+                    "session_low_pct": mark.session_low_pct,
+                    "session_high_pct": mark.session_high_pct,
+                    "company": mark.company or quote.company,
+                }
+            )
+            evaluation = evaluate_stable_afterhours(rule, merged, cap_filtered=True)
+            logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
+            if evaluation.matched:
+                matched.append(merged)
+        self._stable_done.add(key)
+        logger.info("After-hours stable matches for %s: %s", rule.id, len(matched))
+        return matched
+
     async def _match_trend_afterhours(self, rule: Rule) -> list[Quote]:
         client = self._trend_moomoo or self.moomoo
         if client is None:
@@ -966,7 +1175,7 @@ class MonitorEngine:
                 continue
             candidates.append(quote)
         if rule.condition.min_regular_volume is not None and candidates:
-            snapshots = await client.snapshots([quote.symbol for quote in candidates])
+            snapshots = await self._moomoo_snapshots(client, [quote.symbol for quote in candidates])
             for quote in candidates:
                 snap = snapshots.get(quote.symbol)
                 if snap is not None and snap.volume is not None:
@@ -1089,15 +1298,16 @@ class MonitorEngine:
         return matched
 
     async def _fill_recent_day_spikes(
-        self, quotes: list[Quote], rule: Rule, client: MoomooClient
+        self, quotes: list[Quote], rule: Rule, _client: MoomooClient
     ) -> None:
         minimum = rule.condition.min_recent_day_change
         if minimum is None:
             return
-        lookback = rule.condition.recent_day_count
-        today = now_et().date().isoformat()
+        today = now_et().date()
         include_today = is_afterhours()
-        fetched = False
+        days = recent_trading_days(
+            today, rule.condition.recent_day_count, include_end=include_today
+        )
         for quote in quotes:
             if (
                 include_today
@@ -1105,34 +1315,25 @@ class MonitorEngine:
                 and quote.regular_change_pct > minimum
             ):
                 quote.recent_day_spike = True
-                self._day_spike_cache[(today, True, quote.symbol)] = True
                 continue
-            key = (today, include_today, quote.symbol)
-            cached = self._day_spike_cache.get(key)
-            if cached is not None:
-                quote.recent_day_spike = cached
-                continue
-            if fetched:
-                continue
-            now = datetime.now(timezone.utc)
-            if self._kline_blocked_until is not None and now < self._kline_blocked_until:
-                continue
-            bars = await client.recent_daily_changes(quote.symbol, lookback + 2)
-            await self._drain_client_problem(client)
-            fetched = True
-            if bars is None:
-                self._kline_blocked_until = datetime.now(timezone.utc) + timedelta(seconds=31)
-                continue
-            changes = completed_daily_changes(bars, today=today, include_today=include_today)
-            quote.recent_day_spike = day_gain_exceeded(changes, minimum, lookback)
-            self._day_spike_cache[key] = quote.recent_day_spike
-            logger.info(
-                "%s last %s days: day gain %s %.0f%%",
-                quote.symbol,
-                lookback,
-                ">" if quote.recent_day_spike else "<=",
-                minimum,
+            quote.recent_day_spike = self.store.saw_day_gain(quote.symbol, minimum, days)
+
+    async def _run_late_rules(self, rules: list[Rule]) -> None:
+        for rule in rules:
+            phase = last_hour_phase(
+                hours=rule.condition.late_session_hours,
+                session=rule.condition.late_session,
             )
+            if phase is None:
+                continue
+            matched = await self._match_last_hour(rule, phase)
+            self._note_opend_ok()
+            if phase != "alert" or not matched:
+                continue
+            async with self._lock:
+                state = self.store.load_state()
+                await self._emit_trend_matches(rule, matched, state)
+                self.store.save_state(state)
 
     async def _match_last_hour(self, rule: Rule, phase: str) -> list[Quote]:
         client = self._trend_moomoo or self.moomoo
@@ -1143,31 +1344,59 @@ class MonitorEngine:
             self._late_day = day
             self._late_baselines.clear()
             self._late_begin.clear()
-            self._late_phase = None
-        if self._late_phase != phase:
+            self._late_phase.clear()
+        if self._late_phase.get(rule.id) != phase:
             self._late_begin[rule.id] = 0
-            self._late_phase = phase
+            self._late_phase[rule.id] = phase
+        session = rule.condition.late_session or "regular"
         max_cap = rule.condition.max_market_cap or 100_000_000
-        min_volume = rule.condition.min_volume if phase == "alert" else None
+        min_volume = rule.condition.min_volume if phase == "alert" and session == "regular" else None
+        min_price = rule.condition.min_price
         begin = self._late_begin.get(rule.id, 0)
         if begin == 0:
-            volume = "" if min_volume is None else f", volume > {min_volume:,.0f}"
-            logger.info("Last-hour %s sweep, cap <= %.0f%s", phase, max_cap, volume)
-        quotes, next_begin = await client.smallcap_page(begin, max_cap, min_volume)
+            volume = "" if rule.condition.min_volume is None else f", volume > {rule.condition.min_volume:,.0f}"
+            price = "" if min_price is None else f", price > {min_price:g}"
+            logger.info(
+                "Last %sh %s %s sweep, cap <= %.0f%s%s",
+                rule.condition.late_session_hours,
+                session,
+                phase,
+                max_cap,
+                volume,
+                price,
+            )
+        quotes, next_begin = await client.smallcap_page(begin, max_cap, min_volume, min_price)
+        if session != "regular":
+            marks = await client.session_marks([quote.symbol for quote in quotes], session)
+            await self._drain_client_problem(client)
+            if marks is None:
+                logger.info("Late-session snapshot paused for %s", rule.id)
+                return []
+            kept: list[Quote] = []
+            for quote in quotes:
+                mark = marks.get(quote.symbol)
+                if mark is None:
+                    continue
+                quote.price, quote.volume = mark
+                kept.append(quote)
+            quotes = kept
         self._late_begin[rule.id] = next_begin
         if quotes and all(quote.price is None for quote in quotes):
             logger.warning("Last-hour page returned no prices")
         if phase == "alert" and quotes and all(quote.volume is None for quote in quotes):
             logger.warning("Last-hour page returned no volume")
+        baselines = self._late_baselines.setdefault(rule.id, {})
         matched: list[Quote] = []
         for quote in quotes:
             price = quote.price
             if price is None or price <= 0:
                 continue
-            if phase == "baseline" or quote.symbol not in self._late_baselines:
-                self._late_baselines[quote.symbol] = price
+            if min_price is not None and price <= min_price:
                 continue
-            change = hour_change_pct(self._late_baselines[quote.symbol], price)
+            if phase == "baseline" or quote.symbol not in baselines:
+                baselines[quote.symbol] = price
+                continue
+            change = hour_change_pct(baselines[quote.symbol], price)
             quote.change_pct = change
             evaluation = evaluate_last_hour_scan(
                 rule, quote, in_last_hour=True, market_cap=None, cap_filtered=True
@@ -1192,7 +1421,7 @@ class MonitorEngine:
         symbols = [quote.symbol for quote in found]
         snaps: dict[str, Quote] = {}
         for start in range(0, len(symbols), 200):
-            snaps.update(await client.snapshots(symbols[start : start + 200]))
+            snaps.update(await self._moomoo_snapshots(client, symbols[start : start + 200]))
         day = now_et().date().isoformat()
         seen_at = datetime.now(timezone.utc)
         noted: list[str] = []
@@ -1516,6 +1745,7 @@ class MonitorEngine:
         if rule.condition.type is ConditionType.PREMARKET_GAIN and self.moomoo is not None:
             try:
                 quote.after_hours_change_pct = await self.moomoo.after_hours_change(quote.symbol)
+                await self._drain_client_problem(self.moomoo)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("After-hours change unavailable for %s: %s", quote.symbol, exc)
         alert = self.store.new_alert(
@@ -1565,7 +1795,7 @@ class MonitorEngine:
         symbol = symbol.strip().upper()
         config = self.load_config()
         if self.moomoo is not None:
-            quotes = await self.moomoo.snapshots([symbol])
+            quotes = await self._moomoo_snapshots(self.moomoo, [symbol])
         else:
             quotes = await self.alpaca.snapshots(
                 [symbol], config.feed or self.settings.alpaca_feed

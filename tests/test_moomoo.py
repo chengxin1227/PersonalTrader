@@ -1,19 +1,74 @@
+from datetime import date
+
 import pytest
 
 from monitor.moomoo_client import (
+    _is_opend_limit,
     afterhours_leaders,
     completed_daily_changes,
     day_gain_exceeded,
     is_circuit_breaker,
     is_test_name,
     is_upward_halt,
+    after_hours_range_pct,
+    quote_from_after_hours,
     quote_from_filter,
     quote_from_rank,
     quote_from_snapshot,
+    session_mark,
+    recent_daily_window,
+    regular_high_change_pct,
     regular_session_uptrend,
     total_market_cap,
     yesterday_cap,
 )
+
+
+def test_after_hours_range_uses_the_regular_close():
+    assert after_hours_range_pct(10.5, 5.0, 10.5, 9.5) == (-5.0, 5.0)
+    assert after_hours_range_pct(10.0, 0.0, 10.5, 9.5) == (-5.0, 5.0)
+    low, high = after_hours_range_pct(10.0, 0.0, 10.51, 9.49)
+    assert low < -5
+    assert high > 5
+    assert after_hours_range_pct(None, 0.0, 10.0, 9.0) is None
+    quote = quote_from_after_hours(
+        {
+            "code": "US.ABCD",
+            "name": "Example",
+            "after_price": 10.0,
+            "after_change_rate": 0.0,
+            "after_high_price": 10.4,
+            "after_low_price": 9.7,
+            "after_volume": 120000,
+        }
+    )
+    assert quote is not None
+    assert quote.change_pct == 0
+    assert quote.session_low_pct == -3
+    assert quote.session_high_pct == 4
+    assert quote.volume == 120000
+
+
+def test_regular_high_change_uses_the_session_high():
+    assert regular_high_change_pct(1.9, 1.0) == 90
+    assert regular_high_change_pct(1.91, 1.0) > 90
+    assert regular_high_change_pct(None, 1.0) is None
+    assert regular_high_change_pct(2.0, 0) is None
+
+
+def test_session_mark_uses_the_extended_print():
+    assert session_mark({"pre_price": 1.25, "pre_volume": 120000}, "premarket") == (1.25, 120000)
+    assert session_mark({"after_price": 0.2, "after_volume": 10}, "afterhours") == (0.2, 10)
+    assert session_mark({"pre_price": 0, "pre_volume": 100}, "premarket") is None
+    assert session_mark({"after_price": 1.0}, "regular") is None
+
+
+def test_snapshot_frequency_is_a_limit():
+    assert _is_opend_limit(
+        "Get Market Snapshot request failed due to high frequency. "
+        "Maximum 60 times per 30 seconds."
+    )
+    assert not _is_opend_limit("Unknown stock US.ABCD")
 
 
 def test_filter_row_reads_price_and_today_volume():
@@ -30,6 +85,13 @@ def test_filter_row_reads_price_and_today_volume():
     assert quote.symbol == "ABCD"
     assert quote.price == 1.25
     assert quote.volume == 150_000
+
+
+def test_recent_daily_window_stays_near_the_end_date():
+    start, end, limit = recent_daily_window(date(2026, 10, 8), 7)
+    assert end == "2026-10-08"
+    assert start == "2026-09-10"
+    assert limit > 7
 
 
 def test_day_gain_uses_the_last_five_completed_sessions():

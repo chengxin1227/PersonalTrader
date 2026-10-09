@@ -4,12 +4,12 @@ import asyncio
 import logging
 import math
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from monitor.config import Settings
 from monitor.models import MarketClock, Quote
-from monitor.session import ET
+from monitor.session import ET, now_et
 
 logger = logging.getLogger("personaltrader.moomoo")
 
@@ -111,6 +111,17 @@ def completed_daily_changes(
     return changes
 
 
+def recent_daily_window(end: date, count: int) -> tuple[str, str, int]:
+    """Start, end, and page size for the most recent daily bars.
+
+    OpenD treats a missing range as the past year and returns the oldest page
+    first. A short window with room for every session in it keeps the latest days.
+    """
+    span = max(count * 4, 21)
+    start = end - timedelta(days=span)
+    return start.isoformat(), end.isoformat(), span + 1
+
+
 def day_gain_exceeded(changes: list[float], minimum: float, lookback: int) -> bool:
     if lookback < 1:
         return False
@@ -127,6 +138,92 @@ def regular_session_uptrend(bars: list[tuple[float, float]], *, minimum_bars: in
         return False
     closes = [close for _open_px, close in bars]
     return line_slope(closes) > 0 and close_px > open_px
+
+
+def _is_opend_limit(message: str) -> bool:
+    lowered = message.lower()
+    if "quota" in lowered or "high frequency" in lowered or "too frequent" in lowered:
+        return True
+    return "maximum" in lowered and "times per" in lowered
+
+
+def after_hours_range_pct(
+    price: float | None,
+    change_pct: float | None,
+    high: float | None,
+    low: float | None,
+) -> tuple[float, float] | None:
+    """After-hours low and high versus the regular close, in percent.
+
+    `change_pct` is the after-hours change already expressed in percent, the same
+    unit as `after_change_rate` on a snapshot.
+    """
+    if price is None or change_pct is None or price <= 0:
+        return None
+    if high is None or low is None or high <= 0 or low <= 0:
+        return None
+    denominator = 1 + change_pct / 100
+    if denominator <= 0:
+        return None
+    base = price / denominator
+    if base <= 0:
+        return None
+    return (
+        round((low - base) / base * 100, 4),
+        round((high - base) / base * 100, 4),
+    )
+
+
+def regular_high_change_pct(high: float | None, prev_close: float | None) -> float | None:
+    """Regular-session high versus the previous close, in percent."""
+    if high is None or prev_close is None or high <= 0 or prev_close <= 0:
+        return None
+    return round((high - prev_close) / prev_close * 100, 4)
+
+
+def session_mark(row: dict[str, Any], session: str) -> tuple[float, int] | None:
+    """Premarket or after-hours price and share volume from a snapshot row."""
+    if session == "premarket":
+        price = _float(row.get("pre_price"))
+        volume = _float(row.get("pre_volume"))
+    elif session == "afterhours":
+        price = _float(row.get("after_price"))
+        volume = _float(row.get("after_volume"))
+    else:
+        return None
+    if price is None or price <= 0:
+        return None
+    return price, int(volume or 0)
+
+
+def quote_from_after_hours(row: dict[str, Any]) -> Quote | None:
+    symbol = bare_symbol(str(row.get("code") or ""))
+    if not symbol:
+        return None
+    name = str(row.get("name") or "").strip()
+    if is_test_name(name):
+        return None
+    price = _float(row.get("after_price"))
+    change = _float(row.get("after_change_rate"))
+    band = after_hours_range_pct(
+        price,
+        change,
+        _float(row.get("after_high_price")),
+        _float(row.get("after_low_price")),
+    )
+    if price is None or price <= 0 or change is None or band is None:
+        return None
+    volume = _float(row.get("after_volume"))
+    low_pct, high_pct = band
+    return Quote(
+        symbol=symbol,
+        company=name or None,
+        price=price,
+        change_pct=change,
+        volume=int(volume) if volume is not None else None,
+        session_low_pct=low_pct,
+        session_high_pct=high_pct,
+    )
 
 
 def quote_from_snapshot(row: dict[str, Any]) -> Quote:
@@ -288,6 +385,10 @@ class MoomooClient:
         if ret == RET_OK:
             return data.to_dict(orient="records")
         message = str(data)
+        if _is_opend_limit(message):
+            self._remember_problem(message)
+            logger.warning("Moomoo snapshot paused: %s", message)
+            return []
         if len(codes) == 1:
             logger.warning("Skip %s: %s", codes[0], message)
             return []
@@ -362,6 +463,7 @@ class MoomooClient:
         session: str = "premarket",
         max_market_cap: float | None = None,
         limit: int | None = None,
+        max_pages: int = _MAX_PAGES,
     ) -> list[tuple[Quote, float | None]]:
         from moomoo import RET_OK, SimpleRankFilter, SimpleRankIndicatorType
 
@@ -387,7 +489,7 @@ class MoomooClient:
         offset = 0
         with self._lock:
             context = self._context()
-            for _page in range(_MAX_PAGES):
+            for _page in range(max_pages):
                 ret, data = getattr(context, rank_method)(
                     count=_PAGE_SIZE, offset=offset, filter_list=filter_list
                 )
@@ -435,7 +537,10 @@ class MoomooClient:
         return found
 
     async def scan_afterhours(
-        self, min_change_pct: float, max_market_cap: float | None = None
+        self,
+        min_change_pct: float,
+        max_market_cap: float | None = None,
+        max_pages: int = _MAX_PAGES,
     ) -> list[tuple[Quote, float | None]]:
         if max_market_cap is None:
             logger.info("Moomoo after-hours rank, gain >= %.1f%%", min_change_pct)
@@ -445,9 +550,73 @@ class MoomooClient:
                 min_change_pct,
                 max_market_cap,
             )
-        found = await asyncio.to_thread(self._scan_sync, min_change_pct, "afterhours", max_market_cap)
+        found = await asyncio.to_thread(
+            self._scan_sync,
+            min_change_pct,
+            "afterhours",
+            max_market_cap,
+            None,
+            max_pages,
+        )
         logger.info("Moomoo after-hours names above threshold: %s", len(found))
         return found
+
+    def _after_hours_quotes_sync(self, symbols: list[str]) -> dict[str, Quote] | None:
+        codes = [f"US.{symbol.strip().upper()}" for symbol in symbols if symbol.strip()]
+        if not codes:
+            return {}
+        quotes: dict[str, Quote] = {}
+        with self._lock:
+            context = self._context()
+            for start in range(0, len(codes), _PAGE_SIZE):
+                chunk = codes[start : start + _PAGE_SIZE]
+                pending = self._pending_problem
+                rows = self._snapshot_rows(context, chunk)
+                if (
+                    not rows
+                    and self._pending_problem
+                    and self._pending_problem != pending
+                    and _is_opend_limit(self._pending_problem)
+                ):
+                    return None
+                for row in rows:
+                    quote = quote_from_after_hours(row)
+                    if quote is not None and quote.symbol:
+                        quotes[quote.symbol] = quote
+        return quotes
+
+    async def after_hours_quotes(self, symbols: list[str]) -> dict[str, Quote] | None:
+        return await asyncio.to_thread(self._after_hours_quotes_sync, symbols)
+
+    def _session_marks_sync(self, symbols: list[str], session: str) -> dict[str, tuple[float, int]] | None:
+        codes = [f"US.{symbol.strip().upper()}" for symbol in symbols if symbol.strip()]
+        if not codes:
+            return {}
+        marks: dict[str, tuple[float, int]] = {}
+        with self._lock:
+            context = self._context()
+            for start in range(0, len(codes), _PAGE_SIZE):
+                chunk = codes[start : start + _PAGE_SIZE]
+                pending = self._pending_problem
+                rows = self._snapshot_rows(context, chunk)
+                if (
+                    not rows
+                    and self._pending_problem
+                    and self._pending_problem != pending
+                    and _is_opend_limit(self._pending_problem)
+                ):
+                    return None
+                for row in rows:
+                    mark = session_mark(row, session)
+                    symbol = bare_symbol(str(row.get("code") or ""))
+                    if mark is not None and symbol:
+                        marks[symbol] = mark
+        return marks
+
+    async def session_marks(
+        self, symbols: list[str], session: str
+    ) -> dict[str, tuple[float, int]] | None:
+        return await asyncio.to_thread(self._session_marks_sync, symbols, session)
 
     async def top_afterhours(
         self,
@@ -524,12 +693,15 @@ class MoomooClient:
         from moomoo import RET_OK, AuType, KLType
 
         code = f"US.{symbol.strip().upper()}"
+        start, end, limit = recent_daily_window(now_et().date(), count)
         with self._lock:
             ret, data, _page = self._context().request_history_kline(
                 code,
+                start=start,
+                end=end,
                 ktype=KLType.K_DAY,
                 autype=AuType.NONE,
-                max_count=count,
+                max_count=limit,
             )
         if ret != RET_OK:
             message = str(data)
@@ -639,6 +811,7 @@ class MoomooClient:
         begin: int,
         max_market_cap: float,
         min_volume: float | None,
+        min_price: float | None = None,
     ) -> tuple[list[Quote], int]:
         from moomoo import RET_OK, Market, SimpleFilter, StockField
 
@@ -648,7 +821,7 @@ class MoomooClient:
         cap.is_no_filter = False
         price = SimpleFilter()
         price.stock_field = StockField.CUR_PRICE
-        price.filter_min = 0
+        price.filter_min = 0 if min_price is None else min_price
         price.is_no_filter = False
         filters: list[Any] = [cap, price]
         if min_volume is not None:
@@ -682,7 +855,8 @@ class MoomooClient:
         begin: int,
         max_market_cap: float,
         min_volume: float | None = None,
+        min_price: float | None = None,
     ) -> tuple[list[Quote], int]:
         return await asyncio.to_thread(
-            self._smallcap_page_sync, begin, max_market_cap, min_volume
+            self._smallcap_page_sync, begin, max_market_cap, min_volume, min_price
         )

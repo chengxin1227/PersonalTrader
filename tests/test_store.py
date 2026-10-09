@@ -22,3 +22,12 @@ def test_cooldown_and_price_state(tmp_path):
     assert store.note_spike("2026-10-02", "premarket", "AMOD", now) == first
     assert store.spike_seen_at("2026-10-02", "premarket", "AMOD") == first
     assert store.spike_seen_at("2026-10-02", "premarket", "NIVF") is None
+
+
+def test_day_gains_keep_every_name_seen_above_the_threshold(tmp_path):
+    store = Store(tmp_path)
+    assert store.note_day_gains("2026-10-08", 50, ["mi", "OLB"]) == ["MI", "OLB"]
+    assert store.note_day_gains("2026-10-08", 50, ["MI", "CDT"]) == ["CDT"]
+    assert store.saw_day_gain("mi", 50, ["2026-10-08", "2026-10-07"])
+    assert not store.saw_day_gain("MI", 50, ["2026-10-07"])
+    assert not store.saw_day_gain("MI", 60, ["2026-10-08"])

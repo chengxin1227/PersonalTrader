@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -10,7 +10,12 @@ from monitor.session import (
     is_regular_session,
     is_trading_day,
     afterhours_board_slot,
+    afterhours_just_opened,
+    afterhours_stable_due,
+    afterhours_stable_missed,
     last_hour_phase,
+    recent_trading_days,
+    regular_close_approach,
     premarket_mark,
     seconds_until_extended_open,
     trade_is_premarket,
@@ -35,6 +40,37 @@ def test_regular_session_window():
     assert not is_regular_session(datetime(2026, 9, 26, 12, 0, tzinfo=ET))
 
 
+def test_afterhours_stable_window_is_the_first_five_minutes():
+    assert regular_close_approach(datetime(2026, 10, 8, 15, 50, tzinfo=ET))
+    assert not regular_close_approach(datetime(2026, 10, 8, 15, 49, tzinfo=ET))
+    assert afterhours_just_opened(datetime(2026, 10, 8, 16, 0, 44, tzinfo=ET))
+    assert not afterhours_just_opened(datetime(2026, 10, 8, 16, 0, 45, tzinfo=ET))
+    assert not afterhours_stable_due(datetime(2026, 10, 8, 16, 4, 59, tzinfo=ET), 5)
+    assert afterhours_stable_due(datetime(2026, 10, 8, 16, 5, 0, tzinfo=ET), 5)
+    assert afterhours_stable_due(datetime(2026, 10, 8, 16, 5, 19, tzinfo=ET), 5)
+    assert not afterhours_stable_due(datetime(2026, 10, 8, 16, 5, 20, tzinfo=ET), 5)
+    assert not afterhours_stable_due(datetime(2026, 10, 10, 16, 5, tzinfo=ET), 5)
+    assert not afterhours_stable_missed(datetime(2026, 10, 8, 16, 5, 19, tzinfo=ET), 5)
+    assert afterhours_stable_missed(datetime(2026, 10, 8, 16, 5, 20, tzinfo=ET), 5)
+
+
+def test_recent_trading_days_skip_weekends_and_can_leave_out_today():
+    assert recent_trading_days(date(2026, 10, 9), 5, include_end=False) == [
+        "2026-10-08",
+        "2026-10-07",
+        "2026-10-06",
+        "2026-10-05",
+        "2026-10-02",
+    ]
+    assert recent_trading_days(date(2026, 10, 9), 5, include_end=True) == [
+        "2026-10-09",
+        "2026-10-08",
+        "2026-10-07",
+        "2026-10-06",
+        "2026-10-05",
+    ]
+
+
 def test_last_hour_records_before_the_close_and_alerts_from_15():
     assert last_hour_phase(datetime(2026, 10, 7, 14, 44, tzinfo=ET)) is None
     assert last_hour_phase(datetime(2026, 10, 7, 14, 45, tzinfo=ET)) == "baseline"
@@ -43,6 +79,22 @@ def test_last_hour_records_before_the_close_and_alerts_from_15():
     assert last_hour_phase(datetime(2026, 10, 7, 15, 59, tzinfo=ET)) == "alert"
     assert last_hour_phase(datetime(2026, 10, 7, 16, 0, tzinfo=ET)) is None
     assert last_hour_phase(datetime(2026, 10, 10, 15, 10, tzinfo=ET)) is None
+    assert last_hour_phase(datetime(2026, 10, 7, 13, 44, tzinfo=ET), hours=2) is None
+    assert last_hour_phase(datetime(2026, 10, 7, 13, 45, tzinfo=ET), hours=2) == "baseline"
+    assert last_hour_phase(datetime(2026, 10, 7, 13, 59, tzinfo=ET), hours=2) == "baseline"
+    assert last_hour_phase(datetime(2026, 10, 7, 14, 0, tzinfo=ET), hours=2) == "alert"
+    assert last_hour_phase(datetime(2026, 10, 7, 15, 59, tzinfo=ET), hours=2) == "alert"
+    assert last_hour_phase(datetime(2026, 10, 7, 16, 0, tzinfo=ET), hours=2) is None
+    assert last_hour_phase(datetime(2026, 10, 7, 7, 14, tzinfo=ET), hours=2, session="premarket") is None
+    assert last_hour_phase(datetime(2026, 10, 7, 7, 15, tzinfo=ET), hours=2, session="premarket") == "baseline"
+    assert last_hour_phase(datetime(2026, 10, 7, 7, 30, tzinfo=ET), hours=2, session="premarket") == "alert"
+    assert last_hour_phase(datetime(2026, 10, 7, 9, 29, tzinfo=ET), hours=2, session="premarket") == "alert"
+    assert last_hour_phase(datetime(2026, 10, 7, 9, 30, tzinfo=ET), hours=2, session="premarket") is None
+    assert last_hour_phase(datetime(2026, 10, 7, 17, 44, tzinfo=ET), hours=2, session="afterhours") is None
+    assert last_hour_phase(datetime(2026, 10, 7, 17, 45, tzinfo=ET), hours=2, session="afterhours") == "baseline"
+    assert last_hour_phase(datetime(2026, 10, 7, 18, 0, tzinfo=ET), hours=2, session="afterhours") == "alert"
+    assert last_hour_phase(datetime(2026, 10, 7, 19, 59, tzinfo=ET), hours=2, session="afterhours") == "alert"
+    assert last_hour_phase(datetime(2026, 10, 7, 20, 0, tzinfo=ET), hours=2, session="afterhours") is None
 
 
 def test_afterhours_board_slot_is_each_half_hour():

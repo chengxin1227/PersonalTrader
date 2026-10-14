@@ -30,6 +30,8 @@ class Store:
         self._spikes: dict[str, Any] | None = None
         self._day_gains_path = data_dir / "day_gains.json"
         self._day_gains: dict[str, Any] | None = None
+        self._trend_watch_path = data_dir / "trend_watch.json"
+        self._trend_watch: dict[str, Any] | None = None
         data_dir.mkdir(parents=True, exist_ok=True)
 
     def load_state(self) -> dict[str, Any]:
@@ -138,6 +140,27 @@ class Store:
             added.append(key)
         if not added:
             return []
+        self._prune_day_gains(gains, day)
+        self._save_day_gains(gains)
+        return added
+
+    def replace_day_gains(self, day: str, minimum: float, symbols: list[str]) -> None:
+        """Replace one day's names. A later check near the close drops names that faded."""
+        gains = self._load_day_gains()
+        bucket = gains.setdefault(f"{minimum:g}", {})
+        row: list[str] = []
+        have: set[str] = set()
+        for symbol in symbols:
+            key = symbol.upper()
+            if key in have:
+                continue
+            row.append(key)
+            have.add(key)
+        bucket[day] = row
+        self._prune_day_gains(gains, day)
+        self._save_day_gains(gains)
+
+    def _prune_day_gains(self, gains: dict[str, Any], day: str) -> None:
         cutoff = date.fromisoformat(day) - timedelta(days=21)
         for days in gains.values():
             if not isinstance(days, dict):
@@ -148,8 +171,17 @@ class Store:
                 if _is_iso_date(item) and date.fromisoformat(item) < cutoff
             ]:
                 days.pop(stale, None)
-        self._save_day_gains(gains)
-        return added
+
+    def day_gain_symbols(self, minimum: float, days: list[str]) -> list[str]:
+        bucket = self._load_day_gains().get(f"{minimum:g}", {})
+        if not isinstance(bucket, dict):
+            return []
+        found: set[str] = set()
+        for day in days:
+            row = bucket.get(day, [])
+            if isinstance(row, list):
+                found.update(symbol for symbol in row if isinstance(symbol, str))
+        return sorted(found)
 
     def saw_day_gain(self, symbol: str, minimum: float, days: list[str]) -> bool:
         bucket = self._load_day_gains().get(f"{minimum:g}", {})
@@ -157,6 +189,45 @@ class Store:
             return False
         key = symbol.upper()
         return any(isinstance(bucket.get(day), list) and key in bucket[day] for day in days)
+
+    def replace_trend_watch(self, rule_id: str, day: str, rows: list[dict[str, Any]]) -> None:
+        """Replace today's trend names. A later check near the close drops names that faded."""
+        watch = self._load_trend_watch()
+        rule_row = watch.setdefault(rule_id, {})
+        rule_row[day] = rows
+        cutoff = date.fromisoformat(day) - timedelta(days=21)
+        for days in watch.values():
+            if not isinstance(days, dict):
+                continue
+            for stale in [
+                item
+                for item in days
+                if _is_iso_date(item) and date.fromisoformat(item) < cutoff
+            ]:
+                days.pop(stale, None)
+        self._save_trend_watch(watch)
+
+    def trend_watch(self, rule_id: str, day: str) -> list[dict[str, Any]]:
+        row = self._load_trend_watch().get(rule_id, {}).get(day, [])
+        if not isinstance(row, list):
+            return []
+        return [item for item in row if isinstance(item, dict) and item.get("symbol")]
+
+    def _load_trend_watch(self) -> dict[str, Any]:
+        if self._trend_watch is not None:
+            return self._trend_watch
+        if not self._trend_watch_path.exists():
+            self._trend_watch = {}
+            return self._trend_watch
+        with self._trend_watch_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self._trend_watch = payload if isinstance(payload, dict) else {}
+        return self._trend_watch
+
+    def _save_trend_watch(self, watch: dict[str, Any]) -> None:
+        self._trend_watch = watch
+        with self._trend_watch_path.open("w", encoding="utf-8") as handle:
+            json.dump(watch, handle, indent=2)
 
     def _load_day_gains(self) -> dict[str, Any]:
         if self._day_gains is not None:

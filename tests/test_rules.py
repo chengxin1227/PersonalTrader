@@ -1,7 +1,98 @@
 from datetime import datetime, timezone
+from pathlib import Path
 
-from monitor.models import Condition, ConditionType, Quote, Rule
-from monitor.rules import evaluate_rule, render_message
+import pytest
+from pydantic import ValidationError
+
+from monitor.models import Condition, ConditionType, Quote, Rule, RulesConfig
+from monitor.rules import evaluate_rule, load_rules, render_message
+
+
+def test_example_rules_group_by_their_session():
+    config = load_rules(Path(__file__).resolve().parent.parent / "config" / "rules.example.yaml")
+    assert config.rules
+    for rule in config.rules:
+        assert rule.group == rule.condition_session
+        assert rule.description
+
+
+def test_rules_can_sit_under_their_session():
+    config = RulesConfig.model_validate(
+        {
+            "rules": {
+                "afterhours": [
+                    {
+                        "id": "x",
+                        "name": "x",
+                        "symbol": "*",
+                        "condition": {"type": "afterhours_gain", "value": 5},
+                    }
+                ],
+                "premarket": None,
+            }
+        }
+    )
+    assert [(rule.id, rule.group) for rule in config.rules] == [("x", "盘后")]
+    with pytest.raises(ValidationError):
+        RulesConfig.model_validate(
+            {
+                "rules": {
+                    "premarket": [
+                        {
+                            "id": "x",
+                            "name": "x",
+                            "symbol": "*",
+                            "condition": {"type": "afterhours_gain", "value": 5},
+                        }
+                    ]
+                }
+            }
+        )
+
+
+def test_group_must_match_the_condition():
+    with pytest.raises(ValidationError):
+        Rule(
+            id="x",
+            name="x",
+            symbol="*",
+            group="盘前",
+            condition=Condition(type=ConditionType.AFTERHOURS_GAIN, value=5),
+        )
+
+
+def test_regular_close_runs_in_the_regular_session():
+    rule = Rule(
+        id="x",
+        name="涨幅熔断",
+        symbol="*",
+        group="盘中",
+        condition=Condition(type=ConditionType.REGULAR_CLOSE, require_circuit_breaker=True),
+    )
+    assert rule.condition_session == "盘中"
+    assert rule.condition.close_minutes == 5
+    assert rule.is_scanner
+    with pytest.raises(ValidationError):
+        Rule(
+            id="x",
+            name="x",
+            symbol="*",
+            group="盘后",
+            condition=Condition(type=ConditionType.REGULAR_CLOSE),
+        )
+
+
+def test_alert_ends_with_the_description():
+    rule = Rule(
+        id="x",
+        name="盘后前5",
+        description="盘后涨幅前5，总市值不超过1亿美元",
+        symbol="*",
+        condition=Condition(type=ConditionType.AFTERHOURS_GAIN, value=0),
+        slack_message="{stock_name}{field_gap}{price_text}",
+    )
+    message = render_message(rule, _quote(1.5))
+    assert message.splitlines()[-1] == "盘后涨幅前5，总市值不超过1亿美元"
 
 
 def _quote(price: float, change_pct: float | None = 1.0) -> Quote:

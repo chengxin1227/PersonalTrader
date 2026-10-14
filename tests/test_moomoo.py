@@ -2,16 +2,20 @@ from datetime import date
 
 import pytest
 
+from monitor.models import Quote
 from monitor.moomoo_client import (
     _is_opend_limit,
     afterhours_leaders,
     completed_daily_changes,
     day_gain_exceeded,
     is_circuit_breaker,
+    is_otc_exchange,
     is_test_name,
     is_upward_halt,
+    unchanged_symbols,
     after_hours_range_pct,
     quote_from_after_hours,
+    quote_from_premarket,
     quote_from_filter,
     quote_from_rank,
     quote_from_snapshot,
@@ -47,6 +51,48 @@ def test_after_hours_range_uses_the_regular_close():
     assert quote.session_low_pct == -3
     assert quote.session_high_pct == 4
     assert quote.volume == 120000
+
+
+def test_pink_sheet_names_are_otc():
+    assert is_otc_exchange("US_PINK")
+    assert not is_otc_exchange("US_NASDAQ")
+    assert not is_otc_exchange("US_NYSE")
+    assert not is_otc_exchange("US_AMEX")
+    assert not is_otc_exchange("")
+
+
+def test_premarket_quote_uses_the_premarket_print():
+    quote = quote_from_premarket(
+        {
+            "code": "US.MI",
+            "name": "NFT Ltd",
+            "pre_price": 1.5,
+            "pre_change_rate": 6.2,
+            "pre_volume": 180000,
+        }
+    )
+    assert quote is not None
+    assert quote.symbol == "MI"
+    assert quote.change_pct == 6.2
+    assert quote.volume == 180000
+    assert quote_from_premarket({"code": "US.MI", "pre_price": 1.5}) is None
+
+
+def test_unchanged_symbols_keeps_only_a_frozen_price():
+    previous = {"ZYBT": 2.5, "WFF": 1.0}
+    current, frozen = unchanged_symbols(
+        previous,
+        [
+            Quote(symbol="ZYBT", price=2.5, change_pct=90),
+            Quote(symbol="WFF", price=1.1, change_pct=30),
+            Quote(symbol="NEW", price=3.0, change_pct=40),
+        ],
+    )
+    assert frozen == ["ZYBT"]
+    assert current == {"ZYBT": 2.5, "WFF": 1.1, "NEW": 3.0}
+    current, frozen = unchanged_symbols({}, [Quote(symbol="ZYBT", price=2.5)])
+    assert frozen == []
+    assert current == {"ZYBT": 2.5}
 
 
 def test_regular_high_change_uses_the_session_high():

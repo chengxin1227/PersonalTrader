@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+Session = Literal["盘前", "盘中", "盘后"]
+_LATE_SESSIONS: dict[str, Session] = {"premarket": "盘前", "regular": "盘中", "afterhours": "盘后"}
 
 
 class ConditionType(str, Enum):
@@ -16,11 +19,12 @@ class ConditionType(str, Enum):
     PREMARKET_GAIN = "premarket_gain"
     AFTERHOURS_GAIN = "afterhours_gain"
     LATE_SESSION_GAIN = "late_session_gain"
+    REGULAR_CLOSE = "regular_close"
 
 
 class Condition(BaseModel):
     type: ConditionType
-    value: float
+    value: float = 0
     max_market_cap: Optional[float] = None
     min_volume: Optional[float] = None
     min_regular_change: Optional[float] = None
@@ -40,13 +44,16 @@ class Condition(BaseModel):
     late_session_hours: int = Field(default=1, ge=1)
     late_session: str = "regular"
     min_price: Optional[float] = None
+    close_minutes: int = Field(default=5, ge=1)
 
 
 class Rule(BaseModel):
     id: str
     name: str
+    description: Optional[str] = None
     label: Optional[str] = None
     notify: Optional[str] = None
+    group: Optional[Session] = None
     symbol: str
     enabled: bool = True
     cooldown_minutes: int = Field(default=60, ge=0)
@@ -59,11 +66,37 @@ class Rule(BaseModel):
         return value.strip().upper()
 
     @property
+    def condition_session(self) -> Session | None:
+        """The session the condition actually runs in."""
+        kind = self.condition.type
+        if kind is ConditionType.PREMARKET_GAIN:
+            return "盘前"
+        if kind is ConditionType.AFTERHOURS_GAIN:
+            return "盘后"
+        if kind is ConditionType.LATE_SESSION_GAIN:
+            return _LATE_SESSIONS.get(self.condition.late_session)
+        if kind is ConditionType.REGULAR_CLOSE:
+            return "盘中"
+        return None
+
+    @property
+    def summary(self) -> str:
+        return (self.description or self.name).strip()
+
+    @model_validator(mode="after")
+    def group_matches_condition(self) -> "Rule":
+        actual = self.condition_session
+        if self.group is not None and actual is not None and self.group != actual:
+            raise ValueError(f"rule {self.id}: group is {self.group} but the condition runs {actual}")
+        return self
+
+    @property
     def is_scanner(self) -> bool:
         return self.condition.type in {
             ConditionType.PREMARKET_GAIN,
             ConditionType.AFTERHOURS_GAIN,
             ConditionType.LATE_SESSION_GAIN,
+            ConditionType.REGULAR_CLOSE,
         } or self.symbol in {"*", "ALL"}
 
     @field_validator("id")
@@ -85,6 +118,27 @@ class RulesConfig(BaseModel):
     stream_all_trades: bool = False
     watchlist: list[str] = Field(default_factory=list)
     rules: list[Rule] = Field(default_factory=list)
+
+    @field_validator("rules", mode="before")
+    @classmethod
+    def flatten_sessions(cls, rules: object) -> object:
+        # `rules:` with every entry commented out loads as None.
+        if rules is None:
+            return []
+        if not isinstance(rules, dict):
+            return rules
+        flat: list[object] = []
+        for section, items in rules.items():
+            session = _LATE_SESSIONS.get(section)
+            if session is None:
+                raise ValueError(f"rules section {section} must be one of {', '.join(_LATE_SESSIONS)}")
+            for item in items or []:
+                if isinstance(item, dict):
+                    if item.get("group") not in (None, session):
+                        raise ValueError(f"rule {item.get('id')} is under {section} but says {item['group']}")
+                    item = {**item, "group": session}
+                flat.append(item)
+        return flat
 
     @field_validator("watchlist")
     @classmethod

@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     pushover_user: str = ""
     moomoo_host: str = "127.0.0.1"
     moomoo_port: int = 11111
+    ths_username: str = ""
+    ths_password: str = ""
     monitor_host: str = "0.0.0.0"
     monitor_port: int = 8080
     rules_path: Path = Field(default=ROOT / "config" / "rules.yaml")

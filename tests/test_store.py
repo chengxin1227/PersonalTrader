@@ -31,3 +31,31 @@ def test_day_gains_keep_every_name_seen_above_the_threshold(tmp_path):
     assert store.saw_day_gain("mi", 50, ["2026-10-08", "2026-10-07"])
     assert not store.saw_day_gain("MI", 50, ["2026-10-07"])
     assert not store.saw_day_gain("MI", 60, ["2026-10-08"])
+    store.note_day_gains("2026-10-07", 50, ["CDT"])
+    store.note_day_gains("2026-10-09", 90, ["ZYBT"])
+    assert store.day_gain_symbols(50, ["2026-10-08", "2026-10-07"]) == ["CDT", "MI", "OLB"]
+    assert store.day_gain_symbols(90, ["2026-10-09"]) == ["ZYBT"]
+
+
+def test_closing_day_gains_drop_names_that_faded(tmp_path):
+    store = Store(tmp_path)
+    store.replace_day_gains("2026-10-09", 50, ["ZYBT", "veea", "HCMC"])
+    store.replace_day_gains("2026-10-09", 50, ["zybt"])
+    assert store.day_gain_symbols(50, ["2026-10-09"]) == ["ZYBT"]
+
+
+def test_trend_watch_replaces_the_close_list(tmp_path):
+    store = Store(tmp_path)
+    store.replace_trend_watch(
+        "trend",
+        "2026-10-09",
+        [{"symbol": "AAA", "change": 25, "volume": 2_000_000, "company": "Aaa"}],
+    )
+    store.replace_trend_watch(
+        "trend",
+        "2026-10-09",
+        [{"symbol": "BBB", "change": 22, "volume": 1_500_000, "company": "Bbb"}],
+    )
+    saved = store.trend_watch("trend", "2026-10-09")
+    assert [item["symbol"] for item in saved] == ["BBB"]
+    assert store.trend_watch("trend", "2026-10-08") == []

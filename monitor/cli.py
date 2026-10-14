@@ -170,6 +170,19 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             f"total cap <= ${cap:,.0f}{volume}"
                         )
                         continue
+                    if rule.condition.type is ConditionType.REGULAR_CLOSE:
+                        cap = rule.condition.max_market_cap or 100_000_000
+                        if rule.condition.min_recent_day_change is not None:
+                            what = f"gained > {rule.condition.min_recent_day_change:g}% at some point today"
+                        else:
+                            what = "upward circuit breaker today"
+                        if rule.condition.min_regular_change is not None:
+                            what += f", regular change > {rule.condition.min_regular_change:g}%"
+                        print(
+                            f"    - {rule.name}: last {rule.condition.close_minutes}m of the "
+                            f"regular session, {what}, total cap <= ${cap:,.0f}"
+                        )
+                        continue
                     if rule.condition.type is ConditionType.LATE_SESSION_GAIN:
                         cap = rule.condition.max_market_cap or 100_000_000
                         volume = ""
@@ -216,9 +229,12 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                                 f"> {rule.condition.min_recent_day_change:g}%"
                             )
                         else:
+                            closing_volume = ""
+                            if rule.condition.min_volume is not None:
+                                closing_volume = f" and that day's volume > {rule.condition.min_volume:,.0f}"
                             volume += (
-                                f" and a recorded day gain > {rule.condition.min_recent_day_change:g}% "
-                                f"in the last {rule.condition.recent_day_count} sessions"
+                                f" and a closing gain > {rule.condition.min_recent_day_change:g}%"
+                                f"{closing_volume} in the last {rule.condition.recent_day_count} sessions"
                             )
                     if rule.condition.skip_market_cap or (
                         rule.condition.max_market_cap is None
@@ -231,7 +247,6 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                     comparator = (
                         ">"
                         if rule.condition.min_regular_change is not None
-                        or rule.condition.min_prior_change is not None
                         or rule.condition.min_recent_day_change is not None
                         else ">="
                     )

@@ -28,11 +28,11 @@ def _reject_without_earlier_spike(rule: Rule, quote: Quote, session_name: str) -
     minimum = rule.condition.min_prior_change
     if minimum is None:
         return None
-    if quote.change_pct is None or quote.change_pct <= rule.condition.value:
+    if quote.change_pct is None or quote.change_pct < rule.condition.value:
         shown = "n/a" if quote.change_pct is None else f"{quote.change_pct:.2f}%"
         return RuleEvaluation(
             matched=False,
-            reason=f"{session_name} {shown} <= {rule.condition.value:.2f}%",
+            reason=f"{session_name} {shown} < {rule.condition.value:.2f}%",
         )
     if quote.prior_session_spike is not True:
         lag = rule.condition.prior_change_lag_minutes
@@ -386,6 +386,7 @@ def evaluate_rule(
         ConditionType.PREMARKET_GAIN,
         ConditionType.AFTERHOURS_GAIN,
         ConditionType.LATE_SESSION_GAIN,
+        ConditionType.REGULAR_CLOSE,
     }:
         return RuleEvaluation(matched=False, reason="scanner rule")
 
@@ -449,6 +450,7 @@ def render_message(rule: Rule, quote: Quote, extra: dict | None = None) -> str:
     values = {
         "id": rule.id,
         "name": rule.name,
+        "description": rule.summary,
         "symbol": quote.symbol or rule.symbol,
         "price": price,
         "change_pct": change,
@@ -470,7 +472,7 @@ def render_message(rule: Rule, quote: Quote, extra: dict | None = None) -> str:
         body = template.format(**values)
     except (KeyError, ValueError):
         body = f"{rule.name}: {values['symbol']} is ${price:.2f}"
-    reason = rule.name.strip()
+    reason = rule.summary
     if reason and reason not in body:
         return f"{body}\n{reason}"
     return body

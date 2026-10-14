@@ -7,4 +7,5 @@ pydantic>=2.9
 pydantic-settings>=2.6
 pyyaml>=6.0
 python-dotenv>=1.0
+pycryptodome>=3.20
 pytest>=8.0

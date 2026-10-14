@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from monitor.alpaca import AlpacaClient
 from monitor.config import Settings
@@ -11,7 +11,7 @@ from monitor.marketcap import MarketCapClient
 from monitor.moomoo_client import (
     MoomooClient,
     is_upward_halt,
-    regular_high_change_pct,
+    unchanged_symbols,
 )
 from monitor.models import Alert, ConditionType, MonitorStatus, Quote, Rule, RulesConfig
 from monitor.notify import NotifyRoutes
@@ -52,6 +52,7 @@ from monitor.slack import SlackClient
 from monitor.quote_link import quote_url
 from monitor.store import Store
 from monitor.stream import AlpacaStream, StreamEvent
+from monitor.tonghuashun import TonghuashunClient
 from monitor.universe import UniverseCache
 
 logger = logging.getLogger("personaltrader.monitor")
@@ -67,6 +68,10 @@ def _is_spike_rule(rule: Rule) -> bool:
 
 def _is_breaker_rule(rule: Rule) -> bool:
     return rule.condition.require_circuit_breaker
+
+
+def _is_close_rule(rule: Rule) -> bool:
+    return rule.condition.type is ConditionType.REGULAR_CLOSE
 
 
 def _is_leaderboard_rule(rule: Rule) -> bool:
@@ -116,6 +121,9 @@ class MonitorEngine:
         self.moomoo = moomoo
         self.slack = slack
         self.pushover = pushover
+        self.ths = TonghuashunClient(settings)
+        self._ths_tasks: set[asyncio.Task] = set()
+        self._ths_lock = asyncio.Lock()
         self.store = store
         self.verbose = verbose
         self.quotes: dict[str, Quote] = {}
@@ -152,7 +160,12 @@ class MonitorEngine:
         self._problems = ProblemLatch()
         self._board_retry_at: Optional[datetime] = None
         self._breaker_checked_at: Optional[datetime] = None
-        self._day_gain_recorded_at: Optional[datetime] = None
+        self._close_checked_at: Optional[datetime] = None
+        self._halt_marks: dict[str, float] = {}
+        self._halt_marks_day: str | None = None
+        self._closing_gains_day: str | None = None
+        self._closing_gains_attempted_at: Optional[datetime] = None
+        self._trend_watch_at: Optional[datetime] = None
         self._stable_pool: dict[str, dict[str, Quote]] = {}
         self._stable_ready_day: dict[str, str] = {}
         self._stable_done: set[str] = set()
@@ -297,7 +310,7 @@ class MonitorEngine:
                 slack_error = slack_error or scan_error
             if trend_rules and not self._trend_loop_running:
                 for rule in trend_rules:
-                    matched = await self._match_trend_afterhours(rule)
+                    matched = await self._match_saved_trend(rule)
                     fired.extend(await self._emit_trend_matches(rule, matched, state))
             spike_rules = [rule for rule in open_rules if _is_spike_rule(rule)]
             if spike_rules and not self._spike_loop_running:
@@ -307,7 +320,7 @@ class MonitorEngine:
             day_spike_rules = [rule for rule in open_rules if _is_day_spike_rule(rule)]
             if day_spike_rules and not self._day_spike_loop_running:
                 for rule in day_spike_rules:
-                    matched = await self._match_day_spike_rule(rule)
+                    matched = await self._match_saved_day(rule)
                     fired.extend(await self._emit_trend_matches(rule, matched, state))
             breaker_rules = [rule for rule in open_rules if _is_breaker_rule(rule)]
             if breaker_rules and not self._regular_loop_running:
@@ -433,7 +446,7 @@ class MonitorEngine:
                     await asyncio.sleep(interval)
                     continue
                 for rule in rules:
-                    matched = await self._match_trend_afterhours(rule)
+                    matched = await self._match_saved_trend(rule)
                     self._note_opend_ok()
                     if not matched:
                         continue
@@ -503,7 +516,7 @@ class MonitorEngine:
                     await asyncio.sleep(interval)
                     continue
                 for rule in rules:
-                    matched = await self._match_day_spike_rule(rule)
+                    matched = await self._match_saved_day(rule)
                     self._note_opend_ok()
                     if not matched:
                         continue
@@ -536,12 +549,27 @@ class MonitorEngine:
                 day_gain_rules = [
                     rule for rule in config.rules if rule.enabled and _is_day_spike_rule(rule)
                 ]
-                if not rules and not last_hour_rules and not stable_rules and not day_gain_rules:
+                closing_rules = [
+                    rule
+                    for rule in day_gain_rules
+                    if not rule.condition.intraday_touch
+                ]
+                trend_rules = [
+                    rule for rule in config.rules if rule.enabled and _is_trend_rule(rule)
+                ]
+                if (
+                    not rules
+                    and not last_hour_rules
+                    and not stable_rules
+                    and not day_gain_rules
+                    and not trend_rules
+                ):
                     await asyncio.sleep(30)
                     continue
                 if is_regular_session():
-                    if day_gain_rules and self._day_gain_due():
-                        await self._record_day_gains(day_gain_rules)
+                    touch_rules = [rule for rule in day_gain_rules if rule.condition.intraday_touch]
+                    if touch_rules:
+                        await self._record_day_gains(touch_rules)
                         self._note_opend_ok()
                     if stable_rules and self._stable_capture_due():
                         client = self._trend_moomoo or self.moomoo
@@ -549,14 +577,49 @@ class MonitorEngine:
                             for rule in stable_rules:
                                 await self._capture_stable_names(rule, client)
                                 self._note_opend_ok()
+                    if (
+                        trend_rules
+                        and regular_close_approach()
+                        and self._trend_watch_due()
+                    ):
+                        for rule in trend_rules:
+                            await self._capture_trend_watch(rule)
+                            self._note_opend_ok()
                     if rules and self._breaker_due():
                         for rule in rules:
                             await self._record_circuit_breakers(rule)
                             self._note_opend_ok()
+                    close_rules = [
+                        rule
+                        for rule in config.rules
+                        if rule.enabled
+                        and _is_close_rule(rule)
+                        and regular_close_approach(minutes=rule.condition.close_minutes)
+                    ]
+                    if close_rules and self._close_due():
+                        for rule in close_rules:
+                            if _is_breaker_rule(rule):
+                                matched = await self._match_breaker_close(rule)
+                            elif _is_day_spike_rule(rule):
+                                matched = await self._match_day_gain_close(rule)
+                            else:
+                                continue
+                            self._note_opend_ok()
+                            if not matched:
+                                continue
+                            async with self._lock:
+                                state = self.store.load_state()
+                                await self._emit_trend_matches(rule, matched, state)
+                                self.store.save_state(state)
                     await self._run_late_rules(last_hour_rules)
                 elif is_afterhours():
-                    if rules and self._breaker_due():
-                        for rule in rules:
+                    if closing_rules and self._closing_gains_due():
+                        await self._record_closing_gains(closing_rules)
+                        self._closing_gains_day = now_et().date().isoformat()
+                        self._note_opend_ok()
+                    afterhours_breakers = [rule for rule in rules if not _is_close_rule(rule)]
+                    if afterhours_breakers and self._breaker_due():
+                        for rule in afterhours_breakers:
                             matched = await self._match_breaker_afterhours(rule)
                             self._note_opend_ok()
                             if not matched:
@@ -579,12 +642,15 @@ class MonitorEngine:
                 await self._note_problem(str(exc))
             await asyncio.sleep(10)
 
-    def _day_gain_due(self) -> bool:
+    def _closing_gains_due(self) -> bool:
+        day = now_et().date().isoformat()
+        if self._closing_gains_day == day:
+            return False
         now = datetime.now(timezone.utc)
-        last = self._day_gain_recorded_at
+        last = self._closing_gains_attempted_at
         if last is not None and (now - last).total_seconds() < 60:
             return False
-        self._day_gain_recorded_at = now
+        self._closing_gains_attempted_at = now
         return True
 
     async def _record_day_gains(self, rules: list[Rule]) -> None:
@@ -592,48 +658,207 @@ class MonitorEngine:
         if client is None:
             return
         day = now_et().date().isoformat()
-        plain: dict[tuple[float, float | None], None] = {}
-        touched: dict[tuple[float, float | None], None] = {}
+        seen: set[tuple[float, float | None]] = set()
         for rule in rules:
             minimum = rule.condition.min_recent_day_change
             if minimum is None:
                 continue
             key = (minimum, rule.condition.max_market_cap)
-            if rule.condition.intraday_touch:
-                touched[key] = None
-            else:
-                plain[key] = None
-        for minimum, cap in plain:
-            found = await client.regular_gainers(minimum, max_market_cap=cap)
-            self._note_day_gain_names(day, minimum, [quote.symbol for quote in found])
-        for minimum, cap in touched:
-            await self._record_intraday_touch(client, day, minimum, cap)
+            if key in seen:
+                continue
+            seen.add(key)
+            found = await client.regular_gainers(minimum, max_market_cap=rule.condition.max_market_cap)
+            added = self.store.note_day_gains(day, minimum, [quote.symbol for quote in found])
+            if added:
+                logger.info("Recorded day gain > %.0f%%: %s", minimum, ", ".join(added))
 
-    def _note_day_gain_names(self, day: str, minimum: float, symbols: list[str]) -> None:
-        added = self.store.note_day_gains(day, minimum, symbols)
-        if added:
-            logger.info("Recorded day gain > %.0f%%: %s", minimum, ", ".join(added))
+    async def _record_closing_gains(self, rules: list[Rule]) -> None:
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return
+        day = now_et().date().isoformat()
+        seen: set[tuple[float, float | None, float | None]] = set()
+        for rule in rules:
+            minimum = rule.condition.min_recent_day_change
+            if minimum is None:
+                continue
+            key = (minimum, rule.condition.max_market_cap, rule.condition.min_volume)
+            if key in seen:
+                continue
+            seen.add(key)
+            found = await client.regular_gainers(
+                minimum,
+                max_market_cap=rule.condition.max_market_cap,
+                min_volume=rule.condition.min_volume,
+            )
+            symbols = [quote.symbol for quote in found]
+            self.store.replace_day_gains(day, minimum, symbols)
+            logger.info(
+                "Closing gain > %.0f%%: %s",
+                minimum,
+                ", ".join(symbols) if symbols else "0",
+            )
 
-    async def _record_intraday_touch(
-        self,
-        client: MoomooClient,
-        day: str,
-        minimum: float,
-        cap: float | None,
-    ) -> None:
-        """Remember a name that traded above the threshold, even if it later fell back."""
-        found = await client.regular_gainers(20, max_market_cap=cap)
+    def _trend_watch_due(self) -> bool:
+        now = datetime.now(timezone.utc)
+        last = self._trend_watch_at
+        if last is not None and (now - last).total_seconds() < 60:
+            return False
+        self._trend_watch_at = now
+        return True
+
+    async def _capture_trend_watch(self, rule: Rule) -> None:
+        client = self._trend_moomoo or self.moomoo
+        minimum = rule.condition.min_regular_change
+        if client is None or minimum is None:
+            return
+        day = now_et().date().isoformat()
+        found = await client.regular_gainers(minimum, max_market_cap=rule.condition.max_market_cap)
+        if not found:
+            self.store.replace_trend_watch(rule.id, day, [])
+            return
         snaps = await self._moomoo_snapshots(client, [quote.symbol for quote in found])
-        symbols = [
-            quote.symbol
-            for quote in found
-            if quote.change_pct is not None and quote.change_pct > minimum
-        ]
-        for symbol, snap in snaps.items():
-            change = regular_high_change_pct(snap.daily_high, snap.prev_close)
-            if change is not None and change > minimum:
-                symbols.append(symbol)
-        self._note_day_gain_names(day, minimum, symbols)
+        if not snaps:
+            return
+        volume_min = rule.condition.min_regular_volume
+        ready: list[Quote] = []
+        for quote in found:
+            snap = snaps.get(quote.symbol)
+            if snap is None or snap.volume is None:
+                continue
+            if volume_min is not None and snap.volume <= volume_min:
+                continue
+            quote.regular_volume = snap.volume
+            quote.regular_change_pct = quote.change_pct
+            quote.company = snap.company or quote.company
+            ready.append(quote)
+        if rule.condition.require_uptrend:
+            await self._fill_session_uptrends(ready, rule, client, refresh=True)
+        previous = {
+            str(item["symbol"]): item for item in self.store.trend_watch(rule.id, day)
+        }
+        found_symbols = {quote.symbol for quote in found}
+        rows: list[dict[str, Any]] = []
+        kept: set[str] = set()
+        for quote in ready:
+            uptrend = quote.session_uptrend
+            if rule.condition.require_uptrend and uptrend is False:
+                continue
+            if rule.condition.require_uptrend and uptrend is not True and quote.symbol not in previous:
+                continue
+            rows.append(
+                {
+                    "symbol": quote.symbol,
+                    "change": quote.regular_change_pct,
+                    "volume": quote.regular_volume,
+                    "company": quote.company,
+                }
+            )
+            kept.add(quote.symbol)
+        for symbol, row in previous.items():
+            if symbol in kept or symbol not in found_symbols or symbol in snaps:
+                continue
+            rows.append(row)
+        self.store.replace_trend_watch(rule.id, day, rows)
+        if rows:
+            logger.info("Trend watch %s: %s", rule.id, ", ".join(item["symbol"] for item in rows))
+
+    async def _saved_afterhours_quotes(
+        self, client: MoomooClient, symbols: list[str]
+    ) -> dict[str, Quote] | None:
+        if not symbols:
+            return {}
+        marks = await client.after_hours_quotes(symbols)
+        await self._drain_client_problem(client)
+        return marks
+
+    async def _saved_premarket_quotes(
+        self, client: MoomooClient, symbols: list[str]
+    ) -> dict[str, Quote] | None:
+        if not symbols:
+            return {}
+        marks = await client.premarket_quotes(symbols)
+        await self._drain_client_problem(client)
+        return marks
+
+    async def _match_saved_day(self, rule: Rule) -> list[Quote]:
+        client = self._trend_moomoo or self.moomoo
+        minimum = rule.condition.min_recent_day_change
+        if client is None or minimum is None:
+            return []
+        afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
+        days = recent_trading_days(
+            now_et().date(),
+            rule.condition.recent_day_count,
+            include_end=afterhours,
+        )
+        symbols = self.store.day_gain_symbols(minimum, days)
+        if afterhours:
+            marks = await self._saved_afterhours_quotes(client, symbols)
+        else:
+            marks = await self._saved_premarket_quotes(client, symbols)
+        if not marks:
+            return []
+        matched: list[Quote] = []
+        for symbol in symbols:
+            mark = marks.get(symbol)
+            if mark is None:
+                continue
+            mark.recent_day_spike = True
+            if afterhours:
+                evaluation = evaluate_afterhours_scan(
+                    rule, mark, market_cap=None, in_afterhours=True, cap_filtered=True
+                )
+            else:
+                evaluation = evaluate_premarket_scan(
+                    rule, mark, market_cap=None, in_premarket=True, cap_filtered=True
+                )
+            if evaluation.matched:
+                matched.append(mark)
+        label = "Saved after-hours" if afterhours else "Saved pre-market"
+        self._log_saved_matches(rule.id, [quote.symbol for quote in matched], label)
+        return matched
+
+    async def _match_saved_trend(self, rule: Rule) -> list[Quote]:
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return []
+        saved = self.store.trend_watch(rule.id, now_et().date().isoformat())
+        marks = await self._saved_afterhours_quotes(
+            client, [str(item["symbol"]) for item in saved]
+        )
+        if not marks:
+            return []
+        by_symbol = {str(item["symbol"]): item for item in saved}
+        matched: list[Quote] = []
+        for symbol, mark in marks.items():
+            row = by_symbol.get(symbol, {})
+            mark.regular_change_pct = row.get("change")
+            volume = row.get("volume")
+            mark.regular_volume = int(volume) if volume is not None else None
+            mark.company = mark.company or row.get("company")
+            mark.session_uptrend = True
+            evaluation = evaluate_afterhours_scan(
+                rule, mark, market_cap=None, in_afterhours=True, cap_filtered=True
+            )
+            if evaluation.matched:
+                matched.append(mark)
+        self._log_saved_matches(rule.id, [quote.symbol for quote in matched], "Saved trend")
+        return matched
+
+    def _log_saved_matches(self, rule_id: str, symbols: list[str], label: str) -> None:
+        signature = tuple(sorted(symbols))
+        now = datetime.now(timezone.utc)
+        previous = self._scan_log.get(rule_id)
+        if (
+            previous is not None
+            and previous[0] == signature
+            and (now - previous[1]).total_seconds() < 60
+        ):
+            return
+        shown = ", ".join(symbols) if symbols else "0"
+        logger.info("%s matches for %s: %s", label, rule_id, shown)
+        self._scan_log[rule_id] = (signature, now)
 
     def _breaker_due(self) -> bool:
         now = datetime.now(timezone.utc)
@@ -1155,54 +1380,6 @@ class MonitorEngine:
         logger.info("After-hours stable matches for %s: %s", rule.id, len(matched))
         return matched
 
-    async def _match_trend_afterhours(self, rule: Rule) -> list[Quote]:
-        client = self._trend_moomoo or self.moomoo
-        if client is None:
-            return []
-        max_cap = None if rule.condition.skip_market_cap else (rule.condition.max_market_cap or 100_000_000)
-        found = await client.scan_afterhours(rule.condition.value, max_cap)
-        candidates: list[Quote] = []
-        regular_min = rule.condition.min_regular_change
-        volume_min = rule.condition.min_volume
-        for quote, _cap in found:
-            if quote.change_pct is None or quote.change_pct <= rule.condition.value:
-                continue
-            if regular_min is not None and (
-                quote.regular_change_pct is None or quote.regular_change_pct <= regular_min
-            ):
-                continue
-            if volume_min is not None and (quote.volume is None or quote.volume <= volume_min):
-                continue
-            candidates.append(quote)
-        if rule.condition.min_regular_volume is not None and candidates:
-            snapshots = await self._moomoo_snapshots(client, [quote.symbol for quote in candidates])
-            for quote in candidates:
-                snap = snapshots.get(quote.symbol)
-                if snap is not None and snap.volume is not None:
-                    quote.regular_volume = snap.volume
-        if rule.condition.require_uptrend:
-            await self._fill_session_uptrends(candidates, rule, client)
-        matched: list[Quote] = []
-        for quote in candidates:
-            evaluation = evaluate_afterhours_scan(
-                rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
-            )
-            if self.verbose:
-                logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
-            if evaluation.matched:
-                matched.append(quote)
-        signature = tuple(sorted(quote.symbol for quote in matched))
-        now = datetime.now(timezone.utc)
-        previous = self._scan_log.get(rule.id)
-        if (
-            previous is None
-            or previous[0] != signature
-            or (now - previous[1]).total_seconds() >= 60
-        ):
-            logger.info("After-hours matches for %s: %s", rule.id, len(matched))
-            self._scan_log[rule.id] = (signature, now)
-        return matched
-
     async def _match_spike_rule(self, rule: Rule) -> list[Quote]:
         client = self._trend_moomoo or self.moomoo
         if client is None:
@@ -1216,7 +1393,7 @@ class MonitorEngine:
         candidates: list[Quote] = []
         volume_min = rule.condition.min_volume
         for quote, _cap in found:
-            if quote.change_pct is None or quote.change_pct <= rule.condition.value:
+            if quote.change_pct is None or quote.change_pct < rule.condition.value:
                 continue
             if volume_min is not None and (quote.volume is None or quote.volume <= volume_min):
                 continue
@@ -1250,73 +1427,6 @@ class MonitorEngine:
             logger.info("%s pullback matches for %s: %s", session_name, rule.id, len(matched))
             self._scan_log[rule.id] = (signature, now)
         return matched
-
-    async def _match_day_spike_rule(self, rule: Rule) -> list[Quote]:
-        client = self._trend_moomoo or self.moomoo
-        if client is None:
-            return []
-        afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
-        max_cap = rule.condition.max_market_cap or 100_000_000
-        if afterhours:
-            found = await client.scan_afterhours(rule.condition.value, max_cap)
-        else:
-            found = await client.scan_premarket(rule.condition.value, max_cap)
-        candidates: list[Quote] = []
-        volume_min = rule.condition.min_volume
-        for quote, _cap in found:
-            if quote.change_pct is None or quote.change_pct <= rule.condition.value:
-                continue
-            if volume_min is not None and (quote.volume is None or quote.volume <= volume_min):
-                continue
-            candidates.append(quote)
-        await self._fill_recent_day_spikes(candidates, rule, client)
-        matched: list[Quote] = []
-        for quote in candidates:
-            if afterhours:
-                evaluation = evaluate_afterhours_scan(
-                    rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
-                )
-            else:
-                evaluation = evaluate_premarket_scan(
-                    rule, quote, market_cap=None, in_premarket=True, cap_filtered=True
-                )
-            if self.verbose:
-                logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
-            if evaluation.matched:
-                matched.append(quote)
-        signature = tuple(sorted(quote.symbol for quote in matched))
-        now = datetime.now(timezone.utc)
-        previous = self._scan_log.get(rule.id)
-        if (
-            previous is None
-            or previous[0] != signature
-            or (now - previous[1]).total_seconds() >= 60
-        ):
-            session_name = "After-hours" if afterhours else "Pre-market"
-            logger.info("%s day-gain matches for %s: %s", session_name, rule.id, len(matched))
-            self._scan_log[rule.id] = (signature, now)
-        return matched
-
-    async def _fill_recent_day_spikes(
-        self, quotes: list[Quote], rule: Rule, _client: MoomooClient
-    ) -> None:
-        minimum = rule.condition.min_recent_day_change
-        if minimum is None:
-            return
-        today = now_et().date()
-        include_today = is_afterhours()
-        days = recent_trading_days(
-            today, rule.condition.recent_day_count, include_end=include_today
-        )
-        for quote in quotes:
-            if (
-                include_today
-                and quote.regular_change_pct is not None
-                and quote.regular_change_pct > minimum
-            ):
-                quote.recent_day_spike = True
-                continue
-            quote.recent_day_spike = self.store.saw_day_gain(quote.symbol, minimum, days)
 
     async def _run_late_rules(self, rules: list[Rule]) -> None:
         for rule in rules:
@@ -1418,11 +1528,17 @@ class MonitorEngine:
         if client is None:
             return
         found = await client.regular_gainers(20, max_market_cap=rule.condition.max_market_cap)
-        symbols = [quote.symbol for quote in found]
-        snaps: dict[str, Quote] = {}
-        for start in range(0, len(symbols), 200):
-            snaps.update(await self._moomoo_snapshots(client, symbols[start : start + 200]))
         day = now_et().date().isoformat()
+        if self._halt_marks_day != day:
+            self._halt_marks = {}
+            self._halt_marks_day = day
+        current, frozen = unchanged_symbols(self._halt_marks, found)
+        self._halt_marks = current
+        # A halt freezes the price. One batch stays under the 60-snapshot limit.
+        symbols = frozen[:50]
+        if symbols:
+            logger.info("Halt check: %s unchanged, snapshot %s", len(frozen), len(symbols))
+        snaps = await self._moomoo_snapshots(client, symbols)
         seen_at = datetime.now(timezone.utc)
         noted: list[str] = []
         for symbol, snap in snaps.items():
@@ -1439,6 +1555,47 @@ class MonitorEngine:
         if noted and (previous is None or previous[0] != signature):
             logger.info("Noted upward halts: %s", ", ".join(noted))
             self._scan_log[f"{rule.id}:halt"] = (signature, now)
+
+    def _close_due(self) -> bool:
+        now = datetime.now(timezone.utc)
+        last = self._close_checked_at
+        if last is not None and (now - last).total_seconds() < 60:
+            return False
+        self._close_checked_at = now
+        return True
+
+    async def _match_breaker_close(self, rule: Rule) -> list[Quote]:
+        day = now_et().date().isoformat()
+        halted = self.store.session_symbols(day, "upward_halt")
+        return await self._match_close(rule, halted, "Regular-close circuit breaker")
+
+    async def _match_day_gain_close(self, rule: Rule) -> list[Quote]:
+        minimum = rule.condition.min_recent_day_change
+        if minimum is None:
+            return []
+        day = now_et().date().isoformat()
+        touched = self.store.day_gain_symbols(minimum, [day])
+        return await self._match_close(rule, touched, f"Regular-close day gain > {minimum:g}%")
+
+    async def _match_close(self, rule: Rule, symbols: list[str], label: str) -> list[Quote]:
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return []
+        snaps = await self._moomoo_snapshots(client, symbols[:50]) if symbols else {}
+        regular_min = rule.condition.min_regular_change
+        matched: list[Quote] = []
+        for symbol in symbols:
+            quote = snaps.get(symbol)
+            if quote is None:
+                continue
+            if regular_min is not None and (
+                quote.change_pct is None or quote.change_pct <= regular_min
+            ):
+                continue
+            quote.regular_change_pct = quote.change_pct
+            matched.append(quote)
+        self._log_saved_matches(rule.id, [quote.symbol for quote in matched], label)
+        return matched
 
     async def _match_breaker_afterhours(self, rule: Rule) -> list[Quote]:
         client = self._trend_moomoo or self.moomoo
@@ -1520,7 +1677,7 @@ class MonitorEngine:
         message = "\n".join(line for _symbol, line in rows)
         alert = self.store.new_alert(
             rule_id=rule.id,
-            rule_name=rule.name,
+            rule_name=rule.summary,
             label=rule.label,
             notify=rule.notify,
             symbol=leaders[0].symbol,
@@ -1531,6 +1688,7 @@ class MonitorEngine:
         self.store.append_alert(alert)
         self.store.mark_fired(state, slot_key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, message.replace("\n", " | "))
+        self._add_to_tonghuashun(rule, leaders)
 
     async def _deliver_digest(
         self, rule_id: str, title: str, rows: list[tuple[str, str]], notify: str | None = None
@@ -1595,28 +1753,37 @@ class MonitorEngine:
         return fired
 
     async def _fill_session_uptrends(
-        self, quotes: list[Quote], rule: Rule, client: MoomooClient
+        self, quotes: list[Quote], rule: Rule, client: MoomooClient, *, refresh: bool = False
     ) -> None:
         minimum = rule.condition.min_regular_volume
         session_day = now_et().date().isoformat()
         now = datetime.now(timezone.utc)
+        checked = 0
         for quote in quotes:
             if minimum is not None and (
                 quote.regular_volume is None or quote.regular_volume <= minimum
             ):
                 continue
-            cached = self._uptrend_cache.get((session_day, quote.symbol))
-            if cached is not None:
-                quote.session_uptrend = cached
-                continue
+            key = (session_day, quote.symbol)
+            if not refresh:
+                cached = self._uptrend_cache.get(key)
+                if cached is not None:
+                    quote.session_uptrend = cached
+                    continue
             if self._kline_blocked_until is not None and now < self._kline_blocked_until:
+                quote.session_uptrend = self._uptrend_cache.get(key)
+                continue
+            if checked >= 30:
+                quote.session_uptrend = self._uptrend_cache.get(key)
                 continue
             result = await client.session_uptrend(quote.symbol, session_day)
             await self._drain_client_problem(client)
+            checked += 1
             if result is None:
                 self._kline_blocked_until = datetime.now(timezone.utc) + timedelta(seconds=31)
+                quote.session_uptrend = self._uptrend_cache.get(key)
                 break
-            self._uptrend_cache[(session_day, quote.symbol)] = result
+            self._uptrend_cache[key] = result
             quote.session_uptrend = result
 
     async def _run_moomoo_scanner(
@@ -1684,6 +1851,8 @@ class MonitorEngine:
         for rule in config.rules:
             if not rule.enabled or not rule.is_scanner or self._rule_session_open(rule):
                 continue
+            if _is_close_rule(rule):
+                continue
             afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
             max_cap = None if rule.condition.skip_market_cap else (rule.condition.max_market_cap or 100_000_000)
             if afterhours:
@@ -1750,7 +1919,7 @@ class MonitorEngine:
                 logger.warning("After-hours change unavailable for %s: %s", quote.symbol, exc)
         alert = self.store.new_alert(
             rule_id=rule.id,
-            rule_name=rule.name,
+            rule_name=rule.summary,
             label=rule.label,
             notify=rule.notify,
             symbol=quote.symbol,
@@ -1763,10 +1932,51 @@ class MonitorEngine:
         self.store.append_alert(alert)
         self.store.mark_fired(state, key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, alert.message)
+        self._add_to_tonghuashun(rule, [quote])
         return alert
 
+    def _add_to_tonghuashun(self, rule: Rule, quotes: list[Quote]) -> None:
+        if not self.ths.configured:
+            return
+        task = asyncio.create_task(self._tonghuashun_sync(rule, quotes))
+        self._ths_tasks.add(task)
+        task.add_done_callback(self._ths_tasks.discard)
+
+    async def _tonghuashun_sync(self, rule: Rule, quotes: list[Quote]) -> None:
+        group = rule.name
+        async with self._ths_lock:
+            try:
+                members = await self.ths.members(
+                    group, now_et().date().isoformat(), [quote.symbol for quote in quotes]
+                )
+                changes = {quote.symbol: quote.change_pct for quote in quotes}
+                changes.update(await self._session_changes(rule, members))
+                ordered = sorted(
+                    members,
+                    key=lambda symbol: changes.get(symbol) if changes.get(symbol) is not None else float("-inf"),
+                    reverse=True,
+                )
+                await self.ths.arrange(group, ordered)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("同花顺 update failed for %s: %s", group, exc)
+                await self._note_problem(f"Tonghuashun add failed: {exc}")
+
+    async def _session_changes(self, rule: Rule, symbols: list[str]) -> dict[str, float | None]:
+        """Current gain for the rule's session, so the group sorts high to low."""
+        client = self._trend_moomoo or self.moomoo
+        if client is None or not symbols:
+            return {}
+        session = rule.group or rule.condition_session
+        if session == "盘后":
+            found = await client.after_hours_quotes(symbols)
+        elif session == "盘前":
+            found = await client.premarket_quotes(symbols)
+        else:
+            found = await client.snapshots(symbols)
+        return {symbol: quote.change_pct for symbol, quote in (found or {}).items()}
+
     def _scanner_digest(self, rule: Rule, alerts: list[Alert]) -> str:
-        lines = [f":chart_with_upwards_trend: *{rule.name}*"]
+        lines = [f":chart_with_upwards_trend: *{rule.summary}*"]
         lines.extend(f"• {alert.message}" for alert in alerts)
         return "\n".join(lines)
 

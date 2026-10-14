@@ -47,6 +47,8 @@ def problem_notice(text: str) -> tuple[str, str, str] | None:
         if detail:
             body = f"{body}{detail}"
         return key, "OpenD 超限", body
+    if lowered.startswith("tonghuashun add failed"):
+        return "error:tonghuashun", "加自选失败", "同花顺加自选失败。"
     if lowered.startswith("slack send failed"):
         return "error:slack", "发送失败", "Slack 发送失败。"
     if lowered.startswith("pushover send failed"):

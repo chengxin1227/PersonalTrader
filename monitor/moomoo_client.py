@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import threading
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from monitor.config import Settings
@@ -24,6 +26,25 @@ _MAX_PAGES = 5
 
 def is_circuit_breaker(status: str | None) -> bool:
     return status in CIRCUIT_BREAKER_STATUSES
+
+
+def unchanged_symbols(
+    previous: dict[str, float], quotes: list[Quote]
+) -> tuple[dict[str, float], list[str]]:
+    """Prices seen now, and symbols whose price is the same as the last check."""
+    current: dict[str, float] = {}
+    frozen: list[str] = []
+    for quote in quotes:
+        if quote.price is not None and quote.price > 0:
+            mark = round(quote.price, 4)
+        elif quote.change_pct is not None:
+            mark = round(quote.change_pct, 4)
+        else:
+            continue
+        current[quote.symbol] = mark
+        if previous.get(quote.symbol) == mark:
+            frozen.append(quote.symbol)
+    return current, frozen
 
 
 def is_upward_halt(quote: Quote) -> bool:
@@ -74,6 +95,32 @@ def _parse_et(value: Any) -> datetime | None:
 
 def is_test_name(name: str) -> bool:
     return "test symbol" in name.lower()
+
+
+def _load_exchanges(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(symbol).upper(): str(exchange) for symbol, exchange in payload.items()}
+
+
+def _save_exchanges(path: Path, cache: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def is_otc_exchange(exchange: str | None) -> bool:
+    """Moomoo marks US OTC, pink-sheet, and expert-market names as US_PINK."""
+    return str(exchange or "").upper() == "US_PINK"
+
+
+_exchange_lock = threading.RLock()
+_exchange_cache: dict[str, str] | None = None
 
 
 def line_slope(values: list[float]) -> float:
@@ -226,6 +273,27 @@ def quote_from_after_hours(row: dict[str, Any]) -> Quote | None:
     )
 
 
+def quote_from_premarket(row: dict[str, Any]) -> Quote | None:
+    symbol = bare_symbol(str(row.get("code") or ""))
+    if not symbol:
+        return None
+    name = str(row.get("name") or "").strip()
+    if is_test_name(name):
+        return None
+    price = _float(row.get("pre_price"))
+    change = _float(row.get("pre_change_rate"))
+    if price is None or price <= 0 or change is None:
+        return None
+    volume = _float(row.get("pre_volume"))
+    return Quote(
+        symbol=symbol,
+        company=name or None,
+        price=price,
+        change_pct=change,
+        volume=int(volume) if volume is not None else None,
+    )
+
+
 def quote_from_snapshot(row: dict[str, Any]) -> Quote:
     symbol = bare_symbol(str(row.get("code") or ""))
     price = _float(row.get("last_price"))
@@ -346,9 +414,74 @@ class MoomooClient:
     def __init__(self, settings: Settings) -> None:
         self._host = settings.moomoo_host
         self._port = settings.moomoo_port
+        self._exchange_path = settings.data_dir / "exchanges.json"
         self._ctx: Any = None
         self._lock = threading.RLock()
         self._pending_problem: str | None = None
+
+    def _exchanges(self) -> dict[str, str]:
+        global _exchange_cache
+        with _exchange_lock:
+            if _exchange_cache is None:
+                _exchange_cache = _load_exchanges(self._exchange_path)
+            return _exchange_cache
+
+    def _remember_exchanges(self, found: dict[str, str]) -> None:
+        with _exchange_lock:
+            cache = self._exchanges()
+            fresh = [
+                symbol
+                for symbol, exchange in found.items()
+                if is_otc_exchange(exchange) and not is_otc_exchange(cache.get(symbol))
+            ]
+            cache.update({symbol: exchange for symbol, exchange in found.items() if symbol})
+            _save_exchanges(self._exchange_path, cache)
+        if fresh:
+            logger.info("Skip OTC: %s", ", ".join(sorted(fresh)))
+
+    def _lookup_exchanges_sync(self, symbols: list[str]) -> dict[str, str] | None:
+        from moomoo import RET_OK, Market, SecurityType
+
+        found: dict[str, str] = {}
+        codes = [f"US.{symbol}" for symbol in symbols]
+        with self._lock:
+            context = self._context()
+            for start in range(0, len(codes), _PAGE_SIZE):
+                chunk = codes[start : start + _PAGE_SIZE]
+                ret, data = context.get_stock_basicinfo(Market.US, SecurityType.STOCK, chunk)
+                if ret != RET_OK:
+                    logger.warning("Moomoo exchange lookup failed: %s", data)
+                    return None
+                rows = data.to_dict(orient="records") if data is not None else []
+                for row in rows:
+                    symbol = bare_symbol(str(row.get("code") or ""))
+                    if symbol:
+                        found[symbol] = str(row.get("exchange_type") or "")
+        return found
+
+    def _without_otc_sync(self, symbols: list[str]) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for symbol in symbols:
+            key = symbol.strip().upper()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(key)
+        if not ordered:
+            return []
+        missing = [symbol for symbol in ordered if symbol not in self._exchanges()]
+        if missing:
+            found = self._lookup_exchanges_sync(missing)
+            if found is None:
+                return ordered
+            for symbol in missing:
+                found.setdefault(symbol, "")
+            self._remember_exchanges(found)
+        return [symbol for symbol in ordered if not is_otc_exchange(self._exchanges().get(symbol))]
+
+    def _listed_codes(self, symbols: list[str]) -> list[str]:
+        return [f"US.{symbol}" for symbol in self._without_otc_sync(symbols)]
 
     def _remember_problem(self, message: str) -> None:
         with self._lock:
@@ -407,7 +540,7 @@ class MoomooClient:
         )
 
     def _snapshots_sync(self, symbols: list[str]) -> dict[str, Quote]:
-        codes = [f"US.{symbol.strip().upper()}" for symbol in symbols if symbol.strip()]
+        codes = self._listed_codes(symbols)
         if not codes:
             return {}
         with self._lock:
@@ -522,7 +655,8 @@ class MoomooClient:
                     break
         if not quotes:
             return []
-        return [(quote, None) for quote in quotes]
+        listed = set(self._without_otc_sync([quote.symbol for quote in quotes]))
+        return [(quote, None) for quote in quotes if quote.symbol in listed]
 
     async def scan_premarket(
         self, min_change_pct: float, max_market_cap: float
@@ -562,7 +696,7 @@ class MoomooClient:
         return found
 
     def _after_hours_quotes_sync(self, symbols: list[str]) -> dict[str, Quote] | None:
-        codes = [f"US.{symbol.strip().upper()}" for symbol in symbols if symbol.strip()]
+        codes = self._listed_codes(symbols)
         if not codes:
             return {}
         quotes: dict[str, Quote] = {}
@@ -588,8 +722,35 @@ class MoomooClient:
     async def after_hours_quotes(self, symbols: list[str]) -> dict[str, Quote] | None:
         return await asyncio.to_thread(self._after_hours_quotes_sync, symbols)
 
+    def _premarket_quotes_sync(self, symbols: list[str]) -> dict[str, Quote] | None:
+        codes = self._listed_codes(symbols)
+        if not codes:
+            return {}
+        quotes: dict[str, Quote] = {}
+        with self._lock:
+            context = self._context()
+            for start in range(0, len(codes), _PAGE_SIZE):
+                chunk = codes[start : start + _PAGE_SIZE]
+                pending = self._pending_problem
+                rows = self._snapshot_rows(context, chunk)
+                if (
+                    not rows
+                    and self._pending_problem
+                    and self._pending_problem != pending
+                    and _is_opend_limit(self._pending_problem)
+                ):
+                    return None
+                for row in rows:
+                    quote = quote_from_premarket(row)
+                    if quote is not None and quote.symbol:
+                        quotes[quote.symbol] = quote
+        return quotes
+
+    async def premarket_quotes(self, symbols: list[str]) -> dict[str, Quote] | None:
+        return await asyncio.to_thread(self._premarket_quotes_sync, symbols)
+
     def _session_marks_sync(self, symbols: list[str], session: str) -> dict[str, tuple[float, int]] | None:
-        codes = [f"US.{symbol.strip().upper()}" for symbol in symbols if symbol.strip()]
+        codes = self._listed_codes(symbols)
         if not codes:
             return {}
         marks: dict[str, tuple[float, int]] = {}
@@ -735,6 +896,7 @@ class MoomooClient:
         min_change_pct: float,
         max_pages: int = 15,
         max_market_cap: float | None = None,
+        min_volume: float | None = None,
     ) -> list[Quote]:
         from moomoo import RET_OK, AccumulateFilter, Market, SortDir, StockField
 
@@ -745,6 +907,13 @@ class MoomooClient:
         acc.sort = SortDir.DESCEND
         acc.days = 1
         filters = [acc]
+        if min_volume is not None:
+            volume = AccumulateFilter()
+            volume.stock_field = StockField.VOLUME
+            volume.days = 1
+            volume.filter_min = min_volume
+            volume.is_no_filter = False
+            filters.append(volume)
         if max_market_cap is not None:
             from moomoo import SimpleFilter
 
@@ -755,6 +924,8 @@ class MoomooClient:
             filters.append(cap)
         quotes: list[Quote] = []
         begin = 0
+        saw_change = 0
+        missing_volume = 0
         with self._lock:
             context = self._context()
             for _page in range(max_pages):
@@ -778,30 +949,50 @@ class MoomooClient:
                     symbol = bare_symbol(str(getattr(item, "stock_code", "") or ""))
                     if not symbol:
                         continue
+                    saw_change += 1
+                    volume = _float(item.__dict__.get(("volume", 1)))
+                    if min_volume is not None:
+                        if volume is None:
+                            missing_volume += 1
+                            continue
+                        if volume <= min_volume:
+                            continue
                     quotes.append(
-                        Quote(symbol=symbol, company=name.strip() or None, change_pct=change)
+                        Quote(
+                            symbol=symbol,
+                            company=name.strip() or None,
+                            price=_float(item.__dict__.get("cur_price")),
+                            change_pct=change,
+                            volume=int(volume) if volume is not None else None,
+                        )
                     )
                 begin += len(rows)
                 if stop or last_page or begin >= int(all_count):
                     break
-        return quotes
+        if min_volume is not None and saw_change and missing_volume == saw_change:
+            raise RuntimeError("Moomoo regular-session screen returned no volume")
+        listed = set(self._without_otc_sync([quote.symbol for quote in quotes]))
+        return [quote for quote in quotes if quote.symbol in listed]
 
     async def regular_gainers(
         self,
         min_change_pct: float,
         max_pages: int = 15,
         max_market_cap: float | None = None,
+        min_volume: float | None = None,
     ) -> list[Quote]:
         if max_market_cap is None:
             logger.info("Moomoo regular-session screen, gain > %.1f%%", min_change_pct)
         else:
+            volume = "" if min_volume is None else f", volume > {min_volume:,.0f}"
             logger.info(
-                "Moomoo regular-session screen, gain > %.1f%%, total cap <= %.0f",
+                "Moomoo regular-session screen, gain > %.1f%%, total cap <= %.0f%s",
                 min_change_pct,
                 max_market_cap,
+                volume,
             )
         found = await asyncio.to_thread(
-            self._regular_gainers_sync, min_change_pct, max_pages, max_market_cap
+            self._regular_gainers_sync, min_change_pct, max_pages, max_market_cap, min_volume
         )
         logger.info("Moomoo regular-session names above threshold: %s", len(found))
         return found
@@ -848,7 +1039,8 @@ class MoomooClient:
         next_begin = begin + len(rows or [])
         if not rows or last_page or next_begin >= int(all_count):
             next_begin = 0
-        return quotes, next_begin
+        listed = set(self._without_otc_sync([quote.symbol for quote in quotes]))
+        return [quote for quote in quotes if quote.symbol in listed], next_begin
 
     async def smallcap_page(
         self,

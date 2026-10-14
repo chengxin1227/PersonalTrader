@@ -67,31 +67,31 @@ def test_scanner_requires_gain_and_total_cap_at_or_under_the_limit():
     ).matched
 
 
-def test_pullback_needs_current_gain_above_10_and_an_earlier_spike():
+def test_pullback_needs_current_gain_at_or_above_25_and_an_earlier_spike():
     rule = Rule(
         id="premarket-smallcap-10pct",
         name="盘前",
         symbol="*",
         condition=Condition(
             type=ConditionType.PREMARKET_GAIN,
-            value=10,
+            value=25,
             max_market_cap=100_000_000,
             min_volume=100_000,
-            min_prior_change=20,
-            prior_change_lag_minutes=5,
+            min_prior_change=30,
+            prior_change_lag_minutes=15,
         ),
     )
-    quote = _quote(price=1.11, prev_close=1.0, volume=100_001)
-    quote.change_pct = 11
+    quote = _quote(price=1.25, prev_close=1.0, volume=100_001)
+    quote.change_pct = 25
     quote.prior_session_spike = True
     assert evaluate_premarket_scan(
         rule, quote, market_cap=None, in_premarket=True, cap_filtered=True
     ).matched
-    quote.change_pct = 10
+    quote.change_pct = 24.9999
     assert not evaluate_premarket_scan(
         rule, quote, market_cap=None, in_premarket=True, cap_filtered=True
     ).matched
-    quote.change_pct = 11
+    quote.change_pct = 26
     quote.prior_session_spike = False
     assert not evaluate_premarket_scan(
         rule, quote, market_cap=None, in_premarket=True, cap_filtered=True

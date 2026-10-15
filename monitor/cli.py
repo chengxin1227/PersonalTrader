@@ -15,7 +15,7 @@ from monitor.notify import NotifyRoutes
 from monitor.moomoo_client import MoomooClient
 from monitor.pushover import PushoverClient
 from monitor.rules import load_rules
-from monitor.session import is_premarket
+from monitor.session import CHECK_REMINDER_NOTIFY, is_premarket
 from monitor.slack import SlackClient
 from monitor.store import Store
 
@@ -38,6 +38,9 @@ def _print_routes(settings: Settings, rules: list) -> None:
     slack = "own" if routes.has_slack("opend") else "default"
     pushover = "own" if routes.has_pushover("opend") else "default"
     print(f"    - OpenD: slack {slack}, pushover {pushover}")
+    slack = "own" if routes.has_slack(CHECK_REMINDER_NOTIFY) else "missing"
+    pushover = "own" if routes.has_pushover(CHECK_REMINDER_NOTIFY) else "missing"
+    print(f"    - Important reminder: slack {slack}, pushover {pushover}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -168,6 +171,16 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             f"after-hours stays within {rule.condition.stable_low:g}%.."
                             f"{rule.condition.stable_high:g}%, {regular}"
                             f"total cap <= ${cap:,.0f}{volume}"
+                        )
+                        continue
+                    if rule.condition.type is ConditionType.REGULAR_GAIN:
+                        cap = rule.condition.max_market_cap or 100_000_000
+                        volume = ""
+                        if rule.condition.min_volume is not None:
+                            volume = f", volume > {rule.condition.min_volume:,.0f}"
+                        print(
+                            f"    - {rule.name}: regular session gain > {rule.condition.value:g}% "
+                            f"as soon as it shows, total cap <= ${cap:,.0f}{volume}"
                         )
                         continue
                     if rule.condition.type is ConditionType.REGULAR_CLOSE:

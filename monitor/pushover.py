@@ -9,7 +9,7 @@ import httpx
 from monitor.config import Settings
 from monitor.models import Alert
 from monitor.quote_link import quote_url
-from monitor.rules import FIELD_GAP, split_alert_name
+from monitor.rules import FIELD_GAP, format_price, split_alert_name
 
 _CHANGE = re.compile(r"[+-]\d+(?:\.\d+)?%")
 _PRICE = re.compile(r"\$\d[\d,.]*")
@@ -34,7 +34,7 @@ def html_message(text: str, url: str | None = None) -> str:
         return headline
     # The font tag has to wrap the newlines. A newline before the tag drops the size,
     # and <br> alone disappears from the lock-screen preview.
-    return f'{headline}<font size="1" color="{_MUTED}">\n\n{reason}</font>'
+    return f'{headline}<font size="2" color="{_MUTED}">\n\n{reason}</font>'
 
 
 def _style_line(raw: str, url: str | None = None) -> str:
@@ -93,11 +93,12 @@ class PushoverClient:
             await self._client.aclose()
 
     async def send_alert(self, alert: Alert, token: str | None = None) -> None:
-        title = alert.symbol
+        parts = [alert.symbol]
         if alert.change_pct is not None:
-            title = f"{alert.symbol}  {alert.change_pct:+.1f}%"
-        if alert.label:
-            title = f"{alert.label}  {title}"
+            parts.append(f"{alert.change_pct:+.1f}%")
+        if alert.price is not None:
+            parts.append(format_price(alert.price))
+        title = "  ".join(parts)
         await self.send_text(
             html_message(alert.message, alert.url), title=title, html=True, token=token
         )
@@ -116,6 +117,8 @@ class PushoverClient:
         url_title: str = "打开同花顺",
         html: bool = False,
         token: str | None = None,
+        priority: int | None = None,
+        sound: str | None = None,
     ) -> None:
         app_token = token or self._settings.pushover_token
         if not app_token or not self._settings.pushover_user:
@@ -126,6 +129,10 @@ class PushoverClient:
             "title": title[:250],
             "message": text[:1024],
         }
+        if priority is not None:
+            payload["priority"] = str(priority)
+        if sound:
+            payload["sound"] = sound
         if html:
             payload["html"] = "1"
         if url:

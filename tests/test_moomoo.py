@@ -41,6 +41,8 @@ def test_after_hours_range_uses_the_regular_close():
             "name": "Example",
             "after_price": 10.0,
             "after_change_rate": 0.0,
+            "last_price": 9.5,
+            "prev_close_price": 10.0,
             "after_high_price": 10.4,
             "after_low_price": 9.7,
             "after_volume": 120000,
@@ -51,6 +53,8 @@ def test_after_hours_range_uses_the_regular_close():
     assert quote.session_low_pct == -3
     assert quote.session_high_pct == 4
     assert quote.volume == 120000
+    assert quote.regular_price == 9.5
+    assert quote.after_hours_price == 10.0
 
 
 def test_pink_sheet_names_are_otc():
@@ -69,12 +73,18 @@ def test_premarket_quote_uses_the_premarket_print():
             "pre_price": 1.5,
             "pre_change_rate": 6.2,
             "pre_volume": 180000,
+            "after_price": 1.4,
+            "after_change_rate": 8.5,
         }
     )
     assert quote is not None
     assert quote.symbol == "MI"
     assert quote.change_pct == 6.2
     assert quote.volume == 180000
+    assert quote.premarket_price == 1.5
+    assert quote.premarket_change_pct == 6.2
+    assert quote.after_hours_price == 1.4
+    assert quote.after_hours_change_pct == 8.5
     assert quote_from_premarket({"code": "US.MI", "pre_price": 1.5}) is None
 
 
@@ -203,6 +213,27 @@ def test_snapshot_uses_last_price_against_previous_close():
     assert quote.price == 110
     assert quote.change_pct == 10
     assert quote.bid == 109.5
+    assert quote.regular_price == 110
+    assert quote.regular_change_pct == 10
+
+
+def test_snapshot_keeps_each_session_close():
+    quote = quote_from_snapshot(
+        {
+            "code": "US.SDST",
+            "last_price": 0.026,
+            "prev_close_price": 0.0401,
+            "pre_price": 0.031,
+            "pre_change_rate": -22.7,
+            "after_price": 0.046,
+            "after_change_rate": 76.9,
+        }
+    )
+    assert quote.regular_price == 0.026
+    assert quote.premarket_price == 0.031
+    assert quote.premarket_change_pct == -22.7
+    assert quote.after_hours_price == 0.046
+    assert quote.after_hours_change_pct == 76.9
 
 
 def test_snapshot_keeps_circuit_breaker_status():
@@ -319,6 +350,8 @@ def test_afterhours_rank_quote():
     assert quote.symbol == "MIMI"
     assert quote.change_pct == 21.875
     assert quote.regular_change_pct == -4.5
+    assert quote.regular_price == 0.771
+    assert quote.after_hours_price == 0.939
 
 
 def test_regular_session_uptrend_needs_a_rising_close_and_enough_bars():

@@ -41,7 +41,7 @@ class SlackClient:
         if not url:
             raise RuntimeError("SLACK_WEBHOOK_URL is not set")
         color = "#34C759" if (alert.change_pct or 0) < 0 else "#FF3B30"
-        fallback = f"{alert.label}\n{alert.message}" if alert.label else alert.message
+        fallback = alert.message
         response = await self._client.post(
             url,
             json={
@@ -99,10 +99,9 @@ class SlackClient:
     def _blocks(self, alert: Alert) -> list[dict]:
         lines = [raw for raw in alert.message.splitlines() if raw.strip()]
         headline = _link_name(lines[0], page_url(alert.symbol)) if lines else alert.message
-        blocks: list[dict] = []
-        if alert.label:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{alert.label}*"}})
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": headline}})
+        blocks: list[dict] = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": headline}},
+        ]
         reason = "\n".join(lines[1:])
         if reason:
             blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": reason}]})

@@ -10,6 +10,8 @@ from monitor.session import (
     is_regular_session,
     is_trading_day,
     afterhours_board_slot,
+    check_reminder_text,
+    due_check_reminders,
     afterhours_just_opened,
     afterhours_stable_due,
     afterhours_stable_missed,
@@ -52,6 +54,34 @@ def test_afterhours_stable_window_is_the_first_five_minutes():
     assert not afterhours_stable_due(datetime(2026, 10, 10, 16, 5, tzinfo=ET), 5)
     assert not afterhours_stable_missed(datetime(2026, 10, 8, 16, 5, 19, tzinfo=ET), 5)
     assert afterhours_stable_missed(datetime(2026, 10, 8, 16, 5, 20, tzinfo=ET), 5)
+
+
+def test_check_reminders_fire_once_inside_a_three_minute_window():
+    assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 15, 44, tzinfo=ET))] == []
+    close = due_check_reminders(datetime(2026, 10, 15, 15, 45, tzinfo=ET))
+    assert [item.key for item in close] == ["regular-close-15"]
+    assert close[0].rule_ids == ("regular-gain80", "regular-halt-close15")
+    assert due_check_reminders(datetime(2026, 10, 15, 15, 47, 59, tzinfo=ET))
+    assert due_check_reminders(datetime(2026, 10, 15, 15, 48, tzinfo=ET)) == []
+
+    assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 16, 5, tzinfo=ET))] == [
+        "afterhours-min-5"
+    ]
+    assert due_check_reminders(datetime(2026, 10, 15, 16, 4, 59, tzinfo=ET)) == []
+    assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 18, 30, tzinfo=ET))] == [
+        "afterhours-2h30"
+    ]
+    assert [item.rule_ids for item in due_check_reminders(datetime(2026, 10, 15, 9, 15, tzinfo=ET))] == [
+        ("premarket-last-3h-20", "premarket-gain80")
+    ]
+    assert due_check_reminders(datetime(2026, 10, 17, 15, 45, tzinfo=ET)) == []  # Saturday
+
+
+def test_check_reminder_text_names_the_lists_to_review():
+    assert (
+        check_reminder_text("盘后2.5小时", ["盘后涨幅前5的股票", "盘后涨幅超80%的股票"])
+        == "盘后2.5小时，请检查盘后涨幅前5的股票和盘后涨幅超80%的股票"
+    )
 
 
 def test_recent_trading_days_skip_weekends_and_can_leave_out_today():

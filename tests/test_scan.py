@@ -288,7 +288,9 @@ def test_message_uses_the_other_session_change():
     quote = _quote()
     quote.company = "Acme"
     quote.regular_change_pct = -3.2
+    quote.regular_price = 1.8
     quote.after_hours_change_pct = 8.5
+    quote.after_hours_price = 2.05
     afterhours = render_message(
         Rule(
             id="afterhours-smallcap-10pct",
@@ -309,11 +311,26 @@ def test_message_uses_the_other_session_change():
         ),
         quote,
     )
-    assert afterhours == f"Acme{FIELD_GAP}-3.2%{FIELD_GAP}$2.20\n盘后"
-    assert premarket == f"Acme{FIELD_GAP}+8.5%{FIELD_GAP}$2.20\n盘前"
+    assert afterhours == f"Acme{FIELD_GAP}-3.2%{FIELD_GAP}$1.80\n盘后"
+    assert premarket == f"Acme{FIELD_GAP}+8.5%{FIELD_GAP}$2.05\n盘前"
     assert "盘后涨幅" not in premarket
     assert "+10.0%" not in afterhours
     assert "+10.0%" not in premarket
+    quote.premarket_change_pct = 4.5
+    quote.premarket_price = 2.4
+    regular = render_message(
+        Rule(
+            id="regular-gain80",
+            name="盘中",
+            symbol="*",
+            group="盘中",
+            condition=Condition(type=ConditionType.REGULAR_GAIN, value=80),
+            slack_message="{stock_name}{field_gap}{move_text}{price_text}",
+        ),
+        quote,
+    )
+    assert regular == f"Acme{FIELD_GAP}+4.5%{FIELD_GAP}$2.40\n盘中"
+    assert "$2.20" not in regular
 
 
 def test_leaderboard_line_shows_the_afterhours_gain_and_price():
@@ -340,6 +357,7 @@ def test_afterhours_circuit_breaker_needs_regular_gain_and_a_halt():
     quote.company = "Acme"
     quote.change_pct = 6.2
     quote.regular_change_pct = 12.4
+    quote.regular_price = 1.05
     quote.session_circuit_breaker = True
 
     assert evaluate_afterhours_scan(
@@ -383,7 +401,7 @@ def test_afterhours_circuit_breaker_needs_regular_gain_and_a_halt():
 
     message = render_message(rule, quote)
     assert message == (
-        f"Acme{FIELD_GAP}+12.4%{FIELD_GAP}$1.12\n盘中收盘涨幅超10%并触发涨幅熔断，盘后涨幅超5%，市值不超过1亿美元"
+        f"Acme{FIELD_GAP}+12.4%{FIELD_GAP}$1.05\n盘中收盘涨幅超10%并触发涨幅熔断，盘后涨幅超5%，市值不超过1亿美元"
     )
     assert "+6.2%" not in message
 

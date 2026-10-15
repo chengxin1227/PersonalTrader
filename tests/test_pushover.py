@@ -48,7 +48,7 @@ def test_pushover_posts_symbol_and_message():
     assert "url_title" not in seen
     assert seen["user"] == "user-key"
     assert seen["html"] == "1"
-    assert seen["title"] == "GYGY  +10.0%"
+    assert seen["title"] == "GYGY  +10.0%  $1.50"
     assert '<a href="amihexin://">Game Your Game</a>' in seen["message"]
     assert "<br>" not in seen["message"]
     assert "#FF3B30" not in seen["message"]
@@ -60,7 +60,7 @@ def test_pushover_posts_symbol_and_message():
     assert seen["message"].index("+10.0%") < seen["message"].index("$1.50")
 
 
-def test_pushover_title_starts_with_the_rule_label():
+def test_pushover_title_is_the_symbol_and_change():
     seen: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -76,7 +76,7 @@ def test_pushover_title_starts_with_the_rule_label():
             id="1",
             rule_id="afterhours-smallcap-10pct",
             rule_name="盘后",
-            label="After-hours pullback",
+            label="盘后涨幅超30%的股票",
             symbol="GYGY",
             message="Game Your Game   +10.0%   $1.50",
             price=1.5,
@@ -87,15 +87,15 @@ def test_pushover_title_starts_with_the_rule_label():
         await client.close()
 
     asyncio.run(run())
-    assert seen["title"] == "After-hours pullback  GYGY  +10.0%"
+    assert seen["title"] == "GYGY  +10.0%  $1.50"
 
 
-def test_slack_message_starts_with_the_rule_label():
+def test_slack_message_starts_with_the_stock():
     alert = Alert(
         id="1",
         rule_id="afterhours-smallcap-10pct",
         rule_name="盘后目前涨幅超15%",
-        label="After-hours pullback",
+        label="盘后涨幅超30%的股票",
         symbol="GYGY",
         message="Game Your Game   +10.0%   $1.50\n盘后目前涨幅超15%",
         price=1.5,
@@ -109,8 +109,8 @@ def test_slack_message_starts_with_the_rule_label():
         return blocks
 
     blocks = asyncio.run(run())
-    assert blocks[0]["text"]["text"] == "*After-hours pullback*"
-    assert "Game Your Game" in blocks[1]["text"]["text"]
+    assert "盘后涨幅超30%的股票" not in blocks[0]["text"]["text"]
+    assert "Game Your Game" in blocks[0]["text"]["text"]
 
 
 def test_digest_links_each_name_like_other_alerts():
@@ -154,7 +154,7 @@ def test_message_percent_is_labeled_and_name_stays_the_link():
 def test_trigger_reason_is_separated_and_smaller():
     html = html_message("KALA BIO    +11.8%    $0.843\n盘中涨幅超10%", "amihexin://")
     assert html.startswith('<a href="amihexin://">KALA BIO</a>')
-    assert '<font size="1" color="#8E8E93">\n\n盘中涨幅超10%</font>' in html
+    assert '<font size="2" color="#8E8E93">\n\n盘中涨幅超10%</font>' in html
     assert "<br>" not in html
     assert "盘中涨幅超10%</a>" not in html
 

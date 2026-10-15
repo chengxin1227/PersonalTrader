@@ -20,6 +20,7 @@ class ConditionType(str, Enum):
     AFTERHOURS_GAIN = "afterhours_gain"
     LATE_SESSION_GAIN = "late_session_gain"
     REGULAR_CLOSE = "regular_close"
+    REGULAR_GAIN = "regular_gain"
 
 
 class Condition(BaseModel):
@@ -75,7 +76,7 @@ class Rule(BaseModel):
             return "盘后"
         if kind is ConditionType.LATE_SESSION_GAIN:
             return _LATE_SESSIONS.get(self.condition.late_session)
-        if kind is ConditionType.REGULAR_CLOSE:
+        if kind in {ConditionType.REGULAR_CLOSE, ConditionType.REGULAR_GAIN}:
             return "盘中"
         return None
 
@@ -97,6 +98,7 @@ class Rule(BaseModel):
             ConditionType.AFTERHOURS_GAIN,
             ConditionType.LATE_SESSION_GAIN,
             ConditionType.REGULAR_CLOSE,
+            ConditionType.REGULAR_GAIN,
         } or self.symbol in {"*", "ALL"}
 
     @field_validator("id")
@@ -177,7 +179,11 @@ class Quote(BaseModel):
     daily_low: Optional[float] = None
     prev_close: Optional[float] = None
     change_pct: Optional[float] = None
+    regular_price: Optional[float] = None
     regular_change_pct: Optional[float] = None
+    premarket_price: Optional[float] = None
+    premarket_change_pct: Optional[float] = None
+    after_hours_price: Optional[float] = None
     after_hours_change_pct: Optional[float] = None
     volume: Optional[int] = None
     regular_volume: Optional[int] = None

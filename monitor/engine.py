@@ -45,6 +45,9 @@ from monitor.session import (
     now_et,
     recent_trading_days,
     afterhours_board_slot,
+    CHECK_REMINDER_NOTIFY,
+    check_reminder_text,
+    due_check_reminders,
     premarket_mark,
     seconds_until_extended_open,
 )
@@ -72,6 +75,10 @@ def _is_breaker_rule(rule: Rule) -> bool:
 
 def _is_close_rule(rule: Rule) -> bool:
     return rule.condition.type is ConditionType.REGULAR_CLOSE
+
+
+def _is_regular_gain_rule(rule: Rule) -> bool:
+    return rule.condition.type is ConditionType.REGULAR_GAIN
 
 
 def _is_leaderboard_rule(rule: Rule) -> bool:
@@ -171,6 +178,7 @@ class MonitorEngine:
         self._stable_done: set[str] = set()
         self._stable_captured_at: Optional[datetime] = None
         self._stable_frozen_day: str | None = None
+        self._check_reminder_inflight: set[str] = set()
 
     def load_config(self, force: bool = False) -> RulesConfig:
         now = datetime.now(timezone.utc)
@@ -414,6 +422,7 @@ class MonitorEngine:
                 if idle_logged:
                     logger.info("Session open; scanning every %ss", interval)
                     idle_logged = False
+                await self._maybe_send_check_reminders(config)
                 await self.poll_once()
             except Exception as exc:  # noqa: BLE001
                 self.last_error = str(exc)
@@ -537,6 +546,7 @@ class MonitorEngine:
         while self._running:
             try:
                 config = self.load_config()
+                await self._maybe_send_check_reminders(config)
                 rules = [
                     rule for rule in config.rules if rule.enabled and _is_breaker_rule(rule)
                 ]
@@ -557,16 +567,29 @@ class MonitorEngine:
                 trend_rules = [
                     rule for rule in config.rules if rule.enabled and _is_trend_rule(rule)
                 ]
+                gain_rules = [
+                    rule for rule in config.rules if rule.enabled and _is_regular_gain_rule(rule)
+                ]
                 if (
                     not rules
                     and not last_hour_rules
                     and not stable_rules
                     and not day_gain_rules
                     and not trend_rules
+                    and not gain_rules
                 ):
                     await asyncio.sleep(30)
                     continue
                 if is_regular_session():
+                    for rule in gain_rules:
+                        matched = await self._match_regular_gain(rule)
+                        self._note_opend_ok()
+                        if not matched:
+                            continue
+                        async with self._lock:
+                            state = self.store.load_state()
+                            await self._emit_trend_matches(rule, matched, state)
+                            self.store.save_state(state)
                     touch_rules = [rule for rule in day_gain_rules if rule.condition.intraday_touch]
                     if touch_rules:
                         await self._record_day_gains(touch_rules)
@@ -895,6 +918,98 @@ class MonitorEngine:
             return
         message = f"{body} {now_et().strftime('%H:%M')} ET"
         await self._send_system(title, message)
+
+    async def _maybe_send_check_reminders(self, config: RulesConfig) -> None:
+        due = due_check_reminders()
+        if not due:
+            return
+        day = now_et().date().isoformat()
+        pending: list[tuple[str, str, str, list[str]]] = []
+        async with self._lock:
+            state = self.store.load_state()
+            sent = state.get("check_reminders")
+            if not isinstance(sent, dict):
+                sent = {}
+            for reminder in due:
+                stamp = f"{day}:{reminder.key}"
+                if sent.get(reminder.key) == day or stamp in self._check_reminder_inflight:
+                    continue
+                ordered = []
+                for rule_id in reminder.rule_ids:
+                    match = next(
+                        (rule for rule in config.rules if rule.enabled and rule.id == rule_id),
+                        None,
+                    )
+                    if match is not None:
+                        ordered.append(match)
+                if not ordered:
+                    continue
+                self._check_reminder_inflight.add(stamp)
+                pending.append(
+                    (
+                        stamp,
+                        reminder.key,
+                        reminder.label,
+                        [rule.name for rule in ordered],
+                    )
+                )
+        for stamp, key, label, names in pending:
+            try:
+                await self._deliver_check_reminder(label, names)
+            except Exception as exc:  # noqa: BLE001
+                self._check_reminder_inflight.discard(stamp)
+                logger.warning("Could not send check reminder: %s", exc)
+                continue
+            async with self._lock:
+                state = self.store.load_state()
+                remembered = state.get("check_reminders")
+                if not isinstance(remembered, dict):
+                    remembered = {}
+                remembered[key] = day
+                state["check_reminders"] = {
+                    key: value for key, value in remembered.items() if value == day
+                }
+                self.store.save_state(state)
+            logger.info("Check reminder sent: %s", label)
+
+    async def _deliver_check_reminder(self, label: str, names: list[str]) -> None:
+        text = check_reminder_text(label, names)
+        routes = getattr(self, "routes", None)
+        notify = CHECK_REMINDER_NOTIFY
+        slack_url = ""
+        token = ""
+        if routes is not None and routes.has_slack(notify):
+            slack_url = routes.slack_url(notify)
+        if routes is not None and routes.has_pushover(notify):
+            token = routes.pushover_token(notify)
+        if self.pushover is None and self.slack is None:
+            return
+        if not token and not slack_url:
+            raise RuntimeError(f"{notify} has no Slack webhook or Pushover token")
+        delivered = False
+        errors: list[Exception] = []
+        if self.pushover is not None and token:
+            try:
+                await self.pushover.send_text(
+                    text,
+                    title="重要提醒",
+                    token=token,
+                    priority=1,
+                    sound="pushover",
+                )
+                delivered = True
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+        if self.slack is not None and slack_url:
+            try:
+                await self.slack.send_text(f"重要提醒\n{text}", webhook_url=slack_url)
+                delivered = True
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+        for exc in errors:
+            logger.warning("Check reminder delivery failed: %s", exc)
+        if errors and not delivered:
+            raise errors[0]
 
     async def _send_system(self, title: str, message: str) -> None:
         routes = getattr(self, "routes", None)
@@ -1564,6 +1679,22 @@ class MonitorEngine:
         self._close_checked_at = now
         return True
 
+    async def _match_regular_gain(self, rule: Rule) -> list[Quote]:
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return []
+        found = await client.regular_gainers(
+            rule.condition.value,
+            max_market_cap=rule.condition.max_market_cap,
+            min_volume=rule.condition.min_volume,
+        )
+        for quote in found:
+            quote.regular_change_pct = quote.change_pct
+        self._log_saved_matches(
+            rule.id, [quote.symbol for quote in found], f"Regular gain > {rule.condition.value:g}%"
+        )
+        return found
+
     async def _match_breaker_close(self, rule: Rule) -> list[Quote]:
         day = now_et().date().isoformat()
         halted = self.store.session_symbols(day, "upward_halt")
@@ -1669,7 +1800,7 @@ class MonitorEngine:
             self._board_retry_at = now + timedelta(seconds=30)
             return
         rows = [(quote.symbol, leaderboard_line(quote)) for quote in leaders]
-        title = f"{slot.strftime('%H:%M')} {rule.label or 'Top 5'}"
+        title = f"{slot.strftime('%H:%M')} {rule.name}"
         delivered = await self._deliver_digest(rule.id, title, rows, rule.notify)
         if not delivered:
             self._board_retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
@@ -1678,7 +1809,7 @@ class MonitorEngine:
         alert = self.store.new_alert(
             rule_id=rule.id,
             rule_name=rule.summary,
-            label=rule.label,
+            label=rule.name,
             notify=rule.notify,
             symbol=leaders[0].symbol,
             message=message,
@@ -1851,7 +1982,7 @@ class MonitorEngine:
         for rule in config.rules:
             if not rule.enabled or not rule.is_scanner or self._rule_session_open(rule):
                 continue
-            if _is_close_rule(rule):
+            if _is_close_rule(rule) or _is_regular_gain_rule(rule):
                 continue
             afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
             max_cap = None if rule.condition.skip_market_cap else (rule.condition.max_market_cap or 100_000_000)
@@ -1899,6 +2030,35 @@ class MonitorEngine:
             shown.extend(matched)
         return shown
 
+    async def _fill_prior_session(self, rule: Rule, quote: Quote) -> None:
+        """Copy the previous session's close onto the quote used in the body."""
+        session = rule.group or rule.condition_session
+        if session is None or self.moomoo is None:
+            return
+        try:
+            snaps = await self._moomoo_snapshots(self.moomoo, [quote.symbol])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Prior-session quote unavailable for %s: %s", quote.symbol, exc)
+            return
+        snap = snaps.get(quote.symbol)
+        if snap is None:
+            return
+        if session == "盘后":
+            if snap.regular_price:
+                quote.regular_price = snap.regular_price
+            if snap.regular_change_pct is not None:
+                quote.regular_change_pct = snap.regular_change_pct
+        elif session == "盘前":
+            if snap.after_hours_price:
+                quote.after_hours_price = snap.after_hours_price
+            if snap.after_hours_change_pct is not None:
+                quote.after_hours_change_pct = snap.after_hours_change_pct
+        elif session == "盘中":
+            if snap.premarket_price:
+                quote.premarket_price = snap.premarket_price
+            if snap.premarket_change_pct is not None:
+                quote.premarket_change_pct = snap.premarket_change_pct
+
     async def _fire_alert(
         self,
         rule: Rule,
@@ -1911,16 +2071,11 @@ class MonitorEngine:
         if self.store.in_cooldown(state, key, rule.cooldown_minutes):
             logger.info("Rule %s matched %s but is in cooldown", rule.id, quote.symbol)
             return None
-        if rule.condition.type is ConditionType.PREMARKET_GAIN and self.moomoo is not None:
-            try:
-                quote.after_hours_change_pct = await self.moomoo.after_hours_change(quote.symbol)
-                await self._drain_client_problem(self.moomoo)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("After-hours change unavailable for %s: %s", quote.symbol, exc)
+        await self._fill_prior_session(rule, quote)
         alert = self.store.new_alert(
             rule_id=rule.id,
             rule_name=rule.summary,
-            label=rule.label,
+            label=rule.name,
             notify=rule.notify,
             symbol=quote.symbol,
             message=render_message(rule, quote, extra),

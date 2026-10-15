@@ -82,6 +82,19 @@ def test_regular_close_runs_in_the_regular_session():
         )
 
 
+def test_regular_gain_runs_in_the_regular_session():
+    rule = Rule(
+        id="x",
+        name="盘中80%",
+        symbol="*",
+        group="盘中",
+        condition=Condition(type=ConditionType.REGULAR_GAIN, value=80),
+    )
+    assert rule.condition_session == "盘中"
+    assert rule.is_scanner
+    assert evaluate_rule(rule, _quote(100.0), None).matched is False
+
+
 def test_alert_ends_with_the_description():
     rule = Rule(
         id="x",

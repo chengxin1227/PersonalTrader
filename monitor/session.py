@@ -82,6 +82,67 @@ def afterhours_stable_missed(
     return current >= end
 
 
+CHECK_REMINDER_GRACE_MINUTES = 3
+CHECK_REMINDER_NOTIFY = "Important-reminder"
+
+
+class CheckReminder:
+    """A once-a-day prompt to review the named rules."""
+
+    def __init__(self, key: str, at: time, rule_ids: tuple[str, ...], label: str) -> None:
+        self.key = key
+        self.at = at
+        self.rule_ids = rule_ids
+        self.label = label
+
+
+CHECK_REMINDERS = (
+    CheckReminder(
+        "regular-close-15",
+        time(15, 45),
+        ("regular-gain80", "regular-halt-close15"),
+        "盘中收盘前15分钟",
+    ),
+    CheckReminder(
+        "afterhours-min-5",
+        time(16, 5),
+        ("afterhours-day30-ah10",),
+        "盘后开始第5分钟",
+    ),
+    CheckReminder(
+        "afterhours-2h30",
+        time(18, 30),
+        ("afterhours-top5", "afterhours-gain80"),
+        "盘后2.5小时",
+    ),
+    CheckReminder(
+        "premarket-end-15",
+        time(9, 15),
+        ("premarket-last-3h-20", "premarket-gain80"),
+        "盘前结束前15分钟",
+    ),
+)
+
+
+def due_check_reminders(moment: datetime | None = None) -> list[CheckReminder]:
+    """Reminders whose clock time has arrived and is still inside the grace window."""
+    current = now_et(moment)
+    if current.weekday() >= 5:
+        return []
+    due: list[CheckReminder] = []
+    for reminder in CHECK_REMINDERS:
+        start = datetime.combine(current.date(), reminder.at, tzinfo=current.tzinfo)
+        end = start + timedelta(minutes=CHECK_REMINDER_GRACE_MINUTES)
+        if start <= current < end:
+            due.append(reminder)
+    return due
+
+
+def check_reminder_text(label: str, names: list[str]) -> str:
+    joined = names[0] if len(names) == 1 else "和".join(names)
+    return f"{label}，请检查{joined}"
+
+
 def afterhours_board_slot(moment: datetime | None = None) -> datetime | None:
     """The current half-hour mark during after-hours, from 16:00 through 19:30 ET."""
     current = now_et(moment)

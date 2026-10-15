@@ -387,6 +387,7 @@ def evaluate_rule(
         ConditionType.AFTERHOURS_GAIN,
         ConditionType.LATE_SESSION_GAIN,
         ConditionType.REGULAR_CLOSE,
+        ConditionType.REGULAR_GAIN,
     }:
         return RuleEvaluation(matched=False, reason="scanner rule")
 
@@ -432,13 +433,24 @@ def split_alert_name(prefix: str) -> tuple[str, str]:
     return text.strip(), ""
 
 
+def _prior_session(rule: Rule, quote: Quote) -> tuple[float | None, float | None]:
+    """Change and price from the session before this alert.
+
+    After-hours shows the regular close, premarket shows the previous day's
+    after-hours close, and the regular session shows the premarket close.
+    """
+    session = rule.group or rule.condition_session
+    if session == "盘后":
+        return quote.regular_change_pct, quote.regular_price
+    if session == "盘前":
+        return quote.after_hours_change_pct, quote.after_hours_price
+    if session == "盘中":
+        return quote.premarket_change_pct, quote.premarket_price
+    return None, None
+
+
 def _move_text(rule: Rule, quote: Quote) -> str:
-    if rule.condition.type is ConditionType.AFTERHOURS_GAIN:
-        value = quote.regular_change_pct
-    elif rule.condition.type is ConditionType.PREMARKET_GAIN:
-        value = quote.after_hours_change_pct
-    else:
-        return ""
+    value, _price = _prior_session(rule, quote)
     if value is None:
         return ""
     return f"{value:+.1f}%{FIELD_GAP}"
@@ -465,7 +477,14 @@ def render_message(rule: Rule, quote: Quote, extra: dict | None = None) -> str:
         values.update(extra)
     values["field_gap"] = FIELD_GAP
     values["move_text"] = _move_text(rule, quote)
-    values["price_text"] = format_price(float(values["price"]))
+    _prior_change, prior_price = _prior_session(rule, quote)
+    if prior_price is not None and prior_price > 0:
+        shown_price = prior_price
+    elif _prior_change is not None:
+        shown_price = None
+    else:
+        shown_price = float(values["price"])
+    values["price_text"] = "" if shown_price is None else format_price(shown_price)
     values["volume_text"] = format_volume(float(values["volume"]))
     template = rule.slack_message or "{name}: {symbol} is ${price:.2f} ({change_pct:+.2f}% today)"
     try:

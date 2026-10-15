@@ -262,11 +262,20 @@ def quote_from_after_hours(row: dict[str, Any]) -> Quote | None:
         return None
     volume = _float(row.get("after_volume"))
     low_pct, high_pct = band
+    regular_price = _float(row.get("last_price"))
+    prev_close = _float(row.get("prev_close_price"))
+    regular_change = None
+    if regular_price is not None and prev_close:
+        regular_change = ((regular_price - prev_close) / prev_close) * 100
     return Quote(
         symbol=symbol,
         company=name or None,
         price=price,
         change_pct=change,
+        regular_price=regular_price if regular_price and regular_price > 0 else None,
+        regular_change_pct=regular_change,
+        after_hours_price=price,
+        after_hours_change_pct=change,
         volume=int(volume) if volume is not None else None,
         session_low_pct=low_pct,
         session_high_pct=high_pct,
@@ -285,11 +294,16 @@ def quote_from_premarket(row: dict[str, Any]) -> Quote | None:
     if price is None or price <= 0 or change is None:
         return None
     volume = _float(row.get("pre_volume"))
+    after_price = _float(row.get("after_price"))
     return Quote(
         symbol=symbol,
         company=name or None,
         price=price,
         change_pct=change,
+        premarket_price=price,
+        premarket_change_pct=change,
+        after_hours_price=after_price if after_price and after_price > 0 else None,
+        after_hours_change_pct=_float(row.get("after_change_rate")),
         volume=int(volume) if volume is not None else None,
     )
 
@@ -305,6 +319,8 @@ def quote_from_snapshot(row: dict[str, Any]) -> Quote:
     status = str(row.get("sec_status") or "").strip()
     if status in {"", "N/A", "NONE"}:
         status = ""
+    pre_price = _float(row.get("pre_price"))
+    after_price = _float(row.get("after_price"))
     return Quote(
         symbol=symbol,
         price=price,
@@ -315,6 +331,12 @@ def quote_from_snapshot(row: dict[str, Any]) -> Quote:
         daily_low=_float(row.get("low_price")),
         prev_close=prev_close,
         change_pct=change_pct,
+        regular_price=price if price and price > 0 else None,
+        regular_change_pct=change_pct,
+        premarket_price=pre_price if pre_price and pre_price > 0 else None,
+        premarket_change_pct=_float(row.get("pre_change_rate")),
+        after_hours_price=after_price if after_price and after_price > 0 else None,
+        after_hours_change_pct=_float(row.get("after_change_rate")),
         volume=int(volume) if volume is not None else None,
         company=str(row.get("name") or "").strip() or None,
         sec_status=status or None,
@@ -336,12 +358,20 @@ def quote_from_rank(
     if not symbol:
         return None
     volume = _float(row.get(volume_key))
+    price = _float(row.get(price_key))
+    change = _float(row.get(change_key))
+    close = _float(row.get("close_price"))
     return Quote(
         symbol=symbol,
-        price=_float(row.get(price_key)),
-        prev_close=_float(row.get("close_price")),
-        change_pct=_float(row.get(change_key)),
+        price=price,
+        prev_close=close,
+        change_pct=change,
         regular_change_pct=_float(row.get("change_ratio")),
+        regular_price=close if price_key == "after_hours_price" and close and close > 0 else None,
+        premarket_price=price if price_key == "pre_market_price" else None,
+        premarket_change_pct=change if price_key == "pre_market_price" else None,
+        after_hours_price=price if price_key == "after_hours_price" else None,
+        after_hours_change_pct=change if price_key == "after_hours_price" else None,
         volume=int(volume) if volume is not None else None,
         company=name.strip() or None,
     )

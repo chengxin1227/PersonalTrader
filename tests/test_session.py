@@ -60,7 +60,7 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
     assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 15, 44, tzinfo=ET))] == []
     close = due_check_reminders(datetime(2026, 10, 15, 15, 45, tzinfo=ET))
     assert [item.key for item in close] == ["regular-close-15"]
-    assert close[0].rule_ids == ("regular-gain80", "regular-halt-close15")
+    assert close[0].rule_ids == ("afterhours-day80-ah5",)
     assert due_check_reminders(datetime(2026, 10, 15, 15, 47, 59, tzinfo=ET))
     assert due_check_reminders(datetime(2026, 10, 15, 15, 48, tzinfo=ET)) == []
 

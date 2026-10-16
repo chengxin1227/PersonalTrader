@@ -100,7 +100,7 @@ CHECK_REMINDERS = (
     CheckReminder(
         "regular-close-15",
         time(15, 45),
-        ("regular-gain80", "regular-halt-close15"),
+        ("afterhours-day80-ah5",),
         "盘中收盘前15分钟",
     ),
     CheckReminder(

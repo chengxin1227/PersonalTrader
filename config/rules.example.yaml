@@ -21,9 +21,9 @@ watchlist: []
 # name is the short name and the 同花顺 group. description is shown in alerts.
 rules:
   afterhours:
-    - id: afterhours-30-hold25
-      name: 盘后涨幅超30%的股票
-      description: 盘后涨幅超过30%，15分钟后仍在25%以上，总市值不超过5亿美元，成交量超过10万
+    - id: afterhours-30-hold20
+      name: 盘后涨幅超30%且保持20%以上的股票
+      description: 盘后涨幅超过30%，15分钟后仍在20%以上，总市值不超过5亿美元，成交量超过10万
       label: After-hours boost
       notify: Afterhours-boost
       symbol: "*"
@@ -31,7 +31,7 @@ rules:
       cooldown_minutes: 240
       condition:
         type: afterhours_gain
-        value: 25
+        value: 20
         min_prior_change: 30
         prior_change_lag_minutes: 15
         max_market_cap: 500000000
@@ -140,36 +140,37 @@ rules:
         max_market_cap: 500000000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
-  regular:
-    - id: regular-halt-close15
+    - id: afterhours-halt-ah5
       name: 盘中触发过涨幅熔断的股票
-      description: 盘中收盘前15分钟，当天触发过涨幅熔断，市值不超过5亿美元
+      description: 当天触发过涨幅熔断，盘后涨幅超过5%，市值不超过5亿美元
       label: Halt boost
       notify: Halt-boost
       symbol: "*"
       enabled: true
-      cooldown_minutes: 390
+      cooldown_minutes: 240
       condition:
-        type: regular_close
-        close_minutes: 15
+        type: afterhours_gain
+        value: 5
         max_market_cap: 500000000
         require_circuit_breaker: true
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
-    - id: regular-gain80
+    - id: afterhours-day80-ah5
       name: 盘中涨幅超80%的股票
-      description: 盘中涨幅超过80%，市值不超过5亿美元
+      description: 盘中涨幅超过80%，盘后涨幅超过5%，市值不超过5亿美元
       label: Regular 80% boost
       notify: Regular-80-boost
       symbol: "*"
       enabled: true
-      cooldown_minutes: 390
+      cooldown_minutes: 240
       condition:
-        type: regular_gain
-        value: 80
+        type: afterhours_gain
+        value: 5
+        min_regular_change: 80
         max_market_cap: 500000000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
+  regular:
     - id: regular-last-hour-20
       name: 盘中尾盘
       description: 盘中收盘前2小时突然涨幅超20%，总市值不超过5亿美元，成交量超过10万，价格高于0.1美元
@@ -188,9 +189,9 @@ rules:
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
   premarket:
-    - id: premarket-30-hold25
-      name: 盘前涨幅超30%的股票
-      description: 盘前涨幅超过30%，15分钟后仍在25%以上，总市值不超过5亿美元，成交量超过10万
+    - id: premarket-30-hold20
+      name: 盘前涨幅超30%且保持20%以上的股票
+      description: 盘前涨幅超过30%，15分钟后仍在20%以上，总市值不超过5亿美元，成交量超过10万
       label: Premarket boost
       notify: Premarket-boost
       symbol: "*"
@@ -198,7 +199,7 @@ rules:
       cooldown_minutes: 330
       condition:
         type: premarket_gain
-        value: 25
+        value: 20
         min_prior_change: 30
         prior_change_lag_minutes: 15
         max_market_cap: 500000000

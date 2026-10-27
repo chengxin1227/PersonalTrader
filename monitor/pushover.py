@@ -104,10 +104,21 @@ class PushoverClient:
         )
 
     async def send_digest(
-        self, title: str, rows: list[tuple[str, str]], token: str | None = None
+        self,
+        title: str,
+        rows: list[tuple[str, str]],
+        token: str | None = None,
+        reason: str | None = None,
     ) -> None:
         linked = [(quote_url(symbol), line) for symbol, line in rows]
-        await self.send_text(html_digest(linked), title=title, html=True, token=token)
+        body = html_digest(linked)
+        footer = (reason or "").strip()
+        if footer:
+            body = (
+                f'{body}<font size="2" color="{_MUTED}">\n\n'
+                f"{html.escape(footer)}</font>"
+            )
+        await self.send_text(body, title=title, html=True, token=token)
 
     async def send_text(
         self,

@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 from monitor.models import MarketClock, Quote
 
 ET = ZoneInfo("America/New_York")
+NZ = ZoneInfo("Pacific/Auckland")
 PREMARKET_START = time(4, 0)
 PREMARKET_END = time(9, 30)
 AFTERHOURS_START = time(16, 0)
@@ -19,6 +20,18 @@ def now_et(moment: datetime | None = None) -> datetime:
     if current.tzinfo is None:
         current = current.replace(tzinfo=ET)
     return current.astimezone(ET)
+
+
+def now_nz(moment: datetime | None = None) -> datetime:
+    current = moment or datetime.now(tz=NZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=NZ)
+    return current.astimezone(NZ)
+
+
+def format_nz_clock(moment: datetime | None = None) -> str:
+    """HH:MM in New Zealand time for Pushover / Slack titles."""
+    return now_nz(moment).strftime("%H:%M")
 
 
 def is_premarket(moment: datetime | None = None) -> bool:
@@ -100,7 +113,7 @@ CHECK_REMINDERS = (
     CheckReminder(
         "regular-close-15",
         time(15, 45),
-        ("afterhours-day80-ah5",),
+        ("afterhours-halt-or-day80",),
         "盘中收盘前15分钟",
     ),
     CheckReminder(
@@ -112,7 +125,7 @@ CHECK_REMINDERS = (
     CheckReminder(
         "afterhours-2h30",
         time(18, 30),
-        ("afterhours-top5", "afterhours-gain80"),
+        ("afterhours-top5-ah50", "afterhours-halt-or-day80"),
         "盘后2.5小时",
     ),
     CheckReminder(

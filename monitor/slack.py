@@ -57,7 +57,11 @@ class SlackClient:
         response.raise_for_status()
 
     async def send_digest(
-        self, title: str, rows: list[tuple[str, str]], webhook_url: str | None = None
+        self,
+        title: str,
+        rows: list[tuple[str, str]],
+        webhook_url: str | None = None,
+        reason: str | None = None,
     ) -> None:
         url = webhook_url or self._settings.slack_webhook_url
         if not url:
@@ -71,6 +75,11 @@ class SlackClient:
                     "type": "section",
                     "text": {"type": "mrkdwn", "text": _link_name(line, page_url(symbol))},
                 }
+            )
+        footer = (reason or "").strip()
+        if footer:
+            blocks.append(
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]}
             )
         response = await self._client.post(
             url,

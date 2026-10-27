@@ -219,9 +219,22 @@ def evaluate_afterhours_scan(
             )
     if rule.condition.require_uptrend and quote.session_uptrend is not True:
         return RuleEvaluation(matched=False, reason="regular session trend is not up")
-    if rule.condition.require_circuit_breaker and quote.session_circuit_breaker is not True:
+    wants_breaker = rule.condition.require_circuit_breaker
+    wants_day = day_min is not None
+    has_breaker = quote.session_circuit_breaker is True
+    has_day = quote.recent_day_spike is True
+    if wants_breaker and wants_day:
+        if not has_breaker and not has_day:
+            return RuleEvaluation(
+                matched=False,
+                reason=(
+                    "no regular-session circuit breaker and no day gain "
+                    f"> {day_min:.2f}% in the last {rule.condition.recent_day_count} days"
+                ),
+            )
+    elif wants_breaker and not has_breaker:
         return RuleEvaluation(matched=False, reason="no regular-session circuit breaker")
-    if day_min is not None and quote.recent_day_spike is not True:
+    elif wants_day and not has_day:
         return RuleEvaluation(
             matched=False,
             reason=f"no day gain > {day_min:.2f}% in the last {rule.condition.recent_day_count} days",
@@ -230,14 +243,25 @@ def evaluate_afterhours_scan(
         rule.condition.require_circuit_breaker and rule.condition.max_market_cap is None
     ):
         trend = " and regular-session trend up" if rule.condition.require_uptrend else ""
-        breaker = (
-            " and regular-session circuit breaker" if rule.condition.require_circuit_breaker else ""
-        )
+        if wants_breaker and wants_day:
+            if has_breaker and has_day:
+                session = " and circuit breaker or day gain"
+            elif has_breaker:
+                session = " and regular-session circuit breaker"
+            else:
+                session = (
+                    f" and day gain > {day_min:.2f}% in the last "
+                    f"{rule.condition.recent_day_count} days"
+                )
+        elif wants_breaker:
+            session = " and regular-session circuit breaker"
+        else:
+            session = ""
         return RuleEvaluation(
             matched=True,
             reason=(
                 f"after-hours {quote.change_pct:.2f}% > {rule.condition.value:.2f}%"
-                f"{trend}{breaker}"
+                f"{trend}{session}"
             ),
         )
     max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000

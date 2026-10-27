@@ -340,6 +340,91 @@ def test_leaderboard_line_shows_the_afterhours_gain_and_price():
     assert leaderboard_line(quote) == f"ABCD{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
 
 
+def test_peak_fade_score_ranks_bigger_givebacks_first():
+    from monitor.engine import peak_fade_score
+
+    assert peak_fade_score(120.0, 40.0) > peak_fade_score(90.0, 80.0)
+    assert peak_fade_score(None, 40.0) == float("-inf")
+    assert peak_fade_score(120.0, None) == float("-inf")
+    names = ["KEEP", "FADE", "MID"]
+    scores = {"FADE": peak_fade_score(150.0, 20.0), "MID": peak_fade_score(100.0, 60.0), "KEEP": peak_fade_score(85.0, 82.0)}
+    assert sorted(names, key=lambda s: scores[s], reverse=True) == ["FADE", "MID", "KEEP"]
+
+
+def test_afterhours_ah50_singles_need_volume_after_the_open():
+    rule = Rule(
+        id="afterhours-top5-ah50",
+        name="盘后涨超50%的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.AFTERHOURS_GAIN,
+            value=50,
+            max_market_cap=500_000_000,
+            min_volume=100_000,
+            top_n=5,
+            min_afterhours_touch=50,
+        ),
+        slack_message="{stock_name}{field_gap}{move_text}{price_text}",
+    )
+    quote = _quote(price=1.12, prev_close=1.0, volume=100_001)
+    quote.change_pct = 51.0
+    assert evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    quote.volume = 100_000
+    assert not evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    quote.volume = 100_001
+    quote.change_pct = 49.9
+    assert not evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+
+
+def test_afterhours_halt_or_day80_matches_either_condition():
+    rule = Rule(
+        id="afterhours-halt-or-day80",
+        name="盘中熔断或涨超80%的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.AFTERHOURS_GAIN,
+            value=5,
+            max_market_cap=500_000_000,
+            min_volume=100_000,
+            top_n=5,
+            min_regular_touch=80,
+            include_circuit_breaker=True,
+            require_circuit_breaker=True,
+            min_recent_day_change=80,
+            recent_day_count=1,
+            intraday_touch=True,
+        ),
+        slack_message="{stock_name}{field_gap}{move_text}{price_text}",
+    )
+    quote = _quote(price=1.12, prev_close=1.0, volume=100_001)
+    quote.change_pct = 6.2
+    quote.session_circuit_breaker = True
+    quote.recent_day_spike = False
+    assert evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    quote.session_circuit_breaker = False
+    quote.recent_day_spike = True
+    assert evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    quote.volume = 100_000
+    assert not evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    quote.volume = 100_001
+    quote.recent_day_spike = False
+    assert not evaluate_afterhours_scan(
+        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+
+
 def test_afterhours_circuit_breaker_needs_regular_gain_and_a_halt():
     rule = Rule(
         id="afterhours-circuit-breaker-day10-ah5",

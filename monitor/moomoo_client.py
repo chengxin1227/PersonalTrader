@@ -228,6 +228,29 @@ def regular_high_change_pct(high: float | None, prev_close: float | None) -> flo
     return round((high - prev_close) / prev_close * 100, 4)
 
 
+def regular_touch_change_pct(
+    *,
+    change_pct: float | None,
+    high: float | None,
+    prev_close: float | None,
+    pre_high: float | None = None,
+) -> float | None:
+    """Peak regular-session gain: live change, or day high once it clears the pre-market high.
+
+    Moomoo's `high_price` can still be the pre-market print. Only count that high as a
+    regular-session touch after the session has traded above `pre_high`.
+    """
+    peaks: list[float] = []
+    if change_pct is not None:
+        peaks.append(change_pct)
+    if high is not None and prev_close is not None and high > 0 and prev_close > 0:
+        if pre_high is None or pre_high <= 0 or high > pre_high * 1.0001:
+            peaks.append((high - prev_close) / prev_close * 100)
+    if not peaks:
+        return None
+    return round(max(peaks), 4)
+
+
 def session_mark(row: dict[str, Any], session: str) -> tuple[float, int] | None:
     """Premarket or after-hours price and share volume from a snapshot row."""
     if session == "premarket":
@@ -320,6 +343,7 @@ def quote_from_snapshot(row: dict[str, Any]) -> Quote:
     if status in {"", "N/A", "NONE"}:
         status = ""
     pre_price = _float(row.get("pre_price"))
+    pre_high = _float(row.get("pre_high_price"))
     after_price = _float(row.get("after_price"))
     return Quote(
         symbol=symbol,
@@ -334,6 +358,7 @@ def quote_from_snapshot(row: dict[str, Any]) -> Quote:
         regular_price=price if price and price > 0 else None,
         regular_change_pct=change_pct,
         premarket_price=pre_price if pre_price and pre_price > 0 else None,
+        premarket_high=pre_high if pre_high and pre_high > 0 else None,
         premarket_change_pct=_float(row.get("pre_change_rate")),
         after_hours_price=after_price if after_price and after_price > 0 else None,
         after_hours_change_pct=_float(row.get("after_change_rate")),
@@ -400,7 +425,7 @@ def afterhours_leaders(
     limit: int,
     min_volume: int | None = None,
 ) -> list[Quote]:
-    """Skip zero prices, and thin names after the after-hours open."""
+    """Rank by after-hours gain. Skip zero prices, and thin names after the open."""
     ready: list[Quote] = []
     for quote in quotes:
         if quote.price is None or quote.price <= 0:
@@ -408,9 +433,15 @@ def afterhours_leaders(
         if min_volume is not None and (quote.volume is None or quote.volume <= min_volume):
             continue
         ready.append(quote)
-        if len(ready) >= limit:
-            break
-    return ready
+    ready.sort(
+        key=lambda item: item.change_pct if item.change_pct is not None else float("-inf"),
+        reverse=True,
+    )
+    return ready[:limit]
+
+
+def afterhours_touch_session(minimum: float) -> str:
+    return f"afterhours_touch_{minimum:g}"
 
 
 def total_market_cap(

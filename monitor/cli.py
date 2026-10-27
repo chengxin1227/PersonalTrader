@@ -147,9 +147,49 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             volume = (
                                 f", volume > {rule.condition.min_volume:,.0f} after the open"
                             )
+                        pool = ""
+                        if rule.condition.min_afterhours_touch is not None:
+                            pool += (
+                                f" that once gained > {rule.condition.min_afterhours_touch:g}%"
+                                " after-hours"
+                            )
+                        if rule.condition.min_regular_touch is not None:
+                            joiner = " or" if pool else " that"
+                            pool += (
+                                f"{joiner} once gained > {rule.condition.min_regular_touch:g}%"
+                                " in the regular session"
+                            )
+                        if rule.condition.include_circuit_breaker:
+                            joiner = " or" if pool else " that"
+                            pool += f"{joiner} hit an upward circuit breaker today"
+                        singles = ""
+                        if rule.condition.value > 0 and (
+                            rule.condition.min_afterhours_touch is not None
+                            or (
+                                (
+                                    rule.condition.require_circuit_breaker
+                                    or rule.condition.include_circuit_breaker
+                                )
+                                and (
+                                    rule.condition.min_recent_day_change is not None
+                                    or rule.condition.min_regular_touch is not None
+                                )
+                            )
+                        ):
+                            pool_entry = ""
+                            if (
+                                rule.condition.min_regular_touch is not None
+                                or rule.condition.include_circuit_breaker
+                            ):
+                                pool_entry = "alert on first regular-session pool entry; "
+                            singles = (
+                                f"; {pool_entry}also alert each name once AH > "
+                                f"{rule.condition.value:g}%"
+                            )
                         print(
                             f"    - {rule.name}: top {rule.condition.top_n} "
-                            f"after-hours names every 30m, total cap <= ${cap:,.0f}{volume}"
+                            f"after-hours names{pool} every 30m{singles}, "
+                            f"total cap <= ${cap:,.0f}{volume}"
                         )
                         continue
                     if (
@@ -232,23 +272,43 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                         )
                     if rule.condition.require_uptrend:
                         volume += " and regular-session trend up"
-                    if rule.condition.require_circuit_breaker:
-                        volume += " and upward circuit breaker"
-                    if rule.condition.min_recent_day_change is not None:
+                    if (
+                        rule.condition.require_circuit_breaker
+                        and rule.condition.min_recent_day_change is not None
+                    ):
                         if rule.condition.recent_day_count == 1:
                             touched = "once " if rule.condition.intraday_touch else ""
                             volume += (
-                                f" and the regular session {touched}gained "
-                                f"> {rule.condition.min_recent_day_change:g}%"
+                                " and (upward circuit breaker or the regular session "
+                                f"{touched}gained > {rule.condition.min_recent_day_change:g}%)"
                             )
                         else:
-                            closing_volume = ""
-                            if rule.condition.min_volume is not None:
-                                closing_volume = f" and that day's volume > {rule.condition.min_volume:,.0f}"
                             volume += (
-                                f" and a closing gain > {rule.condition.min_recent_day_change:g}%"
-                                f"{closing_volume} in the last {rule.condition.recent_day_count} sessions"
+                                " and (upward circuit breaker or a closing gain "
+                                f"> {rule.condition.min_recent_day_change:g}% in the last "
+                                f"{rule.condition.recent_day_count} sessions)"
                             )
+                    else:
+                        if rule.condition.require_circuit_breaker:
+                            volume += " and upward circuit breaker"
+                        if rule.condition.min_recent_day_change is not None:
+                            if rule.condition.recent_day_count == 1:
+                                touched = "once " if rule.condition.intraday_touch else ""
+                                volume += (
+                                    f" and the regular session {touched}gained "
+                                    f"> {rule.condition.min_recent_day_change:g}%"
+                                )
+                            else:
+                                closing_volume = ""
+                                if rule.condition.min_volume is not None:
+                                    closing_volume = (
+                                        f" and that day's volume > {rule.condition.min_volume:,.0f}"
+                                    )
+                                volume += (
+                                    f" and a closing gain > {rule.condition.min_recent_day_change:g}%"
+                                    f"{closing_volume} in the last "
+                                    f"{rule.condition.recent_day_count} sessions"
+                                )
                     if rule.condition.skip_market_cap or (
                         rule.condition.max_market_cap is None
                         and rule.condition.require_circuit_breaker

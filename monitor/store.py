@@ -30,6 +30,8 @@ class Store:
         self._spikes: dict[str, Any] | None = None
         self._day_gains_path = data_dir / "day_gains.json"
         self._day_gains: dict[str, Any] | None = None
+        self._peak_gains_path = data_dir / "peak_gains.json"
+        self._peak_gains: dict[str, Any] | None = None
         self._trend_watch_path = data_dir / "trend_watch.json"
         self._trend_watch: dict[str, Any] | None = None
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -189,6 +191,78 @@ class Store:
             return False
         key = symbol.upper()
         return any(isinstance(bucket.get(day), list) and key in bucket[day] for day in days)
+
+    def note_peak_gain(self, day: str, symbol: str, change_pct: float) -> float:
+        """Remember the highest regular-session change seen for `symbol` on `day`."""
+        peaks = self._load_peak_gains()
+        row = peaks.setdefault(day, {})
+        if not isinstance(row, dict):
+            row = {}
+            peaks[day] = row
+        key = symbol.upper()
+        existing = row.get(key)
+        if existing is not None:
+            try:
+                prior = float(existing)
+            except (TypeError, ValueError):
+                prior = float("-inf")
+            if prior >= change_pct:
+                return prior
+        row[key] = change_pct
+        self._prune_peak_gains(peaks, day)
+        self._save_peak_gains(peaks)
+        return change_pct
+
+    def peak_gain(self, day: str, symbol: str) -> float | None:
+        row = self._load_peak_gains().get(day, {})
+        if not isinstance(row, dict):
+            return None
+        value = row.get(symbol.upper())
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def peak_gains(self, day: str) -> dict[str, float]:
+        row = self._load_peak_gains().get(day, {})
+        if not isinstance(row, dict):
+            return {}
+        out: dict[str, float] = {}
+        for symbol, value in row.items():
+            if not isinstance(symbol, str):
+                continue
+            try:
+                out[symbol.upper()] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _prune_peak_gains(self, peaks: dict[str, Any], day: str) -> None:
+        cutoff = date.fromisoformat(day) - timedelta(days=21)
+        for stale in [
+            item
+            for item in peaks
+            if _is_iso_date(item) and date.fromisoformat(item) < cutoff
+        ]:
+            peaks.pop(stale, None)
+
+    def _load_peak_gains(self) -> dict[str, Any]:
+        if self._peak_gains is not None:
+            return self._peak_gains
+        if not self._peak_gains_path.exists():
+            self._peak_gains = {}
+            return self._peak_gains
+        with self._peak_gains_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self._peak_gains = payload if isinstance(payload, dict) else {}
+        return self._peak_gains
+
+    def _save_peak_gains(self, peaks: dict[str, Any]) -> None:
+        self._peak_gains = peaks
+        with self._peak_gains_path.open("w", encoding="utf-8") as handle:
+            json.dump(peaks, handle, indent=2)
 
     def replace_trend_watch(self, rule_id: str, day: str, rows: list[dict[str, Any]]) -> None:
         """Replace today's trend names. A later check near the close drops names that faded."""

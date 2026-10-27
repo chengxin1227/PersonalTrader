@@ -44,6 +44,16 @@ def test_closing_day_gains_drop_names_that_faded(tmp_path):
     assert store.day_gain_symbols(50, ["2026-10-09"]) == ["ZYBT"]
 
 
+def test_peak_gains_keep_the_intraday_high(tmp_path):
+    store = Store(tmp_path)
+    assert store.note_peak_gain("2026-10-09", "aaa", 82.0) == 82.0
+    assert store.note_peak_gain("2026-10-09", "AAA", 90.5) == 90.5
+    assert store.note_peak_gain("2026-10-09", "aaa", 88.0) == 90.5
+    assert store.peak_gain("2026-10-09", "aaa") == 90.5
+    assert store.peak_gains("2026-10-09") == {"AAA": 90.5}
+    assert store.peak_gain("2026-10-08", "AAA") is None
+
+
 def test_trend_watch_replaces_the_close_list(tmp_path):
     store = Store(tmp_path)
     store.replace_trend_watch(

@@ -99,13 +99,15 @@ def test_alert_ends_with_the_description():
     rule = Rule(
         id="x",
         name="盘后前5",
-        description="盘后涨幅前5，总市值不超过1亿美元",
+        description="盘后首次涨超50%，成交量超过10万",
+        board_description="盘后曾涨超50%，半点按盘后涨幅取前5",
         symbol="*",
-        condition=Condition(type=ConditionType.AFTERHOURS_GAIN, value=0),
+        condition=Condition(type=ConditionType.AFTERHOURS_GAIN, value=50, top_n=5),
         slack_message="{stock_name}{field_gap}{price_text}",
     )
     message = render_message(rule, _quote(1.5))
-    assert message.splitlines()[-1] == "盘后涨幅前5，总市值不超过1亿美元"
+    assert message.splitlines()[-1] == "盘后首次涨超50%，成交量超过10万"
+    assert rule.board_summary == "盘后曾涨超50%，半点按盘后涨幅取前5"
 
 
 def _quote(price: float, change_pct: float | None = 1.0) -> Quote:

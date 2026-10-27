@@ -128,6 +128,7 @@ def test_digest_links_each_name_like_other_alerts():
         await client.send_digest(
             "16:00 Top 5",
             [("GWHT", "GWHT    +75.4%    $0.30"), ("VCIG", "VCIG    +46.7%    $2.07")],
+            reason="盘后曾涨超50%，半点按盘后涨幅取前5",
         )
         await client.close()
 
@@ -138,6 +139,10 @@ def test_digest_links_each_name_like_other_alerts():
     assert '<a href="amihexin://">GWHT</a>' in seen["message"]
     assert "stockpage.10jqka.com.cn" not in seen["message"]
     assert '<font size="1"' not in seen["message"]
+    assert (
+        '<font size="2" color="#8E8E93">\n\n盘后曾涨超50%，半点按盘后涨幅取前5</font>'
+        in seen["message"]
+    )
 
 
 def test_message_percent_is_labeled_and_name_stays_the_link():

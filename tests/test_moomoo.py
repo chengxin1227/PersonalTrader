@@ -22,6 +22,7 @@ from monitor.moomoo_client import (
     session_mark,
     recent_daily_window,
     regular_high_change_pct,
+    regular_touch_change_pct,
     regular_session_uptrend,
     total_market_cap,
     yesterday_cap,
@@ -112,6 +113,31 @@ def test_regular_high_change_uses_the_session_high():
     assert regular_high_change_pct(2.0, 0) is None
 
 
+def test_regular_touch_uses_high_once_it_clears_premarket():
+    # Live change still counts.
+    assert regular_touch_change_pct(change_pct=85.0, high=1.5, prev_close=1.0) == 85.0
+    # Day high above pre-market high counts as a regular-session touch.
+    assert (
+        regular_touch_change_pct(
+            change_pct=22.0, high=0.85, prev_close=0.4479, pre_high=0.8142
+        )
+        == 89.7745
+    )
+    # Day high still equal to the pre-market high is not a regular touch by itself.
+    assert (
+        regular_touch_change_pct(
+            change_pct=10.0, high=0.8142, prev_close=0.4479, pre_high=0.8142
+        )
+        == 10.0
+    )
+    assert (
+        regular_touch_change_pct(
+            change_pct=None, high=0.8142, prev_close=0.4479, pre_high=0.8142
+        )
+        is None
+    )
+
+
 def test_session_mark_uses_the_extended_print():
     assert session_mark({"pre_price": 1.25, "pre_volume": 120000}, "premarket") == (1.25, 120000)
     assert session_mark({"after_price": 0.2, "after_volume": 10}, "afterhours") == (0.2, 10)
@@ -180,6 +206,7 @@ def test_day_gain_uses_the_last_five_completed_sessions():
 
 def test_afterhours_leaders_skip_zero_prices():
     from monitor.models import Quote
+    from monitor.moomoo_client import afterhours_touch_session
 
     zeros = [
         Quote(symbol=f"Z{index}", company="Placeholder", price=0, change_pct=0)
@@ -195,6 +222,10 @@ def test_afterhours_leaders_skip_zero_prices():
     thick = Quote(symbol="GWHT", price=0.3, change_pct=75.4, volume=100_001)
     assert afterhours_leaders([thin, thick], 5, min_volume=100_000) == [thick]
     assert afterhours_leaders([thin, thick], 5) == [thin, thick]
+    lower = Quote(symbol="LOW", price=1.0, change_pct=10, volume=200_000)
+    higher = Quote(symbol="HIGH", price=2.0, change_pct=60, volume=200_000)
+    assert [quote.symbol for quote in afterhours_leaders([lower, higher], 5)] == ["HIGH", "LOW"]
+    assert afterhours_touch_session(50) == "afterhours_touch_50"
 
 
 def test_snapshot_uses_last_price_against_previous_close():
@@ -224,6 +255,7 @@ def test_snapshot_keeps_each_session_close():
             "last_price": 0.026,
             "prev_close_price": 0.0401,
             "pre_price": 0.031,
+            "pre_high_price": 0.035,
             "pre_change_rate": -22.7,
             "after_price": 0.046,
             "after_change_rate": 76.9,
@@ -231,6 +263,7 @@ def test_snapshot_keeps_each_session_close():
     )
     assert quote.regular_price == 0.026
     assert quote.premarket_price == 0.031
+    assert quote.premarket_high == 0.035
     assert quote.premarket_change_pct == -22.7
     assert quote.after_hours_price == 0.046
     assert quote.after_hours_change_pct == 76.9

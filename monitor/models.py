@@ -34,8 +34,11 @@ class Condition(BaseModel):
     prior_change_lag_minutes: int = Field(default=5, ge=0)
     require_uptrend: bool = False
     require_circuit_breaker: bool = False
+    include_circuit_breaker: bool = False
     skip_market_cap: bool = False
     top_n: Optional[int] = Field(default=None, ge=1)
+    min_afterhours_touch: Optional[float] = None
+    min_regular_touch: Optional[float] = None
     min_recent_day_change: Optional[float] = None
     recent_day_count: int = Field(default=5, ge=1)
     intraday_touch: bool = False
@@ -52,6 +55,7 @@ class Rule(BaseModel):
     id: str
     name: str
     description: Optional[str] = None
+    board_description: Optional[str] = None
     label: Optional[str] = None
     notify: Optional[str] = None
     group: Optional[Session] = None
@@ -82,7 +86,13 @@ class Rule(BaseModel):
 
     @property
     def summary(self) -> str:
+        """Reason under single-stock alerts (and fallback label text)."""
         return (self.description or self.name).strip()
+
+    @property
+    def board_summary(self) -> str:
+        """Reason under half-hour top-N digests."""
+        return (self.board_description or self.description or self.name).strip()
 
     @model_validator(mode="after")
     def group_matches_condition(self) -> "Rule":
@@ -182,6 +192,7 @@ class Quote(BaseModel):
     regular_price: Optional[float] = None
     regular_change_pct: Optional[float] = None
     premarket_price: Optional[float] = None
+    premarket_high: Optional[float] = None
     premarket_change_pct: Optional[float] = None
     after_hours_price: Optional[float] = None
     after_hours_change_pct: Optional[float] = None

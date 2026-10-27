@@ -15,6 +15,7 @@ from monitor.session import (
     afterhours_just_opened,
     afterhours_stable_due,
     afterhours_stable_missed,
+    format_nz_clock,
     last_hour_phase,
     recent_trading_days,
     regular_close_approach,
@@ -24,6 +25,13 @@ from monitor.session import (
 )
 
 ET = ZoneInfo("America/New_York")
+NZ = ZoneInfo("Pacific/Auckland")
+
+
+def test_format_nz_clock_converts_from_et():
+    # 16:30 ET in daylight saving ≈ 09:30 NZ next calendar day.
+    slot = datetime(2026, 10, 15, 16, 30, tzinfo=ET)
+    assert format_nz_clock(slot) == slot.astimezone(NZ).strftime("%H:%M")
 
 
 def test_premarket_window():
@@ -60,7 +68,7 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
     assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 15, 44, tzinfo=ET))] == []
     close = due_check_reminders(datetime(2026, 10, 15, 15, 45, tzinfo=ET))
     assert [item.key for item in close] == ["regular-close-15"]
-    assert close[0].rule_ids == ("afterhours-day80-ah5",)
+    assert close[0].rule_ids == ("afterhours-halt-or-day80",)
     assert due_check_reminders(datetime(2026, 10, 15, 15, 47, 59, tzinfo=ET))
     assert due_check_reminders(datetime(2026, 10, 15, 15, 48, tzinfo=ET)) == []
 
@@ -79,8 +87,8 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
 
 def test_check_reminder_text_names_the_lists_to_review():
     assert (
-        check_reminder_text("盘后2.5小时", ["盘后涨幅前5的股票", "盘后涨幅超80%的股票"])
-        == "盘后2.5小时，请检查盘后涨幅前5的股票和盘后涨幅超80%的股票"
+        check_reminder_text("盘后2.5小时", ["盘后涨超50%的股票", "盘中熔断或涨超80%的股票"])
+        == "盘后2.5小时，请检查盘后涨超50%的股票和盘中熔断或涨超80%的股票"
     )
 
 

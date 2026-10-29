@@ -32,6 +32,8 @@ class Store:
         self._day_gains: dict[str, Any] | None = None
         self._peak_gains_path = data_dir / "peak_gains.json"
         self._peak_gains: dict[str, Any] | None = None
+        self._new_highs_path = data_dir / "session_new_highs.json"
+        self._new_highs: dict[str, Any] | None = None
         self._trend_watch_path = data_dir / "trend_watch.json"
         self._trend_watch: dict[str, Any] | None = None
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -263,6 +265,94 @@ class Store:
         self._peak_gains = peaks
         with self._peak_gains_path.open("w", encoding="utf-8") as handle:
             json.dump(peaks, handle, indent=2)
+
+    def new_high_watch(
+        self, day: str, rule_id: str, symbol: str
+    ) -> tuple[datetime, float] | None:
+        """First time above the entry threshold, and the highest gain seen since."""
+        row = self._load_new_highs().get(day, {}).get(rule_id, {}).get(symbol.upper())
+        if not isinstance(row, dict):
+            return None
+        raw_at = row.get("first_at")
+        raw_peak = row.get("peak")
+        if not raw_at or raw_peak is None:
+            return None
+        try:
+            peak = float(raw_peak)
+        except (TypeError, ValueError):
+            return None
+        seen = datetime.fromisoformat(str(raw_at))
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+        return seen, peak
+
+    def note_new_high_watch(
+        self,
+        day: str,
+        rule_id: str,
+        symbol: str,
+        change_pct: float,
+        when: datetime,
+    ) -> tuple[datetime, float]:
+        """Start watching a name the first time it clears the entry threshold."""
+        highs = self._load_new_highs()
+        rule_row = highs.setdefault(day, {}).setdefault(rule_id, {})
+        key = symbol.upper()
+        existing = rule_row.get(key)
+        if isinstance(existing, dict) and existing.get("first_at") is not None:
+            watched = self.new_high_watch(day, rule_id, key)
+            if watched is not None:
+                return watched
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        rule_row[key] = {"first_at": when.isoformat(), "peak": float(change_pct)}
+        self._prune_new_highs(highs, day)
+        self._save_new_highs(highs)
+        return when, float(change_pct)
+
+    def raise_new_high_peak(
+        self, day: str, rule_id: str, symbol: str, change_pct: float
+    ) -> float | None:
+        """Raise the watched peak when `change_pct` is higher. Returns the previous peak."""
+        highs = self._load_new_highs()
+        rule_row = highs.setdefault(day, {}).setdefault(rule_id, {})
+        key = symbol.upper()
+        existing = rule_row.get(key)
+        if not isinstance(existing, dict):
+            return None
+        try:
+            prior = float(existing.get("peak"))
+        except (TypeError, ValueError):
+            return None
+        if change_pct <= prior:
+            return prior
+        existing["peak"] = float(change_pct)
+        rule_row[key] = existing
+        self._save_new_highs(highs)
+        return prior
+
+    def _prune_new_highs(self, highs: dict[str, Any], day: str) -> None:
+        keep = {day}
+        if _is_iso_date(day):
+            keep.add((date.fromisoformat(day) - timedelta(days=1)).isoformat())
+        for stale in [item for item in highs if item not in keep]:
+            highs.pop(stale, None)
+
+    def _load_new_highs(self) -> dict[str, Any]:
+        if self._new_highs is not None:
+            return self._new_highs
+        if not self._new_highs_path.exists():
+            self._new_highs = {}
+            return self._new_highs
+        with self._new_highs_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self._new_highs = payload if isinstance(payload, dict) else {}
+        return self._new_highs
+
+    def _save_new_highs(self, highs: dict[str, Any]) -> None:
+        self._new_highs = highs
+        with self._new_highs_path.open("w", encoding="utf-8") as handle:
+            json.dump(highs, handle, indent=2)
 
     def replace_trend_watch(self, rule_id: str, day: str, rows: list[dict[str, Any]]) -> None:
         """Replace today's trend names. A later check near the close drops names that faded."""

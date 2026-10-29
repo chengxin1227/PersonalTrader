@@ -213,6 +213,18 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             f"total cap <= ${cap:,.0f}{volume}"
                         )
                         continue
+                    if rule.condition.require_new_high:
+                        cap = rule.condition.max_market_cap or 100_000_000
+                        volume = ""
+                        if rule.condition.min_volume is not None:
+                            volume = f" and volume > {rule.condition.min_volume:,.0f}"
+                        print(
+                            f"    - {rule.name}: after gain > {rule.condition.value:g}%, "
+                            f"alert on each new high after "
+                            f"{rule.condition.prior_change_lag_minutes}m, "
+                            f"total cap <= ${cap:,.0f}{volume}"
+                        )
+                        continue
                     if rule.condition.type is ConditionType.REGULAR_GAIN:
                         cap = rule.condition.max_market_cap or 100_000_000
                         volume = ""

@@ -44,6 +44,26 @@ def test_closing_day_gains_drop_names_that_faded(tmp_path):
     assert store.day_gain_symbols(50, ["2026-10-09"]) == ["ZYBT"]
 
 
+def test_new_high_watch_tracks_first_touch_and_peak(tmp_path):
+    store = Store(tmp_path)
+    now = datetime.now(timezone.utc)
+    first, peak = store.note_new_high_watch(
+        "2026-10-30", "premarket-30-newhigh", "brai", 32.0, now
+    )
+    assert first == now
+    assert peak == 32.0
+    watched = store.new_high_watch("2026-10-30", "premarket-30-newhigh", "BRAI")
+    assert watched == (now, 32.0)
+    assert store.raise_new_high_peak("2026-10-30", "premarket-30-newhigh", "BRAI", 31.0) == 32.0
+    assert store.raise_new_high_peak("2026-10-30", "premarket-30-newhigh", "BRAI", 40.5) == 32.0
+    assert store.new_high_watch("2026-10-30", "premarket-30-newhigh", "BRAI") == (now, 40.5)
+    again, again_peak = store.note_new_high_watch(
+        "2026-10-30", "premarket-30-newhigh", "BRAI", 50.0, now + timedelta(minutes=1)
+    )
+    assert again == now
+    assert again_peak == 40.5
+
+
 def test_peak_gains_keep_the_intraday_high(tmp_path):
     store = Store(tmp_path)
     assert store.note_peak_gain("2026-10-09", "aaa", 82.0) == 82.0

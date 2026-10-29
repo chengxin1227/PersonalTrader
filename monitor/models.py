@@ -32,6 +32,7 @@ class Condition(BaseModel):
     min_regular_volume: Optional[float] = None
     min_prior_change: Optional[float] = None
     prior_change_lag_minutes: int = Field(default=5, ge=0)
+    require_new_high: bool = False
     require_uptrend: bool = False
     require_circuit_breaker: bool = False
     include_circuit_breaker: bool = False

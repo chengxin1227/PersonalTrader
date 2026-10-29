@@ -24,23 +24,6 @@ watchlist: []
 # description is under single-stock alerts; board_description is under top-N digests.
 rules:
   afterhours:
-    - id: afterhours-30-hold20
-      name: 盘后涨幅超30%且保持20%以上的股票
-      description: 盘后涨幅超过30%，15分钟后仍在20%以上，总市值不超过10亿美元，成交量超过10万
-      label: After-hours boost
-      notify: Afterhours-boost
-      symbol: "*"
-      enabled: true
-      cooldown_minutes: 240
-      condition:
-        type: afterhours_gain
-        value: 20
-        min_prior_change: 30
-        prior_change_lag_minutes: 15
-        max_market_cap: 1000000000
-        min_volume: 100000
-      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
-
     - id: afterhours-day30-ah4
       name: 盘中涨幅超30%的股票
       description: 盘中涨幅超30%，盘后5分钟内涨幅保持在-10%到10%，市值低于10亿美元
@@ -93,6 +76,23 @@ rules:
         recent_day_count: 5
         max_market_cap: 1000000000
         min_volume: 10000
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: afterhours-30-newhigh
+      name: 盘后涨超30%后再创新高的股票
+      description: 盘后涨幅超过30%，15分钟后任意时刻涨幅超过此前最高涨幅，总市值不超过10亿美元，成交量超过10万
+      label: After-hours new high
+      notify: Afterhours-30-newhigh
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 0
+      condition:
+        type: afterhours_gain
+        value: 30
+        require_new_high: true
+        prior_change_lag_minutes: 15
+        max_market_cap: 1000000000
+        min_volume: 100000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
     - id: afterhours-last-2h-20
@@ -155,6 +155,23 @@ rules:
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
   regular:
+    - id: regular-30-newhigh
+      name: 盘中涨超30%后再创新高的股票
+      description: 盘中涨幅超过30%，15分钟后任意时刻涨幅超过此前最高涨幅，总市值不超过10亿美元，成交量超过10万
+      label: Regular new high
+      notify: Regular-30-newhigh
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 0
+      condition:
+        type: regular_gain
+        value: 30
+        require_new_high: true
+        prior_change_lag_minutes: 15
+        max_market_cap: 1000000000
+        min_volume: 100000
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
     - id: regular-last-hour-20
       name: 盘中尾盘
       description: 盘中收盘前2小时突然涨幅超20%，总市值不超过10亿美元，成交量超过10万，价格高于0.1美元
@@ -173,18 +190,18 @@ rules:
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
   premarket:
-    - id: premarket-30-hold20
-      name: 盘前涨幅超30%且保持20%以上的股票
-      description: 盘前涨幅超过30%，15分钟后仍在20%以上，总市值不超过10亿美元，成交量超过10万
-      label: Premarket boost
-      notify: Premarket-boost
+    - id: premarket-30-newhigh
+      name: 盘前涨超30%后再创新高的股票
+      description: 盘前涨幅超过30%，15分钟后任意时刻涨幅超过此前最高涨幅，总市值不超过10亿美元，成交量超过10万
+      label: Premarket new high
+      notify: Premarket-30-newhigh
       symbol: "*"
       enabled: true
-      cooldown_minutes: 330
+      cooldown_minutes: 0
       condition:
         type: premarket_gain
-        value: 20
-        min_prior_change: 30
+        value: 30
+        require_new_high: true
         prior_change_lag_minutes: 15
         max_market_cap: 1000000000
         min_volume: 100000

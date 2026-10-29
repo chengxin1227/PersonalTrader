@@ -70,7 +70,14 @@ def _is_trend_rule(rule: Rule) -> bool:
 
 
 def _is_spike_rule(rule: Rule) -> bool:
-    return rule.condition.min_prior_change is not None
+    return (
+        rule.condition.min_prior_change is not None
+        and not rule.condition.require_new_high
+    )
+
+
+def _is_new_high_rule(rule: Rule) -> bool:
+    return rule.condition.require_new_high
 
 
 def _is_breaker_rule(rule: Rule) -> bool:
@@ -343,6 +350,7 @@ class MonitorEngine:
                 for rule in afterhours_rules
                 if not _is_trend_rule(rule)
                 and not _is_spike_rule(rule)
+                and not _is_new_high_rule(rule)
                 and not _is_breaker_rule(rule)
                 and not _is_leaderboard_rule(rule)
                 and not _is_day_spike_rule(rule)
@@ -369,6 +377,11 @@ class MonitorEngine:
             if spike_rules and not self._spike_loop_running:
                 for rule in spike_rules:
                     matched = await self._match_spike_rule(rule)
+                    fired.extend(await self._emit_trend_matches(rule, matched, state))
+            new_high_rules = [rule for rule in open_rules if _is_new_high_rule(rule)]
+            if new_high_rules and not self._spike_loop_running and not self._regular_loop_running:
+                for rule in new_high_rules:
+                    matched = await self._match_new_high_rule(rule)
                     fired.extend(await self._emit_trend_matches(rule, matched, state))
             day_spike_rules = [
                 rule
@@ -404,9 +417,11 @@ class MonitorEngine:
                 if (
                     rule in afterhours_rules
                     or _is_spike_rule(rule)
+                    or _is_new_high_rule(rule)
                     or _is_breaker_rule(rule)
                     or _is_leaderboard_rule(rule)
                     or _is_day_spike_rule(rule)
+                    or _is_regular_gain_rule(rule)
                 ):
                     continue
                 scanned, scan_error = await self._run_scanner(rule, config, state)
@@ -551,11 +566,28 @@ class MonitorEngine:
                     for rule in config.rules
                     if rule.enabled and _is_spike_rule(rule) and self._rule_session_open(rule)
                 ]
-                if not rules:
+                new_high_rules = [
+                    rule
+                    for rule in config.rules
+                    if rule.enabled
+                    and _is_new_high_rule(rule)
+                    and rule.condition.type is not ConditionType.REGULAR_GAIN
+                    and self._rule_session_open(rule)
+                ]
+                if not rules and not new_high_rules:
                     await asyncio.sleep(interval)
                     continue
                 for rule in rules:
                     matched = await self._match_spike_rule(rule)
+                    self._note_opend_ok()
+                    if not matched:
+                        continue
+                    async with self._lock:
+                        state = self.store.load_state()
+                        await self._emit_trend_matches(rule, matched, state)
+                        self.store.save_state(state)
+                for rule in new_high_rules:
+                    matched = await self._match_new_high_rule(rule)
                     self._note_opend_ok()
                     if not matched:
                         continue
@@ -656,7 +688,25 @@ class MonitorEngine:
                     continue
                 if is_regular_session():
                     for rule in gain_rules:
+                        if _is_new_high_rule(rule):
+                            continue
                         matched = await self._match_regular_gain(rule)
+                        self._note_opend_ok()
+                        if not matched:
+                            continue
+                        async with self._lock:
+                            state = self.store.load_state()
+                            await self._emit_trend_matches(rule, matched, state)
+                            self.store.save_state(state)
+                    regular_new_high = [
+                        rule
+                        for rule in config.rules
+                        if rule.enabled
+                        and _is_new_high_rule(rule)
+                        and rule.condition.type is ConditionType.REGULAR_GAIN
+                    ]
+                    for rule in regular_new_high:
+                        matched = await self._match_new_high_rule(rule)
                         self._note_opend_ok()
                         if not matched:
                             continue
@@ -1771,6 +1821,61 @@ class MonitorEngine:
                 matched.append(merged)
         self._stable_done.add(key)
         logger.info("After-hours stable matches for %s: %s", rule.id, len(matched))
+        return matched
+
+    async def _match_new_high_rule(self, rule: Rule) -> list[Quote]:
+        """Alert when gain makes a new high after first clearing `value`, waiting `lag` minutes."""
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return []
+        max_cap = rule.condition.max_market_cap or 100_000_000
+        kind = rule.condition.type
+        if kind is ConditionType.AFTERHOURS_GAIN:
+            found_rows = await client.scan_afterhours(rule.condition.value, max_cap)
+            found = [quote for quote, _cap in found_rows]
+        elif kind is ConditionType.PREMARKET_GAIN:
+            found_rows = await client.scan_premarket(rule.condition.value, max_cap)
+            found = [quote for quote, _cap in found_rows]
+        elif kind is ConditionType.REGULAR_GAIN:
+            found = await client.regular_gainers(
+                rule.condition.value,
+                max_market_cap=max_cap,
+                min_volume=rule.condition.min_volume,
+            )
+        else:
+            return []
+        volume_min = rule.condition.min_volume
+        lag = timedelta(minutes=rule.condition.prior_change_lag_minutes)
+        day = now_et().date().isoformat()
+        now = datetime.now(timezone.utc)
+        matched: list[Quote] = []
+        for quote in found:
+            if quote.change_pct is None or quote.change_pct < rule.condition.value:
+                continue
+            if volume_min is not None and (quote.volume is None or quote.volume <= volume_min):
+                continue
+            watched = self.store.new_high_watch(day, rule.id, quote.symbol)
+            if watched is None:
+                self.store.note_new_high_watch(
+                    day, rule.id, quote.symbol, quote.change_pct, now
+                )
+                continue
+            first_at, peak = watched
+            if quote.change_pct <= peak:
+                continue
+            prior = self.store.raise_new_high_peak(
+                day, rule.id, quote.symbol, quote.change_pct
+            )
+            if prior is None:
+                continue
+            if now - first_at < lag:
+                continue
+            matched.append(quote)
+        self._log_saved_matches(
+            rule.id,
+            [quote.symbol for quote in matched],
+            f"New high after {rule.condition.value:g}%",
+        )
         return matched
 
     async def _match_spike_rule(self, rule: Rule) -> list[Quote]:

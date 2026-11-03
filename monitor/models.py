@@ -233,6 +233,8 @@ class Alert(BaseModel):
     price: Optional[float] = None
     change_pct: Optional[float] = None
     url: Optional[str] = None
+    # Same-symbol alerts in this ET session (盘前/盘中/盘后), including this one. 1 = first.
+    repeat_count: Optional[int] = None
     fired_at: datetime
 
 

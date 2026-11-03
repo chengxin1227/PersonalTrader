@@ -1,5 +1,6 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
+from monitor.models import Alert
 from monitor.store import Store
 
 
@@ -89,3 +90,59 @@ def test_trend_watch_replaces_the_close_list(tmp_path):
     saved = store.trend_watch("trend", "2026-10-09")
     assert [item["symbol"] for item in saved] == ["BBB"]
     assert store.trend_watch("trend", "2026-10-08") == []
+
+
+def test_symbol_alerts_in_session_reset_each_session(tmp_path):
+    store = Store(tmp_path)
+    day = date(2026, 11, 3)
+    # 07:00 ET premarket, 09:00 ET still premarket, 10:00 ET regular
+    pre_a = Alert(
+        id="1",
+        rule_id="premarket-a",
+        rule_name="a",
+        symbol="INLF",
+        message="pre-1",
+        price=0.3,
+        change_pct=10.0,
+        fired_at=datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc),
+    )
+    pre_b = Alert(
+        id="2",
+        rule_id="premarket-b",
+        rule_name="b",
+        symbol="INLF",
+        message="pre-2",
+        price=0.37,
+        change_pct=27.6,
+        fired_at=datetime(2026, 11, 3, 14, 0, tzinfo=timezone.utc),
+    )
+    regular = Alert(
+        id="3",
+        rule_id="regular-a",
+        rule_name="c",
+        symbol="INLF",
+        message="regular-1",
+        price=0.4,
+        change_pct=30.0,
+        fired_at=datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc),
+    )
+    other_symbol = Alert(
+        id="4",
+        rule_id="premarket-a",
+        rule_name="a",
+        symbol="ONEG",
+        message="other",
+        price=1.0,
+        change_pct=6.0,
+        fired_at=datetime(2026, 11, 3, 13, 0, tzinfo=timezone.utc),
+    )
+    for alert in (pre_b, regular, pre_a, other_symbol):
+        store.append_alert(alert)
+    assert [item.message for item in store.symbol_alerts_in_session("inlf", "盘前", day)] == [
+        "pre-1",
+        "pre-2",
+    ]
+    assert [item.message for item in store.symbol_alerts_in_session("inlf", "盘中", day)] == [
+        "regular-1"
+    ]
+    assert store.symbol_alerts_in_session("inlf", "盘后", day) == []

@@ -207,6 +207,18 @@ def is_regular_session(moment: datetime | None = None) -> bool:
     return REGULAR_START <= current.time() < REGULAR_END
 
 
+def et_session_name(moment: datetime | None = None) -> str | None:
+    """盘前 / 盘中 / 盘后, or ``None`` outside those windows."""
+    current = now_et(moment)
+    if is_premarket(current):
+        return "盘前"
+    if is_regular_session(current):
+        return "盘中"
+    if is_afterhours(current):
+        return "盘后"
+    return None
+
+
 def seconds_until_session_end(moment: datetime | None = None) -> int | None:
     """Seconds left in the current ET session, for Pushover ``ttl``.
 

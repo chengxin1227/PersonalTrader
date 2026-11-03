@@ -27,8 +27,6 @@ _GROUP_AGENT = "Hexin_Gphone/11.28.03 (Royal Flush) okhttp/3.14.9"
 _SESSION_SECONDS = 12 * 60 * 60
 # Custom group (not the default 自选股 list) that collects every alerted name.
 _WATCHLIST_GROUP = "我的自选"
-# User-managed portfolio folders — never auto-delete these.
-_KEEP_PERSONAL_GROUPS = frozenset({"短线", "中线", "中长线", "长线"})
 # When a session opens, 我的自选 drops names tagged with the previous session.
 _PREVIOUS_SESSION = {"盘前": "盘后", "盘中": "盘前", "盘后": "盘中"}
 
@@ -377,15 +375,6 @@ class TonghuashunClient:
         _version, groups = self._groups(http)
         return [g for g in groups if str(g.get("id", "")).startswith("0_")]
 
-    def _delete_group(self, http: httpx.Client, group_id: str) -> None:
-        version, _groups = self._groups(http)
-        self._group_call(
-            http,
-            "POST",
-            "/group/v1/delete",
-            {"ids": group_id, "version": version, "from": "sjcg_gphone"},
-        )
-
     def _clear_group_rows(
         self, http: httpx.Client, name: str, group_id: str, rows: list[tuple[str, str]], day: str
     ) -> None:
@@ -435,30 +424,17 @@ class TonghuashunClient:
         )
 
     def _sync_groups_sync(self, keep_names: list[str]) -> dict[str, list[str]]:
-        """Ensure keep groups exist; delete other custom groups except personal folders."""
+        """Ensure rule groups + 我的自选 exist. Never delete user-created groups."""
         keep = {_WATCHLIST_GROUP, *(name.strip() for name in keep_names if name.strip())}
 
         def work(http: httpx.Client) -> dict[str, list[str]]:
             created: list[str] = []
-            deleted: list[str] = []
             present = {str(g.get("name") or "") for g in self._custom_groups(http)}
             for name in sorted(keep):
                 if name not in present:
                     self._group(http, name)
                     created.append(name)
-            for group in self._custom_groups(http):
-                name = str(group.get("name") or "")
-                group_id = str(group.get("id") or "")
-                if name in keep or name in _KEEP_PERSONAL_GROUPS:
-                    continue
-                self._delete_group(http, group_id)
-                deleted.append(name)
-                days = self._group_days()
-                if name in days:
-                    del days[name]
-                    self._save_group_days()
-                logger.info("同花顺 deleted unused group %s", name)
-            return {"keep": sorted(keep), "created": created, "deleted": deleted}
+            return {"keep": sorted(keep), "created": created, "deleted": []}
 
         return self._with_session(work)
 

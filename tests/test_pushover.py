@@ -90,6 +90,36 @@ def test_pushover_title_is_the_symbol_and_change():
     assert seen["title"] == "GYGY  +10.0%  $1.50"
 
 
+def test_pushover_title_adds_repeat_count_from_the_second_ping():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        parsed = parse_qs(request.content.decode())
+        seen.update({key: values[0] for key, values in parsed.items()})
+        return httpx.Response(200, json={"status": 1})
+
+    async def run() -> None:
+        client = PushoverClient(
+            _settings(), httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        )
+        alert = Alert(
+            id="2",
+            rule_id="premarket-30-newhigh",
+            rule_name="盘前",
+            symbol="INLF",
+            message="INLIF Ltd    +27.6%    $0.37\n盘前涨幅超过30%",
+            price=0.37,
+            change_pct=27.6,
+            repeat_count=2,
+            fired_at=datetime.now(timezone.utc),
+        )
+        await client.send_alert(alert)
+        await client.close()
+
+    asyncio.run(run())
+    assert seen["title"] == "INLF(#2)  +27.6%  $0.37"
+
+
 def test_slack_message_starts_with_the_stock():
     alert = Alert(
         id="1",
@@ -162,6 +192,25 @@ def test_trigger_reason_is_separated_and_smaller():
     assert '<font size="2" color="#8E8E93">\n\n盘中涨幅超10%</font>' in html
     assert "<br>" not in html
     assert "盘中涨幅超10%</a>" not in html
+
+
+def test_repeat_history_keeps_blank_line_and_indexes():
+    from monitor.repeat_alerts import HISTORY_DIVIDER
+
+    html = html_message(
+        "INLIF Ltd    +27.6%    $0.37\n盘前涨超30%\n\n"
+        f"{HISTORY_DIVIDER}\n\n"
+        "INLIF Ltd(#2)    +15.0%    $0.30\n5日盘前超5%",
+        "amihexin://",
+    )
+    assert '<a href="amihexin://">INLIF Ltd</a>' in html
+    assert HISTORY_DIVIDER in html
+    assert "盘前涨超30%" in html
+    assert "INLIF Ltd(#2)" in html
+    muted = html.split('<font size="2"', 1)[1]
+    assert HISTORY_DIVIDER in muted
+    assert "INLIF Ltd(#2)" in muted
+    assert muted.count('<font size="2"') == 0
 
 
 def test_pushover_rejects_failed_status():

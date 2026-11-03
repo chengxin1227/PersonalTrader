@@ -9,6 +9,7 @@ import httpx
 from monitor.config import Settings
 from monitor.models import Alert
 from monitor.quote_link import quote_url
+from monitor.repeat_alerts import HISTORY_DIVIDER
 from monitor.rules import FIELD_GAP, format_price, split_alert_name
 from monitor.session import seconds_until_session_end
 
@@ -25,20 +26,34 @@ def html_digest(rows: list[tuple[str, str]]) -> str:
 
 
 def html_message(text: str, url: str | None = None) -> str:
-    """First row links the stock name. Later rows are the smaller trigger reason."""
-    lines = [raw for raw in text.splitlines() if raw.strip()]
-    if not lines:
+    """First stock row links the name. Later rows (reason + history) stay smaller."""
+    lines = text.splitlines()
+    nonempty = [index for index, raw in enumerate(lines) if raw.strip()]
+    if not nonempty:
         return ""
-    headline = _style_line(lines[0], url)
-    reason = "".join(_style_line(raw, None) for raw in lines[1:])
-    if not reason:
+    headline_at = nonempty[0]
+    headline = _style_line(lines[headline_at], url)
+    rest = lines[headline_at + 1 :]
+    if not any(raw.strip() for raw in rest):
         return headline
+    # One muted block only — nested <font> tags make Pushover drop HTML formatting.
+    styled: list[str] = []
+    for raw in rest:
+        if not raw.strip():
+            styled.append("")
+        elif raw.strip() == HISTORY_DIVIDER:
+            styled.append(html.escape(HISTORY_DIVIDER))
+        else:
+            styled.append(_style_line(raw, None, allow_nested_font=False))
+    reason = "\n".join(styled).strip("\n")
     # The font tag has to wrap the newlines. A newline before the tag drops the size,
     # and <br> alone disappears from the lock-screen preview.
     return f'{headline}<font size="2" color="{_MUTED}">\n\n{reason}</font>'
 
 
-def _style_line(raw: str, url: str | None = None) -> str:
+def _style_line(
+    raw: str, url: str | None = None, *, allow_nested_font: bool = True
+) -> str:
     spans = [(match.start(), match.end(), "price") for match in _PRICE.finditer(raw)]
     spans.extend((match.start(), match.end(), "change") for match in _CHANGE.finditer(raw))
     spans.sort()
@@ -64,14 +79,22 @@ def _style_line(raw: str, url: str | None = None) -> str:
             continue
         gap = raw[cursor:start]
         if gap:
-            parts.append(FIELD_GAP if gap.strip() == "" else (_muted(gap) if previous == "change" else html.escape(gap)))
+            if gap.strip() == "":
+                parts.append(FIELD_GAP)
+            elif allow_nested_font and previous == "change":
+                parts.append(_muted(gap))
+            else:
+                parts.append(html.escape(gap))
         token = raw[start:end]
         parts.append(html.escape(token))
         previous = kind
         cursor = end
     tail = raw[cursor:]
     if tail:
-        parts.append(_muted(tail) if previous == "change" else html.escape(tail))
+        if allow_nested_font and previous == "change":
+            parts.append(_muted(tail))
+        else:
+            parts.append(html.escape(tail))
     return "".join(parts)
 
 
@@ -94,7 +117,9 @@ class PushoverClient:
             await self._client.aclose()
 
     async def send_alert(self, alert: Alert, token: str | None = None) -> None:
-        parts = [alert.symbol]
+        count = alert.repeat_count or 1
+        head = f"{alert.symbol}(#{count})" if count >= 2 else alert.symbol
+        parts = [head]
         if alert.change_pct is not None:
             parts.append(f"{alert.change_pct:+.1f}%")
         if alert.price is not None:

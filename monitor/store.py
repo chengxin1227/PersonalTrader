@@ -5,8 +5,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from monitor.models import Alert
+
+_ET = ZoneInfo("America/New_York")
 
 
 def _now() -> datetime:
@@ -428,6 +431,35 @@ class Store:
     def append_alert(self, alert: Alert) -> None:
         with self._alerts_path.open("a", encoding="utf-8") as handle:
             handle.write(alert.model_dump_json() + "\n")
+
+    def symbol_alerts_in_session(self, symbol: str, session: str, day: date) -> list[Alert]:
+        """Alerts for ``symbol`` in one ET session window (盘前/盘中/盘后) on ``day``.
+
+        Oldest first. Count resets each session, not across the whole day.
+        """
+        from monitor.session import et_session_name
+
+        if not self._alerts_path.exists() or not session:
+            return []
+        wanted = symbol.strip().upper()
+        found: list[Alert] = []
+        for line in self._alerts_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            alert = Alert.model_validate_json(line)
+            if alert.symbol.upper() != wanted:
+                continue
+            fired = alert.fired_at
+            if fired.tzinfo is None:
+                fired = fired.replace(tzinfo=timezone.utc)
+            local = fired.astimezone(_ET)
+            if local.date() != day:
+                continue
+            if et_session_name(local) != session:
+                continue
+            found.append(alert)
+        found.sort(key=lambda item: item.fired_at)
+        return found
 
     def recent_alerts(self, limit: int = 50) -> list[Alert]:
         if not self._alerts_path.exists():

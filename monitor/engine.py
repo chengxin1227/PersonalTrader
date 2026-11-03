@@ -41,6 +41,7 @@ from monitor.session import (
     afterhours_just_opened,
     afterhours_stable_due,
     afterhours_stable_missed,
+    et_session_name,
     is_afterhours,
     is_premarket,
     is_regular_session,
@@ -59,6 +60,7 @@ from monitor.session import (
 )
 from monitor.slack import SlackClient
 from monitor.quote_link import quote_url
+from monitor.repeat_alerts import with_repeat_history
 from monitor.store import Store
 from monitor.stream import AlpacaStream, StreamEvent
 from monitor.tonghuashun import TonghuashunClient
@@ -218,7 +220,6 @@ class MonitorEngine:
         self._sudden_pool: dict[str, set[str]] = {}
         self._sudden_prices: dict[str, dict[str, list[tuple[float, float]]]] = {}
         self._sudden_session: dict[str, float] = {}
-        self._sudden_discover_begin: dict[str, int] = {}
         self._sudden_discovered_at: dict[str, float] = {}
         self._sudden_day: str | None = None
         self._kline_blocked_until: Optional[datetime] = None
@@ -2073,7 +2074,6 @@ class MonitorEngine:
             self._sudden_pool.clear()
             self._sudden_prices.clear()
             self._sudden_session.clear()
-            self._sudden_discover_begin.clear()
             self._sudden_discovered_at.clear()
         await self._discover_sudden_pool(rule, client, session)
         pool = self._sudden_pool.get(rule.id) or set()
@@ -2146,48 +2146,53 @@ class MonitorEngine:
     async def _discover_sudden_pool(
         self, rule: Rule, client: MoomooClient, session: str
     ) -> None:
+        """Find names already up > pool floor via session gain screens (not smallcap paging)."""
         now = datetime.now(timezone.utc).timestamp()
         last = self._sudden_discovered_at.get(rule.id)
-        # Filter API: max 10 calls / 30s. One page about every 45s is safe.
-        if last is not None and now - last < 45:
+        # Rank / gainers screens share OpenD quota with other rules; ~15s is enough.
+        if last is not None and now - last < 15:
             return
         self._sudden_discovered_at[rule.id] = now
         max_cap = rule.condition.max_market_cap or 1_000_000_000
         min_volume = rule.condition.min_volume
         min_price = rule.condition.min_price
-        begin = self._sudden_discover_begin.get(rule.id, 0)
-        if begin == 0:
-            logger.info(
-                "Sudden %s discover sweep, session gain > %g%%, cap <= %.0f",
-                session,
-                rule.condition.pool_min_change
-                if rule.condition.pool_min_change is not None
-                else rule.condition.value,
-                max_cap,
-            )
-        page, next_begin = await client.smallcap_page(begin, max_cap, min_volume, min_price)
-        self._sudden_discover_begin[rule.id] = next_begin
-        if not page:
-            return
-        marks = await self._sudden_session_quotes(
-            client, [quote.symbol for quote in page], session
-        )
-        if marks is None:
-            return
-        pool = self._sudden_pool.setdefault(rule.id, set())
         pool_floor = (
             rule.condition.pool_min_change
             if rule.condition.pool_min_change is not None
             else rule.condition.value
         )
+        if last is None:
+            logger.info(
+                "Sudden %s discover via %s rank/screen, session gain > %g%%, cap <= %.0f",
+                rule.id,
+                session,
+                pool_floor,
+                max_cap,
+            )
+        try:
+            found = await self._sudden_session_gainers(
+                client, session, pool_floor, max_cap, min_volume
+            )
+        except Exception as exc:
+            logger.warning("Sudden %s discover failed: %s", rule.id, exc)
+            await self._drain_client_problem(client)
+            return
+        await self._drain_client_problem(client)
+        if not found:
+            return
+        pool = self._sudden_pool.setdefault(rule.id, set())
         added = 0
-        for symbol, quote in marks.items():
+        for quote in found:
             if quote.change_pct is None or quote.change_pct <= pool_floor:
                 continue
-            if symbol not in pool:
+            if min_volume is not None and (quote.volume is None or quote.volume <= min_volume):
+                continue
+            if min_price is not None and (quote.price is None or quote.price <= min_price):
+                continue
+            if quote.symbol not in pool:
                 added += 1
-            pool.add(symbol)
-            self._sudden_session[f"{rule.id}:{symbol}"] = quote.change_pct
+            pool.add(quote.symbol)
+            self._sudden_session[f"{rule.id}:{quote.symbol}"] = quote.change_pct
         if len(pool) > 200:
             ranked = sorted(
                 pool,
@@ -2207,6 +2212,27 @@ class MonitorEngine:
                 added,
                 len(pool),
             )
+
+    async def _sudden_session_gainers(
+        self,
+        client: MoomooClient,
+        session: str,
+        pool_floor: float,
+        max_cap: float,
+        min_volume: float | None,
+    ) -> list[Quote]:
+        """Session-gain leaders already above the sudden pool floor."""
+        if session == "afterhours":
+            rows = await client.scan_afterhours(pool_floor, max_cap)
+            return [quote for quote, _cap in rows]
+        if session == "premarket":
+            rows = await client.scan_premarket(pool_floor, max_cap)
+            return [quote for quote, _cap in rows]
+        return await client.regular_gainers(
+            pool_floor,
+            max_market_cap=max_cap,
+            min_volume=min_volume,
+        )
 
     async def _sudden_session_quotes(
         self, client: MoomooClient, symbols: list[str], session: str
@@ -2504,7 +2530,8 @@ class MonitorEngine:
         if not delivered:
             self._board_retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
             return
-        message = "\n".join(line for _symbol, line in rows)
+        # Digest keeps tickers; persist company names so repeat-history bodies stay consistent.
+        message = "\n".join(leaderboard_line(quote, company=True) for quote in leaders)
         if reason and reason not in message:
             message = f"{message}\n{reason}"
         alert = self.store.new_alert(
@@ -2841,18 +2868,32 @@ class MonitorEngine:
             logger.info("Rule %s matched %s but is in cooldown", rule.id, quote.symbol)
             return None
         await self._fill_prior_session(rule, quote)
+        # Persist the trigger move for later history; show prior-session on the live top line.
+        stored_message = render_message(rule, quote, extra, headline="trigger")
+        display_message = render_message(rule, quote, extra, headline="prior")
         alert = self.store.new_alert(
             rule_id=rule.id,
             rule_name=rule.summary,
             label=rule.name,
             notify=rule.notify,
             symbol=quote.symbol,
-            message=render_message(rule, quote, extra),
+            message=stored_message,
             price=quote.price,
             change_pct=quote.change_pct,
         )
         alert.url = quote_url(quote.symbol)
-        await self._deliver(alert)
+        moment = now_et()
+        session = et_session_name(moment)
+        prior = (
+            self.store.symbol_alerts_in_session(quote.symbol, session, moment.date())
+            if session
+            else []
+        )
+        delivery = with_repeat_history(
+            alert.model_copy(update={"message": display_message}), prior
+        )
+        alert.repeat_count = delivery.repeat_count
+        await self._deliver(delivery)
         self.store.append_alert(alert)
         self.store.mark_fired(state, key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, alert.message)
@@ -3050,7 +3091,16 @@ class MonitorEngine:
             change_pct=quote.change_pct,
         )
         alert.url = quote_url(symbol)
-        await self._deliver(alert)
+        moment = now_et()
+        session = et_session_name(moment)
+        prior = (
+            self.store.symbol_alerts_in_session(symbol, session, moment.date())
+            if session
+            else []
+        )
+        delivery = with_repeat_history(alert, prior)
+        alert.repeat_count = delivery.repeat_count
+        await self._deliver(delivery)
         self.store.append_alert(alert)
         logger.info("Sent test alert for %s at %s", symbol, quote.price)
         return alert

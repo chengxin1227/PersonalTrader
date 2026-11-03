@@ -106,12 +106,16 @@ class SlackClient:
         response.raise_for_status()
 
     def _blocks(self, alert: Alert) -> list[dict]:
-        lines = [raw for raw in alert.message.splitlines() if raw.strip()]
-        headline = _link_name(lines[0], page_url(alert.symbol)) if lines else alert.message
+        lines = alert.message.splitlines()
+        nonempty = [index for index, raw in enumerate(lines) if raw.strip()]
+        if not nonempty:
+            return [{"type": "section", "text": {"type": "mrkdwn", "text": alert.message}}]
+        headline_at = nonempty[0]
+        headline = _link_name(lines[headline_at], page_url(alert.symbol))
         blocks: list[dict] = [
             {"type": "section", "text": {"type": "mrkdwn", "text": headline}},
         ]
-        reason = "\n".join(lines[1:])
-        if reason:
+        reason = "\n".join(lines[headline_at + 1 :]).strip("\n")
+        if reason.strip():
             blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": reason}]})
         return blocks

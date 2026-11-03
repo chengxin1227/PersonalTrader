@@ -291,16 +291,15 @@ def test_message_uses_the_other_session_change():
     quote.regular_price = 1.8
     quote.after_hours_change_pct = 8.5
     quote.after_hours_price = 2.05
-    afterhours = render_message(
-        Rule(
-            id="afterhours-smallcap-10pct",
-            name="盘后",
-            symbol="*",
-            condition=Condition(type=ConditionType.AFTERHOURS_GAIN, value=20),
-            slack_message="{stock_name}{field_gap}{move_text}{price_text}",
-        ),
-        quote,
+    rule = Rule(
+        id="afterhours-smallcap-10pct",
+        name="盘后",
+        symbol="*",
+        condition=Condition(type=ConditionType.AFTERHOURS_GAIN, value=20),
+        slack_message="{stock_name}{field_gap}{move_text}{price_text}",
     )
+    afterhours = render_message(rule, quote)
+    trigger = render_message(rule, quote, headline="trigger")
     premarket = render_message(
         Rule(
             id="premarket-smallcap-10pct",
@@ -312,6 +311,7 @@ def test_message_uses_the_other_session_change():
         quote,
     )
     assert afterhours == f"Acme{FIELD_GAP}-3.2%{FIELD_GAP}$1.80\n盘后"
+    assert trigger == f"Acme{FIELD_GAP}+10.0%{FIELD_GAP}$2.20\n盘后"
     assert premarket == f"Acme{FIELD_GAP}+8.5%{FIELD_GAP}$2.05\n盘前"
     assert "盘后涨幅" not in premarket
     assert "+10.0%" not in afterhours
@@ -333,11 +333,12 @@ def test_message_uses_the_other_session_change():
     assert "$2.20" not in regular
 
 
-def test_leaderboard_line_shows_the_afterhours_gain_and_price():
+def test_leaderboard_line_keeps_ticker_unless_company_requested():
     quote = _quote(price=1.12, prev_close=1.0)
     quote.company = "Acme"
     quote.change_pct = 18.4
     assert leaderboard_line(quote) == f"ABCD{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
+    assert leaderboard_line(quote, company=True) == f"Acme{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
 
 
 def test_peak_fade_score_ranks_bigger_givebacks_first():
@@ -489,7 +490,6 @@ def test_afterhours_circuit_breaker_needs_regular_gain_and_a_halt():
         f"Acme{FIELD_GAP}+12.4%{FIELD_GAP}$1.05\n盘中收盘涨幅超10%并触发涨幅熔断，盘后涨幅超5%，市值不超过1亿美元"
     )
     assert "+6.2%" not in message
-
     assert "+12.0%" not in message
 
 

@@ -444,9 +444,16 @@ def evaluate_rule(
     return RuleEvaluation(matched=False, reason="unknown condition")
 
 
-def leaderboard_line(quote: Quote) -> str:
+def display_name(quote: Quote, fallback: str = "") -> str:
+    """Company name for alert bodies; fall back to the ticker."""
+    return (quote.company or "").strip() or (quote.symbol or fallback).strip()
+
+
+def leaderboard_line(quote: Quote, *, company: bool = False) -> str:
+    """Half-hour board line. Digest keeps the ticker; stored body can use the company name."""
     change = quote.change_pct if quote.change_pct is not None else 0.0
-    return f"{quote.symbol}{FIELD_GAP}{change:+.1f}%{FIELD_GAP}{format_price(quote.price or 0.0)}"
+    name = display_name(quote) if company else (quote.symbol or "")
+    return f"{name}{FIELD_GAP}{change:+.1f}%{FIELD_GAP}{format_price(quote.price or 0.0)}"
 
 
 def format_price(price: float) -> str:
@@ -488,6 +495,7 @@ def _prior_session(rule: Rule, quote: Quote) -> tuple[float | None, float | None
 
     After-hours shows the regular close, premarket shows the previous day's
     after-hours close, and the regular session shows the premarket close.
+    Title / stored alert fields still use the trigger move and price.
     """
     session = rule.group or rule.condition_session
     if session == "盘后":
@@ -499,14 +507,38 @@ def _prior_session(rule: Rule, quote: Quote) -> tuple[float | None, float | None
     return None, None
 
 
-def _move_text(rule: Rule, quote: Quote) -> str:
-    value, _price = _prior_session(rule, quote)
-    if value is None:
-        return ""
-    return f"{value:+.1f}%{FIELD_GAP}"
+def _headline_move(
+    rule: Rule, quote: Quote, *, headline: str
+) -> tuple[str, str]:
+    """Return ``(move_text, price_text)`` for the alert headline.
+
+    ``prior``: previous session (AH → regular close). ``trigger``: this alert's move.
+    """
+    if headline == "trigger":
+        change = quote.change_pct
+        price = quote.price
+        move = "" if change is None else f"{change:+.1f}%{FIELD_GAP}"
+        price_text = "" if price is None or price <= 0 else format_price(price)
+        return move, price_text
+    change, price = _prior_session(rule, quote)
+    move = "" if change is None else f"{change:+.1f}%{FIELD_GAP}"
+    if price is not None and price > 0:
+        price_text = format_price(price)
+    elif change is not None:
+        price_text = ""
+    else:
+        live = quote.price or 0.0
+        price_text = "" if live <= 0 else format_price(live)
+    return move, price_text
 
 
-def render_message(rule: Rule, quote: Quote, extra: dict | None = None) -> str:
+def render_message(
+    rule: Rule,
+    quote: Quote,
+    extra: dict | None = None,
+    *,
+    headline: str = "prior",
+) -> str:
     price = quote.price or 0.0
     change = quote.change_pct if quote.change_pct is not None else 0.0
     values = {
@@ -521,20 +553,14 @@ def render_message(rule: Rule, quote: Quote, extra: dict | None = None) -> str:
         "market_cap": 0.0,
         "market_cap_m": 0.0,
         "volume": quote.volume or 0,
-        "stock_name": (quote.company or "").strip() or (quote.symbol or rule.symbol),
+        "stock_name": display_name(quote, quote.symbol or rule.symbol),
     }
     if extra:
         values.update(extra)
     values["field_gap"] = FIELD_GAP
-    values["move_text"] = _move_text(rule, quote)
-    _prior_change, prior_price = _prior_session(rule, quote)
-    if prior_price is not None and prior_price > 0:
-        shown_price = prior_price
-    elif _prior_change is not None:
-        shown_price = None
-    else:
-        shown_price = float(values["price"])
-    values["price_text"] = "" if shown_price is None else format_price(shown_price)
+    move_text, price_text = _headline_move(rule, quote, headline=headline)
+    values["move_text"] = move_text
+    values["price_text"] = price_text
     values["volume_text"] = format_volume(float(values["volume"]))
     template = rule.slack_message or "{name}: {symbol} is ${price:.2f} ({change_pct:+.2f}% today)"
     try:

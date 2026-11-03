@@ -1,6 +1,10 @@
-from monitor.rules import hour_change_pct, price_age_seconds_ago, trim_price_samples
-from monitor.rules import load_rules
+import asyncio
+from unittest.mock import AsyncMock
+
 from monitor.config import ROOT
+from monitor.engine import MonitorEngine
+from monitor.models import Condition, ConditionType, Quote, Rule
+from monitor.rules import hour_change_pct, load_rules, price_age_seconds_ago, trim_price_samples
 
 
 def test_price_age_picks_newest_sample_old_enough():
@@ -32,3 +36,91 @@ def test_live_rules_include_sudden_gain_for_each_session():
         assert rule.condition.value == 10
         assert rule.condition.pool_min_change == 10
         assert rule.condition.sudden_window_seconds == 60
+
+
+def _sudden_rule(session: str) -> Rule:
+    group = {"premarket": "盘前", "regular": "盘中", "afterhours": "盘后"}[session]
+    return Rule(
+        id=f"{session}-sudden-10",
+        name=f"{session} sudden",
+        description="test",
+        group=group,
+        symbol="*",
+        cooldown_minutes=30,
+        condition=Condition(
+            type=ConditionType.SUDDEN_GAIN,
+            value=10,
+            pool_min_change=10,
+            sudden_window_seconds=60,
+            late_session=session,
+            min_price=0.1,
+            max_market_cap=1_000_000_000,
+            min_volume=100_000,
+        ),
+    )
+
+
+def _engine() -> MonitorEngine:
+    engine = MonitorEngine.__new__(MonitorEngine)
+    engine._sudden_pool = {}
+    engine._sudden_prices = {}
+    engine._sudden_session = {}
+    engine._sudden_discovered_at = {}
+    engine._sudden_day = None
+    engine._drain_client_problem = AsyncMock()
+    return engine
+
+
+def test_sudden_discover_uses_afterhours_rank():
+    engine = _engine()
+    client = AsyncMock()
+    client.scan_afterhours = AsyncMock(
+        return_value=[
+            (Quote(symbol="DKI", price=2.0, change_pct=35.0, volume=200_000), None),
+            (Quote(symbol="THIN", price=2.0, change_pct=20.0, volume=1_000), None),
+            (Quote(symbol="CHEAP", price=0.05, change_pct=40.0, volume=200_000), None),
+        ]
+    )
+    client.smallcap_page = AsyncMock()
+
+    async def run() -> None:
+        await engine._discover_sudden_pool(_sudden_rule("afterhours"), client, "afterhours")
+
+    asyncio.run(run())
+    client.scan_afterhours.assert_awaited_once_with(10, 1_000_000_000)
+    client.smallcap_page.assert_not_called()
+    assert engine._sudden_pool["afterhours-sudden-10"] == {"DKI"}
+
+
+def test_sudden_discover_uses_premarket_rank():
+    engine = _engine()
+    client = AsyncMock()
+    client.scan_premarket = AsyncMock(
+        return_value=[
+            (Quote(symbol="AAA", price=3.0, change_pct=12.0, volume=150_000), None),
+        ]
+    )
+
+    async def run() -> None:
+        await engine._discover_sudden_pool(_sudden_rule("premarket"), client, "premarket")
+
+    asyncio.run(run())
+    client.scan_premarket.assert_awaited_once_with(10, 1_000_000_000)
+    assert engine._sudden_pool["premarket-sudden-10"] == {"AAA"}
+
+
+def test_sudden_discover_uses_regular_gainers():
+    engine = _engine()
+    client = AsyncMock()
+    client.regular_gainers = AsyncMock(
+        return_value=[Quote(symbol="BBB", price=4.0, change_pct=15.0, volume=120_000)]
+    )
+
+    async def run() -> None:
+        await engine._discover_sudden_pool(_sudden_rule("regular"), client, "regular")
+
+    asyncio.run(run())
+    client.regular_gainers.assert_awaited_once_with(
+        10, max_market_cap=1_000_000_000, min_volume=100_000
+    )
+    assert engine._sudden_pool["regular-sudden-10"] == {"BBB"}

@@ -21,6 +21,7 @@ from monitor.session import (
     regular_close_approach,
     premarket_mark,
     seconds_until_extended_open,
+    seconds_until_session_end,
     trade_is_premarket,
 )
 
@@ -68,7 +69,7 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
     assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 15, 44, tzinfo=ET))] == []
     close = due_check_reminders(datetime(2026, 10, 15, 15, 45, tzinfo=ET))
     assert [item.key for item in close] == ["regular-close-15"]
-    assert close[0].rule_ids == ("afterhours-halt-or-day80",)
+    assert close[0].rule_ids == ("afterhours-halt-or-day80", "regular-sudden-10")
     assert due_check_reminders(datetime(2026, 10, 15, 15, 47, 59, tzinfo=ET))
     assert due_check_reminders(datetime(2026, 10, 15, 15, 48, tzinfo=ET)) == []
 
@@ -80,7 +81,7 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
         "afterhours-2h30"
     ]
     assert [item.rule_ids for item in due_check_reminders(datetime(2026, 10, 15, 9, 15, tzinfo=ET))] == [
-        ("premarket-last-3h-20", "premarket-gain80")
+        ("premarket-sudden-10",)
     ]
     assert due_check_reminders(datetime(2026, 10, 17, 15, 45, tzinfo=ET)) == []  # Saturday
 
@@ -159,6 +160,14 @@ def test_afterhours_window():
     assert not is_afterhours(datetime(2026, 9, 23, 15, 59, tzinfo=ET))
     assert not is_afterhours(datetime(2026, 9, 23, 20, 0, tzinfo=ET))
     assert not is_afterhours(datetime(2026, 9, 26, 17, 0, tzinfo=ET))
+
+
+def test_seconds_until_session_end_matches_each_window():
+    assert seconds_until_session_end(datetime(2026, 9, 23, 8, 30, tzinfo=ET)) == 3600
+    assert seconds_until_session_end(datetime(2026, 9, 23, 15, 0, tzinfo=ET)) == 3600
+    assert seconds_until_session_end(datetime(2026, 9, 23, 19, 0, tzinfo=ET)) == 3600
+    assert seconds_until_session_end(datetime(2026, 9, 23, 3, 0, tzinfo=ET)) is None
+    assert seconds_until_session_end(datetime(2026, 9, 23, 12, 0, tzinfo=ET)) == 4 * 3600
 
 
 def test_seconds_until_next_extended_session():

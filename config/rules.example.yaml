@@ -85,7 +85,7 @@ rules:
       notify: Afterhours-30-newhigh
       symbol: "*"
       enabled: true
-      cooldown_minutes: 0
+      cooldown_minutes: 30
       condition:
         type: afterhours_gain
         value: 30
@@ -95,18 +95,19 @@ rules:
         min_volume: 100000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
-    - id: afterhours-last-2h-20
-      name: 盘后尾盘
-      description: 盘后结束前2小时突然涨幅超20%，总市值不超过10亿美元，成交量超过10万，价格高于0.1美元
-      label: After-hours last 2 hours
-      notify: Afterhours-last-2-hours
+    - id: afterhours-sudden-10
+      name: 盘后1分钟涨超10%的股票
+      description: 盘后涨幅已超10%，约1分钟内再涨超10%，总市值不超过10亿美元，成交量超过10万，价格高于0.1美元
+      label: After-hours sudden 10%
+      notify: Afterhours-sudden-10
       symbol: "*"
       enabled: true
-      cooldown_minutes: 240
+      cooldown_minutes: 30
       condition:
-        type: late_session_gain
-        value: 20
-        late_session_hours: 2
+        type: sudden_gain
+        value: 10
+        pool_min_change: 10
+        sudden_window_seconds: 60
         late_session: afterhours
         min_price: 0.1
         max_market_cap: 1000000000
@@ -162,7 +163,7 @@ rules:
       notify: Regular-30-newhigh
       symbol: "*"
       enabled: true
-      cooldown_minutes: 0
+      cooldown_minutes: 30
       condition:
         type: regular_gain
         value: 30
@@ -172,18 +173,20 @@ rules:
         min_volume: 100000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
-    - id: regular-last-hour-20
-      name: 盘中尾盘
-      description: 盘中收盘前2小时突然涨幅超20%，总市值不超过10亿美元，成交量超过10万，价格高于0.1美元
-      label: Last hour boost
-      notify: Last-hour-boost
+    - id: regular-sudden-10
+      name: 盘中1分钟涨超10%的股票
+      description: 盘中涨幅已超10%，约1分钟内再涨超10%，总市值不超过10亿美元，成交量超过10万，价格高于0.1美元
+      label: Regular sudden 10%
+      notify: Regular-sudden-10
       symbol: "*"
       enabled: true
-      cooldown_minutes: 390
+      cooldown_minutes: 30
       condition:
-        type: late_session_gain
-        value: 20
-        late_session_hours: 2
+        type: sudden_gain
+        value: 10
+        pool_min_change: 10
+        sudden_window_seconds: 60
+        late_session: regular
         min_price: 0.1
         max_market_cap: 1000000000
         min_volume: 100000
@@ -197,7 +200,7 @@ rules:
       notify: Premarket-30-newhigh
       symbol: "*"
       enabled: true
-      cooldown_minutes: 0
+      cooldown_minutes: 30
       condition:
         type: premarket_gain
         value: 30
@@ -224,34 +227,21 @@ rules:
         min_volume: 10000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
-    - id: premarket-last-3h-20
-      name: 盘前涨幅超20%的股票
-      description: 盘前结束前3小时突然涨幅超20%，总市值不超过10亿美元，成交量超过10万，价格高于0.1美元
-      label: Premarket last 3 hours
-      notify: Premarket-last-3-hours
+    - id: premarket-sudden-10
+      name: 盘前1分钟涨超10%的股票
+      description: 盘前涨幅已超10%，约1分钟内再涨超10%，总市值不超过10亿美元，成交量超过10万，价格高于0.1美元
+      label: Premarket sudden 10%
+      notify: Premarket-sudden-10
       symbol: "*"
       enabled: true
-      cooldown_minutes: 330
+      cooldown_minutes: 30
       condition:
-        type: late_session_gain
-        value: 20
-        late_session_hours: 3
+        type: sudden_gain
+        value: 10
+        pool_min_change: 10
+        sudden_window_seconds: 60
         late_session: premarket
         min_price: 0.1
         max_market_cap: 1000000000
         min_volume: 100000
-      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
-
-    - id: premarket-gain80
-      name: 盘前涨幅超80%的股票
-      description: 盘前涨幅超过80%，市值不超过10亿美元
-      label: Premarket 80% boost
-      notify: Premarket-80-boost
-      symbol: "*"
-      enabled: true
-      cooldown_minutes: 330
-      condition:
-        type: premarket_gain
-        value: 80
-        max_market_cap: 1000000000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"

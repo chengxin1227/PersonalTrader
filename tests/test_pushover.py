@@ -173,10 +173,29 @@ def test_pushover_rejects_failed_status():
             _settings(), httpx.AsyncClient(transport=httpx.MockTransport(handler))
         )
         with pytest.raises(RuntimeError, match="invalid token"):
-            await client.send_text("hello")
+            await client.send_text("hello", ttl=0)
         await client.close()
 
     asyncio.run(run())
+
+
+def test_pushover_sets_ttl_when_given():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        parsed = parse_qs(request.content.decode())
+        seen.update({key: values[0] for key, values in parsed.items()})
+        return httpx.Response(200, json={"status": 1})
+
+    async def run() -> None:
+        client = PushoverClient(
+            _settings(), httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        )
+        await client.send_text("hello", ttl=3600)
+        await client.close()
+
+    asyncio.run(run())
+    assert seen["ttl"] == "3600"
 
 
 def test_opend_disconnect_notifies_once_after_the_connection_stays_down():

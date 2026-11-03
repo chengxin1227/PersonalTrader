@@ -19,6 +19,7 @@ class ConditionType(str, Enum):
     PREMARKET_GAIN = "premarket_gain"
     AFTERHOURS_GAIN = "afterhours_gain"
     LATE_SESSION_GAIN = "late_session_gain"
+    SUDDEN_GAIN = "sudden_gain"
     REGULAR_CLOSE = "regular_close"
     REGULAR_GAIN = "regular_gain"
 
@@ -48,6 +49,8 @@ class Condition(BaseModel):
     stable_high: Optional[float] = None
     late_session_hours: int = Field(default=1, ge=1)
     late_session: str = "regular"
+    sudden_window_seconds: int = Field(default=60, ge=15)
+    pool_min_change: Optional[float] = None
     min_price: Optional[float] = None
     close_minutes: int = Field(default=5, ge=1)
 
@@ -79,7 +82,7 @@ class Rule(BaseModel):
             return "盘前"
         if kind is ConditionType.AFTERHOURS_GAIN:
             return "盘后"
-        if kind is ConditionType.LATE_SESSION_GAIN:
+        if kind in {ConditionType.LATE_SESSION_GAIN, ConditionType.SUDDEN_GAIN}:
             return _LATE_SESSIONS.get(self.condition.late_session)
         if kind in {ConditionType.REGULAR_CLOSE, ConditionType.REGULAR_GAIN}:
             return "盘中"
@@ -108,6 +111,7 @@ class Rule(BaseModel):
             ConditionType.PREMARKET_GAIN,
             ConditionType.AFTERHOURS_GAIN,
             ConditionType.LATE_SESSION_GAIN,
+            ConditionType.SUDDEN_GAIN,
             ConditionType.REGULAR_CLOSE,
             ConditionType.REGULAR_GAIN,
         } or self.symbol in {"*", "ALL"}

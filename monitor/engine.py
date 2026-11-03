@@ -30,8 +30,10 @@ from monitor.rules import (
     hour_change_pct,
     leaderboard_line,
     load_rules,
+    price_age_seconds_ago,
     render_message,
     save_rules,
+    trim_price_samples,
 )
 from monitor.session import (
     AFTERHOURS_START,
@@ -152,6 +154,10 @@ def _is_last_hour_rule(rule: Rule) -> bool:
     return rule.condition.type is ConditionType.LATE_SESSION_GAIN
 
 
+def _is_sudden_rule(rule: Rule) -> bool:
+    return rule.condition.type is ConditionType.SUDDEN_GAIN
+
+
 def opend_is_down(exc: BaseException) -> bool:
     text = str(exc).lower()
     if "network interruption" in text:
@@ -181,6 +187,9 @@ class MonitorEngine:
         self.ths = TonghuashunClient(settings)
         self._ths_tasks: set[asyncio.Task] = set()
         self._ths_lock = asyncio.Lock()
+        # session (盘前/盘中/盘后) -> ET date last cleared for that session's groups
+        self._ths_cleared_session_day: dict[str, str] = {}
+        self._ths_groups_synced = False
         self.store = store
         self.verbose = verbose
         self.quotes: dict[str, Quote] = {}
@@ -206,6 +215,12 @@ class MonitorEngine:
         self._late_begin: dict[str, int] = {}
         self._late_day: str | None = None
         self._late_phase: dict[str, str] = {}
+        self._sudden_pool: dict[str, set[str]] = {}
+        self._sudden_prices: dict[str, dict[str, list[tuple[float, float]]]] = {}
+        self._sudden_session: dict[str, float] = {}
+        self._sudden_discover_begin: dict[str, int] = {}
+        self._sudden_discovered_at: dict[str, float] = {}
+        self._sudden_day: str | None = None
         self._kline_blocked_until: Optional[datetime] = None
         self._trend_moomoo = MoomooClient(settings) if moomoo is not None else None
         self._trend_loop_running = False
@@ -488,6 +503,7 @@ class MonitorEngine:
             try:
                 config = self.load_config(force=True)
                 interval = config.poll_interval_seconds
+                await self._maybe_sync_tonghuashun_groups(config)
                 if self.moomoo is not None and not extended_session_open():
                     if not idle_logged:
                         wait = seconds_until_extended_open()
@@ -658,6 +674,9 @@ class MonitorEngine:
                 last_hour_rules = [
                     rule for rule in config.rules if rule.enabled and _is_last_hour_rule(rule)
                 ]
+                sudden_rules = [
+                    rule for rule in config.rules if rule.enabled and _is_sudden_rule(rule)
+                ]
                 stable_rules = [
                     rule for rule in config.rules if rule.enabled and _is_stable_rule(rule)
                 ]
@@ -679,6 +698,7 @@ class MonitorEngine:
                     not rules
                     and not halt_or_day_rules
                     and not last_hour_rules
+                    and not sudden_rules
                     and not stable_rules
                     and not day_gain_rules
                     and not trend_rules
@@ -779,6 +799,9 @@ class MonitorEngine:
                                 await self._emit_trend_matches(rule, matched, state)
                                 self.store.save_state(state)
                     await self._run_late_rules(last_hour_rules)
+                    await self._run_sudden_rules(
+                        [rule for rule in sudden_rules if rule.condition.late_session == "regular"]
+                    )
                 elif is_afterhours():
                     if closing_rules and self._closing_gains_due():
                         await self._record_closing_gains(closing_rules)
@@ -848,8 +871,14 @@ class MonitorEngine:
                                 await self._emit_trend_matches(rule, matched, state)
                                 self.store.save_state(state)
                     await self._run_late_rules(last_hour_rules)
+                    await self._run_sudden_rules(
+                        [rule for rule in sudden_rules if rule.condition.late_session == "afterhours"]
+                    )
                 elif is_premarket():
                     await self._run_late_rules(last_hour_rules)
+                    await self._run_sudden_rules(
+                        [rule for rule in sudden_rules if rule.condition.late_session == "premarket"]
+                    )
                 else:
                     await asyncio.sleep(30)
                     continue
@@ -2021,6 +2050,178 @@ class MonitorEngine:
             )
         return matched
 
+    async def _run_sudden_rules(self, rules: list[Rule]) -> None:
+        for rule in rules:
+            matched = await self._match_sudden_rule(rule)
+            self._note_opend_ok()
+            if not matched:
+                continue
+            async with self._lock:
+                state = self.store.load_state()
+                await self._emit_trend_matches(rule, matched, state)
+                self.store.save_state(state)
+
+    async def _match_sudden_rule(self, rule: Rule) -> list[Quote]:
+        """Watch names already up > pool_min_change; alert on ~1-minute spikes."""
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return []
+        session = rule.condition.late_session or "regular"
+        day = now_et().date().isoformat()
+        if self._sudden_day != day:
+            self._sudden_day = day
+            self._sudden_pool.clear()
+            self._sudden_prices.clear()
+            self._sudden_session.clear()
+            self._sudden_discover_begin.clear()
+            self._sudden_discovered_at.clear()
+        await self._discover_sudden_pool(rule, client, session)
+        pool = self._sudden_pool.get(rule.id) or set()
+        if not pool:
+            return []
+        quotes = await self._sudden_session_quotes(client, sorted(pool), session)
+        if quotes is None:
+            return []
+        now = datetime.now(timezone.utc).timestamp()
+        window = rule.condition.sudden_window_seconds
+        keep = max(window * 2, 120)
+        prices = self._sudden_prices.setdefault(rule.id, {})
+        matched: list[Quote] = []
+        still: set[str] = set()
+        pool_floor = (
+            rule.condition.pool_min_change
+            if rule.condition.pool_min_change is not None
+            else rule.condition.value
+        )
+        for symbol, quote in quotes.items():
+            price = quote.price
+            session_change = quote.change_pct
+            if price is None or price <= 0:
+                continue
+            if session_change is None or session_change <= pool_floor:
+                prices.pop(symbol, None)
+                continue
+            still.add(symbol)
+            self._sudden_session[f"{rule.id}:{symbol}"] = session_change
+            samples = prices.setdefault(symbol, [])
+            samples.append((now, price))
+            prices[symbol] = trim_price_samples(samples, now=now, keep_seconds=keep)
+            prior = price_age_seconds_ago(prices[symbol], now=now, window_seconds=window)
+            if prior is None:
+                continue
+            sudden = hour_change_pct(prior[1], price)
+            if sudden is None or sudden <= rule.condition.value:
+                continue
+            age = now - prior[0]
+            alert_quote = Quote(
+                symbol=symbol,
+                company=quote.company,
+                price=price,
+                change_pct=sudden,
+                volume=quote.volume,
+            )
+            if self.verbose:
+                logger.info(
+                    "  %s %s: +%.1f%% in %.0fs (session %+.1f%%)",
+                    rule.id,
+                    symbol,
+                    sudden,
+                    age,
+                    session_change,
+                )
+            matched.append(alert_quote)
+        self._sudden_pool[rule.id] = still
+        dropped = pool - still
+        for symbol in dropped:
+            prices.pop(symbol, None)
+            self._sudden_session.pop(f"{rule.id}:{symbol}", None)
+        if matched:
+            logger.info(
+                "Sudden matches for %s: %s",
+                rule.id,
+                ", ".join(f"{quote.symbol} {quote.change_pct:+.1f}%" for quote in matched),
+            )
+        return matched
+
+    async def _discover_sudden_pool(
+        self, rule: Rule, client: MoomooClient, session: str
+    ) -> None:
+        now = datetime.now(timezone.utc).timestamp()
+        last = self._sudden_discovered_at.get(rule.id)
+        # Filter API: max 10 calls / 30s. One page about every 45s is safe.
+        if last is not None and now - last < 45:
+            return
+        self._sudden_discovered_at[rule.id] = now
+        max_cap = rule.condition.max_market_cap or 1_000_000_000
+        min_volume = rule.condition.min_volume
+        min_price = rule.condition.min_price
+        begin = self._sudden_discover_begin.get(rule.id, 0)
+        if begin == 0:
+            logger.info(
+                "Sudden %s discover sweep, session gain > %g%%, cap <= %.0f",
+                session,
+                rule.condition.pool_min_change
+                if rule.condition.pool_min_change is not None
+                else rule.condition.value,
+                max_cap,
+            )
+        page, next_begin = await client.smallcap_page(begin, max_cap, min_volume, min_price)
+        self._sudden_discover_begin[rule.id] = next_begin
+        if not page:
+            return
+        marks = await self._sudden_session_quotes(
+            client, [quote.symbol for quote in page], session
+        )
+        if marks is None:
+            return
+        pool = self._sudden_pool.setdefault(rule.id, set())
+        pool_floor = (
+            rule.condition.pool_min_change
+            if rule.condition.pool_min_change is not None
+            else rule.condition.value
+        )
+        added = 0
+        for symbol, quote in marks.items():
+            if quote.change_pct is None or quote.change_pct <= pool_floor:
+                continue
+            if symbol not in pool:
+                added += 1
+            pool.add(symbol)
+            self._sudden_session[f"{rule.id}:{symbol}"] = quote.change_pct
+        if len(pool) > 200:
+            ranked = sorted(
+                pool,
+                key=lambda symbol: self._sudden_session.get(f"{rule.id}:{symbol}", float("-inf")),
+                reverse=True,
+            )
+            keep = set(ranked[:200])
+            for symbol in pool - keep:
+                self._sudden_prices.get(rule.id, {}).pop(symbol, None)
+                self._sudden_session.pop(f"{rule.id}:{symbol}", None)
+            self._sudden_pool[rule.id] = keep
+            pool = keep
+        if added:
+            logger.info(
+                "Sudden %s pool +%s (now %s)",
+                rule.id,
+                added,
+                len(pool),
+            )
+
+    async def _sudden_session_quotes(
+        self, client: MoomooClient, symbols: list[str], session: str
+    ) -> dict[str, Quote] | None:
+        if not symbols:
+            return {}
+        if session == "afterhours":
+            found = await client.after_hours_quotes(symbols)
+        elif session == "premarket":
+            found = await client.premarket_quotes(symbols)
+        else:
+            found = await self._moomoo_snapshots(client, symbols)
+        await self._drain_client_problem(client)
+        return found
+
     async def _record_circuit_breakers(self, rule: Rule) -> list[Quote]:
         client = self._trend_moomoo or self.moomoo
         if client is None:
@@ -2663,6 +2864,64 @@ class MonitorEngine:
             self._add_to_tonghuashun(rule, [quote])
         return alert
 
+    def _ths_active_session(self) -> str | None:
+        if is_premarket():
+            return "盘前"
+        if is_regular_session():
+            return "盘中"
+        if is_afterhours():
+            return "盘后"
+        return None
+
+    async def _maybe_sync_tonghuashun_groups(self, config: RulesConfig) -> None:
+        """Create/remove rule groups once; clear only the current session's groups on a new day."""
+        if not self.ths.configured:
+            return
+        day = now_et().date().isoformat()
+        names = [rule.name for rule in config.rules if rule.enabled and rule.name]
+        session = self._ths_active_session()
+        need_structure = not self._ths_groups_synced
+        need_session_clear = bool(session) and self._ths_cleared_session_day.get(session) != day
+        if not need_structure and not need_session_clear:
+            return
+        async with self._ths_lock:
+            try:
+                if need_structure:
+                    result = await self.ths.sync_groups(names)
+                    self._ths_groups_synced = True
+                    if result.get("created") or result.get("deleted"):
+                        logger.info(
+                            "同花顺 groups synced created=%s deleted=%s",
+                            result.get("created") or [],
+                            result.get("deleted") or [],
+                        )
+                if need_session_clear and session is not None:
+                    session_names = [
+                        rule.name
+                        for rule in config.rules
+                        if rule.enabled
+                        and rule.name
+                        and (rule.group or rule.condition_session) == session
+                    ]
+                    cleared = await self.ths.clear_for_day(session_names, day)
+                    watchlist_cleared = await self.ths.clear_watchlist_previous_session(session)
+                    self._ths_cleared_session_day[session] = day
+                    if cleared:
+                        logger.info(
+                            "同花顺 cleared %s groups for %s: %s",
+                            session,
+                            day,
+                            ", ".join(cleared),
+                        )
+                    if watchlist_cleared:
+                        logger.info(
+                            "同花顺 我的自选 cleared previous session: %s",
+                            ", ".join(watchlist_cleared),
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("同花顺 group sync failed: %s", exc)
+                await self._note_problem(f"Tonghuashun add failed: {exc}")
+
     def _add_to_tonghuashun(self, rule: Rule, quotes: list[Quote] | list[str]) -> None:
         if not self.ths.configured:
             return
@@ -2673,12 +2932,13 @@ class MonitorEngine:
     async def _tonghuashun_sync(self, rule: Rule, quotes: list[Quote] | list[str]) -> None:
         group = rule.name
         day = now_et().date().isoformat()
+        session = rule.group or rule.condition_session or self._ths_active_session() or "盘中"
         symbols = [
             item.symbol if isinstance(item, Quote) else str(item).upper() for item in quotes
         ]
         async with self._ths_lock:
             try:
-                members = await self.ths.members(group, day, symbols)
+                members = await self.ths.members(group, day, symbols, session)
                 if _sorts_ths_by_peak_fade(rule):
                     peaks = self.store.peak_gains(day)
                     closes = await self._regular_close_changes(members)

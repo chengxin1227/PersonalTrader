@@ -270,6 +270,29 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             f">{rule.condition.value:g}% and total cap <= ${cap:,.0f}{volume}"
                         )
                         continue
+                    if rule.condition.type is ConditionType.SUDDEN_GAIN:
+                        cap = rule.condition.max_market_cap or 100_000_000
+                        volume = ""
+                        if rule.condition.min_volume is not None:
+                            volume = f" and volume > {rule.condition.min_volume:,.0f}"
+                        if rule.condition.min_price is not None:
+                            volume += f" and price > ${rule.condition.min_price:g}"
+                        session = {
+                            "premarket": "pre-market",
+                            "afterhours": "after-hours",
+                        }.get(rule.condition.late_session, "regular")
+                        pool = (
+                            rule.condition.pool_min_change
+                            if rule.condition.pool_min_change is not None
+                            else rule.condition.value
+                        )
+                        print(
+                            f"    - {rule.name}: {session} names already > {pool:g}%, "
+                            f"then +{rule.condition.value:g}% in "
+                            f"{rule.condition.sudden_window_seconds}s, "
+                            f"total cap <= ${cap:,.0f}{volume}"
+                        )
+                        continue
                     volume = ""
                     if rule.condition.min_volume is not None:
                         volume = f" and volume > {rule.condition.min_volume:,.0f}"

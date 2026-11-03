@@ -60,6 +60,31 @@ def hour_change_pct(baseline: float | None, price: float | None) -> float | None
     return round((price - baseline) / baseline * 100, 4)
 
 
+def price_age_seconds_ago(
+    samples: list[tuple[float, float]],
+    *,
+    now: float,
+    window_seconds: int,
+) -> tuple[float, float] | None:
+    """Newest sample at least `window_seconds` old: (timestamp, price)."""
+    cutoff = now - window_seconds
+    chosen: tuple[float, float] | None = None
+    for stamp, price in samples:
+        if stamp <= cutoff and price > 0:
+            chosen = (stamp, price)
+    return chosen
+
+
+def trim_price_samples(
+    samples: list[tuple[float, float]],
+    *,
+    now: float,
+    keep_seconds: int,
+) -> list[tuple[float, float]]:
+    floor = now - keep_seconds
+    return [(stamp, price) for stamp, price in samples if stamp >= floor]
+
+
 def evaluate_last_hour_scan(
     rule: Rule,
     quote: Quote,
@@ -410,6 +435,7 @@ def evaluate_rule(
         ConditionType.PREMARKET_GAIN,
         ConditionType.AFTERHOURS_GAIN,
         ConditionType.LATE_SESSION_GAIN,
+        ConditionType.SUDDEN_GAIN,
         ConditionType.REGULAR_CLOSE,
         ConditionType.REGULAR_GAIN,
     }:

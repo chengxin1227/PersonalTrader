@@ -113,7 +113,7 @@ CHECK_REMINDERS = (
     CheckReminder(
         "regular-close-15",
         time(15, 45),
-        ("afterhours-halt-or-day80",),
+        ("afterhours-halt-or-day80", "regular-sudden-10"),
         "盘中收盘前15分钟",
     ),
     CheckReminder(
@@ -131,7 +131,7 @@ CHECK_REMINDERS = (
     CheckReminder(
         "premarket-end-15",
         time(9, 15),
-        ("premarket-last-3h-20", "premarket-gain80"),
+        ("premarket-sudden-10",),
         "盘前结束前15分钟",
     ),
 )
@@ -205,6 +205,24 @@ def is_regular_session(moment: datetime | None = None) -> bool:
     if current.weekday() >= 5:
         return False
     return REGULAR_START <= current.time() < REGULAR_END
+
+
+def seconds_until_session_end(moment: datetime | None = None) -> int | None:
+    """Seconds left in the current ET session, for Pushover ``ttl``.
+
+    Premarket ends 09:30, regular 16:00, after-hours 20:00. ``None`` outside those windows.
+    """
+    current = now_et(moment)
+    if is_premarket(current):
+        end = datetime.combine(current.date(), PREMARKET_END, tzinfo=ET)
+    elif is_regular_session(current):
+        end = datetime.combine(current.date(), REGULAR_END, tzinfo=ET)
+    elif is_afterhours(current):
+        end = datetime.combine(current.date(), AFTERHOURS_END, tzinfo=ET)
+    else:
+        return None
+    seconds = int((end - current).total_seconds())
+    return max(1, seconds)
 
 
 def extended_session_open(moment: datetime | None = None) -> bool:

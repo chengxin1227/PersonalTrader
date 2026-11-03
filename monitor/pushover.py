@@ -10,6 +10,7 @@ from monitor.config import Settings
 from monitor.models import Alert
 from monitor.quote_link import quote_url
 from monitor.rules import FIELD_GAP, format_price, split_alert_name
+from monitor.session import seconds_until_session_end
 
 _CHANGE = re.compile(r"[+-]\d+(?:\.\d+)?%")
 _PRICE = re.compile(r"\$\d[\d,.]*")
@@ -130,6 +131,7 @@ class PushoverClient:
         token: str | None = None,
         priority: int | None = None,
         sound: str | None = None,
+        ttl: int | None = None,
     ) -> None:
         app_token = token or self._settings.pushover_token
         if not app_token or not self._settings.pushover_user:
@@ -149,6 +151,12 @@ class PushoverClient:
         if url:
             payload["url"] = url[:512]
             payload["url_title"] = url_title[:100]
+        # Expire with the current ET session (盘前/盘中/盘后). Explicit ttl wins;
+        # ttl=0 skips expiry (OpenD / tests).
+        if ttl is None:
+            ttl = seconds_until_session_end()
+        if ttl and ttl > 0:
+            payload["ttl"] = str(int(ttl))
         response = await self._client.post(
             PUSHOVER_URL,
             data=payload,

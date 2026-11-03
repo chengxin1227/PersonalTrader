@@ -58,6 +58,28 @@ def test_after_hours_range_uses_the_regular_close():
     assert quote.after_hours_price == 10.0
 
 
+def test_after_hours_quote_works_without_high_low_band():
+    quote = quote_from_after_hours(
+        {
+            "code": "US.CRIS",
+            "name": "Curis",
+            "after_price": 1.16,
+            "after_change_rate": 62.5,
+            "last_price": 0.71,
+            "prev_close_price": 0.66,
+            "after_high_price": None,
+            "after_low_price": None,
+            "after_volume": 200000,
+        }
+    )
+    assert quote is not None
+    assert quote.symbol == "CRIS"
+    assert quote.price == 1.16
+    assert quote.change_pct == 62.5
+    assert quote.session_low_pct is None
+    assert quote.session_high_pct is None
+
+
 def test_pink_sheet_names_are_otc():
     assert is_otc_exchange("US_PINK")
     assert not is_otc_exchange("US_NASDAQ")

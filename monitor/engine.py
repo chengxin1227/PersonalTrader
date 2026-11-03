@@ -2093,10 +2093,16 @@ class MonitorEngine:
             if rule.condition.pool_min_change is not None
             else rule.condition.value
         )
-        for symbol, quote in quotes.items():
+        for symbol in pool:
+            quote = quotes.get(symbol)
+            if quote is None:
+                # Missing snapshot this round — keep watching; don't wipe samples.
+                still.add(symbol)
+                continue
             price = quote.price
             session_change = quote.change_pct
             if price is None or price <= 0:
+                still.add(symbol)
                 continue
             if session_change is None or session_change <= pool_floor:
                 prices.pop(symbol, None)
@@ -2181,6 +2187,11 @@ class MonitorEngine:
         if not found:
             return
         pool = self._sudden_pool.setdefault(rule.id, set())
+        prices = self._sudden_prices.setdefault(rule.id, {})
+        keep_samples = max(
+            (rule.condition.sudden_window_seconds or 60) * 2,
+            120,
+        )
         added = 0
         for quote in found:
             if quote.change_pct is None or quote.change_pct <= pool_floor:
@@ -2193,6 +2204,13 @@ class MonitorEngine:
                 added += 1
             pool.add(quote.symbol)
             self._sudden_session[f"{rule.id}:{quote.symbol}"] = quote.change_pct
+            # Seed/refresh a price sample from the rank so the 1-minute window can start immediately.
+            if quote.price is not None and quote.price > 0:
+                samples = prices.setdefault(quote.symbol, [])
+                samples.append((now, quote.price))
+                prices[quote.symbol] = trim_price_samples(
+                    samples, now=now, keep_seconds=keep_samples
+                )
         if len(pool) > 200:
             ranked = sorted(
                 pool,

@@ -124,3 +124,46 @@ def test_sudden_discover_uses_regular_gainers():
         10, max_market_cap=1_000_000_000, min_volume=100_000
     )
     assert engine._sudden_pool["regular-sudden-10"] == {"BBB"}
+
+
+def test_sudden_discover_seeds_price_samples():
+    engine = _engine()
+    client = AsyncMock()
+    client.scan_afterhours = AsyncMock(
+        return_value=[(Quote(symbol="CRIS", price=0.95, change_pct=40.0, volume=200_000), None)]
+    )
+
+    async def run() -> None:
+        await engine._discover_sudden_pool(_sudden_rule("afterhours"), client, "afterhours")
+
+    asyncio.run(run())
+    samples = engine._sudden_prices["afterhours-sudden-10"]["CRIS"]
+    assert len(samples) == 1
+    assert samples[0][1] == 0.95
+
+
+def test_sudden_match_keeps_pool_when_quote_missing():
+    engine = _engine()
+    engine._sudden_day = "2026-11-03"
+    engine._sudden_pool["afterhours-sudden-10"] = {"CRIS", "DKI"}
+    engine._sudden_prices["afterhours-sudden-10"] = {
+        "CRIS": [(100.0, 1.0)],
+        "DKI": [(100.0, 2.0)],
+    }
+    engine._sudden_discovered_at["afterhours-sudden-10"] = 10**12  # skip rediscover
+    client = AsyncMock()
+    engine._trend_moomoo = client
+    engine.moomoo = client
+    engine.verbose = False
+    # Only DKI comes back this round — CRIS must stay in the pool with samples.
+    client.after_hours_quotes = AsyncMock(
+        return_value={"DKI": Quote(symbol="DKI", price=2.1, change_pct=12.0, volume=200_000)}
+    )
+
+    async def run() -> None:
+        matched = await engine._match_sudden_rule(_sudden_rule("afterhours"))
+        assert matched == []
+
+    asyncio.run(run())
+    assert engine._sudden_pool["afterhours-sudden-10"] == {"CRIS", "DKI"}
+    assert "CRIS" in engine._sudden_prices["afterhours-sudden-10"]

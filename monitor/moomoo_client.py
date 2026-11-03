@@ -275,16 +275,19 @@ def quote_from_after_hours(row: dict[str, Any]) -> Quote | None:
         return None
     price = _float(row.get("after_price"))
     change = _float(row.get("after_change_rate"))
+    if price is None or price <= 0 or change is None:
+        return None
+    # High/low can lag on fresh AH prints; still return price/change for sudden watches.
     band = after_hours_range_pct(
         price,
         change,
         _float(row.get("after_high_price")),
         _float(row.get("after_low_price")),
     )
-    if price is None or price <= 0 or change is None or band is None:
-        return None
     volume = _float(row.get("after_volume"))
-    low_pct, high_pct = band
+    low_pct = high_pct = None
+    if band is not None:
+        low_pct, high_pct = band
     regular_price = _float(row.get("last_price"))
     prev_close = _float(row.get("prev_close_price"))
     regular_change = None

@@ -53,8 +53,26 @@ def problem_notice(text: str) -> tuple[str, str, str] | None:
         return "error:slack", "发送失败", "Slack 发送失败。"
     if lowered.startswith("pushover send failed"):
         return "error:pushover", "发送失败", "Pushover 发送失败。"
+    if _is_state_corrupt(lowered):
+        return (
+            "error:state-corrupt",
+            "监控已暂停",
+            "state.json 损坏，扫描已停，请修复后重启。",
+        )
     first = raw[:180]
     return f"error:{first[:80]}", "扫描出错", first
+
+
+def _is_state_corrupt(lowered: str) -> bool:
+    if "expecting" in lowered and ("delimiter" in lowered or "value" in lowered):
+        return True
+    if "json" in lowered and any(
+        part in lowered for part in ("decode", "parse", "expecting", "unterminated")
+    ):
+        return True
+    return "state.json" in lowered and any(
+        part in lowered for part in ("corrupt", "invalid", "decode", "parse")
+    )
 
 
 class ProblemLatch:

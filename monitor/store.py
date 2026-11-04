@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,21 @@ def _is_iso_date(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    """Write JSON via temp file + replace so a crash can't truncate the live file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 class Store:
@@ -51,8 +67,7 @@ class Store:
         return payload
 
     def save_state(self, state: dict[str, Any]) -> None:
-        with self._state_path.open("w", encoding="utf-8") as handle:
-            json.dump(state, handle, indent=2, default=str)
+        _atomic_write_json(self._state_path, state)
 
     def last_price(self, state: dict[str, Any], symbol: str) -> float | None:
         value = state.get("last_prices", {}).get(symbol.upper())
@@ -266,8 +281,7 @@ class Store:
 
     def _save_peak_gains(self, peaks: dict[str, Any]) -> None:
         self._peak_gains = peaks
-        with self._peak_gains_path.open("w", encoding="utf-8") as handle:
-            json.dump(peaks, handle, indent=2)
+        _atomic_write_json(self._peak_gains_path, peaks)
 
     def new_high_watch(
         self, day: str, rule_id: str, symbol: str
@@ -354,8 +368,7 @@ class Store:
 
     def _save_new_highs(self, highs: dict[str, Any]) -> None:
         self._new_highs = highs
-        with self._new_highs_path.open("w", encoding="utf-8") as handle:
-            json.dump(highs, handle, indent=2)
+        _atomic_write_json(self._new_highs_path, highs)
 
     def replace_trend_watch(self, rule_id: str, day: str, rows: list[dict[str, Any]]) -> None:
         """Replace today's trend names. A later check near the close drops names that faded."""
@@ -393,8 +406,7 @@ class Store:
 
     def _save_trend_watch(self, watch: dict[str, Any]) -> None:
         self._trend_watch = watch
-        with self._trend_watch_path.open("w", encoding="utf-8") as handle:
-            json.dump(watch, handle, indent=2)
+        _atomic_write_json(self._trend_watch_path, watch)
 
     def _load_day_gains(self) -> dict[str, Any]:
         if self._day_gains is not None:
@@ -409,8 +421,7 @@ class Store:
 
     def _save_day_gains(self, gains: dict[str, Any]) -> None:
         self._day_gains = gains
-        with self._day_gains_path.open("w", encoding="utf-8") as handle:
-            json.dump(gains, handle, indent=2)
+        _atomic_write_json(self._day_gains_path, gains)
 
     def _load_spikes(self) -> dict[str, Any]:
         if self._spikes is not None:
@@ -425,8 +436,7 @@ class Store:
 
     def _save_spikes(self, spikes: dict[str, Any]) -> None:
         self._spikes = spikes
-        with self._spikes_path.open("w", encoding="utf-8") as handle:
-            json.dump(spikes, handle, indent=2)
+        _atomic_write_json(self._spikes_path, spikes)
 
     def append_alert(self, alert: Alert) -> None:
         with self._alerts_path.open("a", encoding="utf-8") as handle:

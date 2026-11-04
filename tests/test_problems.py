@@ -46,3 +46,13 @@ def test_other_errors_notify_once_until_the_problem_goes_quiet():
     assert latch.should_send(notice[0], now)
     assert not latch.should_send(notice[0], now + timedelta(seconds=5))
     assert latch.should_send(notice[0], now + timedelta(seconds=5 + 121))
+
+
+def test_state_json_corrupt_is_a_clear_pause_notice():
+    notice = problem_notice(
+        "Expecting ':' delimiter: line 1029 column 32 (char 73863)"
+    )
+    assert notice is not None
+    assert notice[0] == "error:state-corrupt"
+    assert notice[1] == "监控已暂停"
+    assert "state.json" in notice[2]

@@ -1373,9 +1373,19 @@ class MonitorEngine:
         routes = getattr(self, "routes", None)
         token = routes.pushover_token("opend") if routes is not None else None
         slack_url = routes.slack_url("opend") if routes is not None else ""
+        delivered = False
         if self.pushover is not None and (token or routes is None):
             try:
-                await self.pushover.send_text(message, title=title, token=token)
+                # ttl=0: do not expire with the session; priority=1 so it is hard to miss.
+                await self.pushover.send_text(
+                    message,
+                    title=title,
+                    token=token,
+                    priority=1,
+                    sound="pushover",
+                    ttl=0,
+                )
+                delivered = True
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not send system alert: %s", exc)
         elif self.pushover is None and title == "OpenD 断开":
@@ -1383,8 +1393,13 @@ class MonitorEngine:
         if getattr(self, "slack", None) is not None and slack_url:
             try:
                 await self.slack.send_text(f"{title}\n{message}", webhook_url=slack_url)
+                delivered = True
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not send system alert to Slack: %s", exc)
+        if delivered:
+            logger.info("System alert sent: %s", title)
+        elif self.pushover is not None or getattr(self, "slack", None) is not None:
+            logger.warning("System alert not delivered: %s", title)
 
     async def _moomoo_snapshots(self, client: MoomooClient, symbols: list[str]) -> dict[str, Quote]:
         quotes = await client.snapshots(symbols)

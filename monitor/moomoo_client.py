@@ -482,6 +482,12 @@ class MoomooClient:
         self._ctx: Any = None
         self._lock = threading.RLock()
         self._pending_problem: str | None = None
+        # Short TTL cache: stock-filter max 10 calls / 30s across the whole process.
+        self._regular_gainers_cache: dict[
+            tuple[float, int, float | None, float | None, float | None],
+            tuple[float, list[Quote]],
+        ] = {}
+        self._filter_blocked_until: float = 0.0
 
     def _exchanges(self) -> dict[str, str]:
         global _exchange_cache
@@ -961,8 +967,9 @@ class MoomooClient:
         max_pages: int = 15,
         max_market_cap: float | None = None,
         min_volume: float | None = None,
+        min_price: float | None = None,
     ) -> list[Quote]:
-        from moomoo import RET_OK, AccumulateFilter, Market, SortDir, StockField
+        from moomoo import RET_OK, AccumulateFilter, Market, SimpleFilter, SortDir, StockField
 
         acc = AccumulateFilter()
         acc.stock_field = StockField.CHANGE_RATE
@@ -979,13 +986,18 @@ class MoomooClient:
             volume.is_no_filter = False
             filters.append(volume)
         if max_market_cap is not None:
-            from moomoo import SimpleFilter
-
             cap = SimpleFilter()
             cap.stock_field = StockField.MARKET_VAL
             cap.filter_max = max_market_cap
             cap.is_no_filter = False
             filters.append(cap)
+        # Filter rows only include fields used as conditions. Ask for CUR_PRICE or
+        # the sudden pool's min_price check drops every name (price is always None).
+        price = SimpleFilter()
+        price.stock_field = StockField.CUR_PRICE
+        price.filter_min = float(min_price) if min_price is not None else 0.01
+        price.is_no_filter = False
+        filters.append(price)
         quotes: list[Quote] = []
         begin = 0
         saw_change = 0
@@ -1021,11 +1033,16 @@ class MoomooClient:
                             continue
                         if volume <= min_volume:
                             continue
+                    last = _float(item.__dict__.get("cur_price"))
+                    if last is None:
+                        last = _float(item.__dict__.get(("cur_price", 1)))
+                    if min_price is not None and (last is None or last <= min_price):
+                        continue
                     quotes.append(
                         Quote(
                             symbol=symbol,
                             company=name.strip() or None,
-                            price=_float(item.__dict__.get("cur_price")),
+                            price=last,
                             change_pct=change,
                             volume=int(volume) if volume is not None else None,
                         )
@@ -1044,22 +1061,50 @@ class MoomooClient:
         max_pages: int = 15,
         max_market_cap: float | None = None,
         min_volume: float | None = None,
+        min_price: float | None = None,
     ) -> list[Quote]:
+        import time
+
+        cache_key = (min_change_pct, max_pages, max_market_cap, min_volume, min_price)
+        now = time.monotonic()
+        cached = self._regular_gainers_cache.get(cache_key)
+        if cached is not None and now - cached[0] < 20:
+            return list(cached[1])
+        if now < self._filter_blocked_until:
+            if cached is not None:
+                return list(cached[1])
+            raise RuntimeError(
+                "Moomoo regular-session screen failed: Stock Screening by Conditions "
+                "request failed due to high frequency. Maximum 10 times per 30 seconds."
+            )
         if max_market_cap is None:
             logger.info("Moomoo regular-session screen, gain > %.1f%%", min_change_pct)
         else:
             volume = "" if min_volume is None else f", volume > {min_volume:,.0f}"
+            price = "" if min_price is None else f", price > {min_price:g}"
             logger.info(
-                "Moomoo regular-session screen, gain > %.1f%%, total cap <= %.0f%s",
+                "Moomoo regular-session screen, gain > %.1f%%, total cap <= %.0f%s%s",
                 min_change_pct,
                 max_market_cap,
                 volume,
+                price,
             )
-        found = await asyncio.to_thread(
-            self._regular_gainers_sync, min_change_pct, max_pages, max_market_cap, min_volume
-        )
+        try:
+            found = await asyncio.to_thread(
+                self._regular_gainers_sync,
+                min_change_pct,
+                max_pages,
+                max_market_cap,
+                min_volume,
+                min_price,
+            )
+        except RuntimeError as exc:
+            if "high frequency" in str(exc).lower() or "too frequent" in str(exc).lower():
+                self._filter_blocked_until = time.monotonic() + 15
+            raise
+        self._regular_gainers_cache[cache_key] = (now, found)
         logger.info("Moomoo regular-session names above threshold: %s", len(found))
-        return found
+        return list(found)
 
     def _smallcap_page_sync(
         self,

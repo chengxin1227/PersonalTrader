@@ -71,7 +71,9 @@ def _engine() -> MonitorEngine:
     return engine
 
 
-def test_sudden_discover_uses_afterhours_rank():
+def test_sudden_discover_uses_afterhours_rank(caplog):
+    import logging
+
     engine = _engine()
     client = AsyncMock()
     client.scan_afterhours = AsyncMock(
@@ -86,10 +88,12 @@ def test_sudden_discover_uses_afterhours_rank():
     async def run() -> None:
         await engine._discover_sudden_pool(_sudden_rule("afterhours"), client, "afterhours")
 
-    asyncio.run(run())
+    with caplog.at_level(logging.INFO, logger="personaltrader.monitor"):
+        asyncio.run(run())
     client.scan_afterhours.assert_awaited_once_with(10, 1_000_000_000)
     client.smallcap_page.assert_not_called()
     assert engine._sudden_pool["afterhours-sudden-10"] == {"DKI"}
+    assert any("pool +1 DKI" in record.message for record in caplog.records)
 
 
 def test_sudden_discover_uses_premarket_rank():
@@ -121,7 +125,7 @@ def test_sudden_discover_uses_regular_gainers():
 
     asyncio.run(run())
     client.regular_gainers.assert_awaited_once_with(
-        10, max_market_cap=1_000_000_000, min_volume=100_000
+        10, max_market_cap=1_000_000_000, min_volume=100_000, min_price=0.1
     )
     assert engine._sudden_pool["regular-sudden-10"] == {"BBB"}
 
@@ -143,8 +147,10 @@ def test_sudden_discover_seeds_price_samples():
 
 
 def test_sudden_match_keeps_pool_when_quote_missing():
+    from monitor.session import now_et
+
     engine = _engine()
-    engine._sudden_day = "2026-11-03"
+    engine._sudden_day = now_et().date().isoformat()
     engine._sudden_pool["afterhours-sudden-10"] = {"CRIS", "DKI"}
     engine._sudden_prices["afterhours-sudden-10"] = {
         "CRIS": [(100.0, 1.0)],

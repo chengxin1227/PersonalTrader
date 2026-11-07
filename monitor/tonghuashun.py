@@ -25,9 +25,10 @@ _LOGIN_AGENT = "同花顺/7.0.10 CFNetwork/1333.0.4 Darwin/21.5.0".encode("utf-8
 _API_AGENT = "hevo"
 _GROUP_AGENT = "Hexin_Gphone/11.28.03 (Royal Flush) okhttp/3.14.9"
 _SESSION_SECONDS = 12 * 60 * 60
-# Custom group (not the default 自选股 list) that collects every alerted name.
-_WATCHLIST_GROUP = "我的自选"
-# When a session opens, 我的自选 drops names tagged with the previous session.
+# Custom groups (not the default 自选股 list).
+_DAILY_WATCHLIST_GROUP = "今日自选"  # every alerted name
+_DEFAULT_IMPORTANT_GROUP = "我的自选"  # important subset only
+# When a session opens, summary groups drop names tagged with the previous session.
 _PREVIOUS_SESSION = {"盘前": "盘后", "盘中": "盘前", "盘后": "盘中"}
 
 
@@ -74,7 +75,7 @@ def _encrypt(pubkey: str, value: str) -> str:
 
 
 class TonghuashunClient:
-    """Adds alerted names to a 同花顺 custom group named after the rule, and to 我的自选."""
+    """Adds alerted names to a rule group, 今日自选, and optionally 我的自选."""
 
     def __init__(self, settings: Settings) -> None:
         self._username = settings.ths_username
@@ -85,14 +86,25 @@ class TonghuashunClient:
         self._saved_at = 0.0
         self._days_path = settings.data_dir / "ths_group_days.json"
         self._watchlist_sessions_path = settings.data_dir / "ths_watchlist_sessions.json"
+        self._important_sessions_path = settings.data_dir / "ths_important_watchlist_sessions.json"
         self._lock = threading.Lock()
         self._markets: dict[str, str] | None = None
         self._days: dict[str, str] | None = None
         self._watchlist_sessions: dict[str, str] | None = None
+        self._important_sessions: dict[str, str] | None = None
+        self._important_group = _DEFAULT_IMPORTANT_GROUP
 
     @property
     def configured(self) -> bool:
         return bool(self._username and self._password)
+
+    def set_important_group(self, name: str) -> None:
+        cleaned = (name or "").strip() or _DEFAULT_IMPORTANT_GROUP
+        self._important_group = cleaned
+
+    @property
+    def important_group(self) -> str:
+        return self._important_group
 
     def _load_session(self) -> None:
         if self._cookies is not None or not self._session_path.exists():
@@ -258,41 +270,57 @@ class TonghuashunClient:
         self._markets_path.write_text(json.dumps(known, indent=2, sort_keys=True), encoding="utf-8")
         return market
 
-    def _watchlist_session_tags(self) -> dict[str, str]:
+    def _session_tags(self, *, important: bool) -> dict[str, str]:
+        if important:
+            if self._important_sessions is None:
+                self._important_sessions = self._load_session_tags(self._important_sessions_path)
+            return self._important_sessions
         if self._watchlist_sessions is None:
-            try:
-                raw = json.loads(self._watchlist_sessions_path.read_text(encoding="utf-8"))
-                self._watchlist_sessions = {
-                    str(symbol).upper(): str(session)
-                    for symbol, session in raw.items()
-                    if symbol and session
-                }
-            except (OSError, ValueError, AttributeError):
-                self._watchlist_sessions = {}
+            self._watchlist_sessions = self._load_session_tags(self._watchlist_sessions_path)
         return self._watchlist_sessions
 
-    def _save_watchlist_session_tags(self) -> None:
-        tags = self._watchlist_session_tags()
-        self._watchlist_sessions_path.parent.mkdir(parents=True, exist_ok=True)
-        self._watchlist_sessions_path.write_text(
+    def _load_session_tags(self, path) -> dict[str, str]:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            return {
+                str(symbol).upper(): str(session)
+                for symbol, session in raw.items()
+                if symbol and session
+            }
+        except (OSError, ValueError, AttributeError):
+            return {}
+
+    def _save_session_tags(self, *, important: bool) -> None:
+        tags = self._session_tags(important=important)
+        path = self._important_sessions_path if important else self._watchlist_sessions_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
             json.dumps(tags, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
 
-    def _ensure_watchlist_group(self, http: httpx.Client, symbols: list[str], session: str) -> None:
-        """Also keep alerted names in custom group 我的自选 (not the default 自选股 list)."""
+    def _ensure_summary_group(
+        self,
+        http: httpx.Client,
+        group_name: str,
+        symbols: list[str],
+        session: str,
+        *,
+        important: bool,
+    ) -> None:
+        """Keep alerted names in a custom summary group (今日自选 / 我的自选)."""
         if not symbols:
             return
-        group_id, rows = self._group(http, _WATCHLIST_GROUP)
+        group_id, rows = self._group(http, group_name)
         known = self._known_markets()
         for code, market in rows:
             known.setdefault(code.upper(), market)
         existing = [code.upper() for code, _ in rows]
         fresh = [symbol for symbol in symbols if symbol not in existing]
-        tags = self._watchlist_session_tags()
+        tags = self._session_tags(important=important)
         for symbol in symbols:
             tags[symbol] = session
-        self._save_watchlist_session_tags()
+        self._save_session_tags(important=important)
         if not fresh:
             return
         for symbol in fresh:
@@ -300,22 +328,22 @@ class TonghuashunClient:
         ordered = fresh + existing
         self._write(http, "/content/v1/delete", group_id, rows)
         self._write(http, "/content/v1/add", group_id, [(code, known[code]) for code in ordered])
-        logger.info("同花顺 %s: %s", _WATCHLIST_GROUP, ", ".join(fresh))
+        logger.info("同花顺 %s: %s", group_name, ", ".join(fresh))
 
-    def _clear_watchlist_session_sync(self, session: str) -> list[str]:
-        """Remove 我的自选 names that were added in ``session`` (previous period)."""
+    def _clear_summary_session_sync(self, session: str, group_name: str, *, important: bool) -> list[str]:
+        """Remove summary-group names that were added in ``session`` (previous period)."""
 
         def work(http: httpx.Client) -> list[str]:
-            group_id, rows = self._group(http, _WATCHLIST_GROUP)
+            group_id, rows = self._group(http, group_name)
             if not rows:
-                tags = self._watchlist_session_tags()
+                tags = self._session_tags(important=important)
                 stale = [symbol for symbol, tagged in list(tags.items()) if tagged == session]
                 for symbol in stale:
                     del tags[symbol]
                 if stale:
-                    self._save_watchlist_session_tags()
+                    self._save_session_tags(important=important)
                 return []
-            tags = self._watchlist_session_tags()
+            tags = self._session_tags(important=important)
             known = self._known_markets()
             keep_rows: list[tuple[str, str]] = []
             removed: list[str] = []
@@ -334,8 +362,8 @@ class TonghuashunClient:
             self._write(http, "/content/v1/delete", group_id, rows)
             if keep_rows:
                 self._write(http, "/content/v1/add", group_id, keep_rows)
-            self._save_watchlist_session_tags()
-            logger.info("同花顺 %s cleared %s: %s", _WATCHLIST_GROUP, session, ", ".join(removed))
+            self._save_session_tags(important=important)
+            logger.info("同花顺 %s cleared %s: %s", group_name, session, ", ".join(removed))
             return removed
 
         return self._with_session(work)
@@ -424,8 +452,12 @@ class TonghuashunClient:
         )
 
     def _sync_groups_sync(self, keep_names: list[str]) -> dict[str, list[str]]:
-        """Ensure rule groups + 我的自选 exist. Never delete user-created groups."""
-        keep = {_WATCHLIST_GROUP, *(name.strip() for name in keep_names if name.strip())}
+        """Ensure rule groups + 今日自选 + 我的自选 exist. Never delete user-created groups."""
+        keep = {
+            _DAILY_WATCHLIST_GROUP,
+            self._important_group,
+            *(name.strip() for name in keep_names if name.strip()),
+        }
 
         def work(http: httpx.Client) -> dict[str, list[str]]:
             created: list[str] = []
@@ -470,10 +502,27 @@ class TonghuashunClient:
                 if symbol not in members:
                     self._market(http, symbol)
                     members.append(symbol)
-            self._ensure_watchlist_group(http, symbols, session)
+            self._ensure_summary_group(
+                http, _DAILY_WATCHLIST_GROUP, symbols, session, important=False
+            )
             return members
 
         return self._with_session(work)
+
+    def _add_summary_sync(
+        self, symbols: list[str], session: str, *, important: bool
+    ) -> None:
+        fresh = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+        if not fresh:
+            return
+        group_name = self._important_group if important else _DAILY_WATCHLIST_GROUP
+
+        def work(http: httpx.Client) -> None:
+            self._ensure_summary_group(
+                http, group_name, fresh, session.strip(), important=important
+            )
+
+        self._with_session(work)
 
     def _arrange_sync(self, name: str, ordered: list[str]) -> None:
         def work(http: httpx.Client) -> None:
@@ -506,12 +555,45 @@ class TonghuashunClient:
         """Empty yesterday's names from the given session groups only."""
         return await asyncio.to_thread(self._clear_day_sync, names, day)
 
+    async def add_daily(self, symbols: list[str], session: str) -> None:
+        """Keep names in 今日自选 without touching a rule group."""
+        await asyncio.to_thread(self._add_summary_sync, symbols, session, important=False)
+
+    async def add_important(self, symbols: list[str], session: str) -> None:
+        """Also keep names in the important summary group (我的自选)."""
+        await asyncio.to_thread(self._add_summary_sync, symbols, session, important=True)
+
     async def clear_watchlist_previous_session(self, current_session: str) -> list[str]:
-        """Drop 我的自选 names that belong to the session before ``current_session``."""
+        """Drop 今日自选 + 我的自选 names tagged with the previous session."""
         previous = _PREVIOUS_SESSION.get(current_session.strip())
         if not previous:
             return []
-        return await asyncio.to_thread(self._clear_watchlist_session_sync, previous)
+        from functools import partial
+
+        daily = await asyncio.to_thread(
+            partial(
+                self._clear_summary_session_sync,
+                previous,
+                _DAILY_WATCHLIST_GROUP,
+                important=False,
+            )
+        )
+        important = await asyncio.to_thread(
+            partial(
+                self._clear_summary_session_sync,
+                previous,
+                self._important_group,
+                important=True,
+            )
+        )
+        # Preserve call-site logging: report union of removed symbols.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for symbol in [*daily, *important]:
+            if symbol not in seen:
+                seen.add(symbol)
+                ordered.append(symbol)
+        return ordered
 
     def list_sync(self) -> list[tuple[str, str]]:
         return self._with_session(lambda http: self._query(http)[1])

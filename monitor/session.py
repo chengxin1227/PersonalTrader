@@ -117,18 +117,6 @@ CHECK_REMINDERS = (
         "盘中收盘前15分钟",
     ),
     CheckReminder(
-        "afterhours-min-5",
-        time(16, 5),
-        ("afterhours-day30-ah10",),
-        "盘后开始第5分钟",
-    ),
-    CheckReminder(
-        "afterhours-2h30",
-        time(18, 30),
-        ("afterhours-top5-ah50", "afterhours-halt-or-day80"),
-        "盘后2.5小时",
-    ),
-    CheckReminder(
         "premarket-end-15",
         time(9, 15),
         ("premarket-sudden-10",),
@@ -137,13 +125,28 @@ CHECK_REMINDERS = (
 )
 
 
-def due_check_reminders(moment: datetime | None = None) -> list[CheckReminder]:
+def afterhours_open_window(
+    moment: datetime | None = None,
+    minutes: int = 15,
+) -> bool:
+    """True during the first ``minutes`` of the after-hours session (from 16:00 ET)."""
+    current = now_et(moment)
+    if current.weekday() >= 5 or not is_afterhours(current):
+        return False
+    start = datetime.combine(current.date(), AFTERHOURS_START, tzinfo=current.tzinfo)
+    return start <= current < start + timedelta(minutes=minutes)
+
+
+def due_check_reminders(
+    moment: datetime | None = None,
+    extra: list[CheckReminder] | None = None,
+) -> list[CheckReminder]:
     """Reminders whose clock time has arrived and is still inside the grace window."""
     current = now_et(moment)
     if current.weekday() >= 5:
         return []
     due: list[CheckReminder] = []
-    for reminder in CHECK_REMINDERS:
+    for reminder in (*CHECK_REMINDERS, *(extra or [])):
         start = datetime.combine(current.date(), reminder.at, tzinfo=current.tzinfo)
         end = start + timedelta(minutes=CHECK_REMINDER_GRACE_MINUTES)
         if start <= current < end:

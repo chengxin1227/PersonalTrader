@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from collections.abc import Iterable
 from typing import Any, Optional
 
 from monitor.alpaca import AlpacaClient
@@ -16,7 +17,15 @@ from monitor.moomoo_client import (
     regular_touch_change_pct,
     unchanged_symbols,
 )
-from monitor.models import Alert, ConditionType, MonitorStatus, Quote, Rule, RulesConfig
+from monitor.models import (
+    Alert,
+    ConditionType,
+    ImportantConfig,
+    MonitorStatus,
+    Quote,
+    Rule,
+    RulesConfig,
+)
 from monitor.notify import NotifyRoutes
 from monitor.quotes import apply_quote, apply_trade, previous_price
 from monitor.problems import ProblemLatch, problem_notice
@@ -37,25 +46,27 @@ from monitor.rules import (
 )
 from monitor.session import (
     AFTERHOURS_START,
-    extended_session_open,
+    CHECK_REMINDER_NOTIFY,
+    CheckReminder,
+    afterhours_board_slot,
     afterhours_just_opened,
+    afterhours_open_window,
     afterhours_stable_due,
     afterhours_stable_missed,
+    check_reminder_text,
+    due_check_reminders,
     et_session_name,
+    extended_session_open,
+    format_nz_clock,
     is_afterhours,
     is_premarket,
     is_regular_session,
     is_trading_day,
     last_hour_phase,
-    regular_close_approach,
     now_et,
-    format_nz_clock,
-    recent_trading_days,
-    afterhours_board_slot,
-    CHECK_REMINDER_NOTIFY,
-    check_reminder_text,
-    due_check_reminders,
     premarket_mark,
+    recent_trading_days,
+    regular_close_approach,
     seconds_until_extended_open,
 )
 from monitor.slack import SlackClient
@@ -67,6 +78,12 @@ from monitor.tonghuashun import TonghuashunClient
 from monitor.universe import UniverseCache
 
 logger = logging.getLogger("personaltrader.monitor")
+
+
+def _symbols_text(symbols: Iterable[str]) -> str:
+    """Comma-separated symbols for rule logs; empty → '0' so greps stay consistent."""
+    items = [symbol for symbol in symbols if symbol]
+    return ", ".join(items) if items else "0"
 
 
 def _is_trend_rule(rule: Rule) -> bool:
@@ -143,6 +160,19 @@ def _is_ah_touch_singles_rule(rule: Rule) -> bool:
     return _is_ah_touch_board_rule(rule) and rule.condition.value > 0
 
 
+def _afterhours_scan_rule(rule: Rule) -> Rule:
+    """Copy of ``rule`` with volume waived at the 16:00 after-hours open."""
+    slot = afterhours_board_slot()
+    if (
+        rule.condition.min_volume is None
+        or slot is None
+        or slot.time() != AFTERHOURS_START
+    ):
+        return rule
+    scan_rule = rule.model_copy(deep=True)
+    scan_rule.condition.min_volume = None
+    return scan_rule
+
 def _is_stable_rule(rule: Rule) -> bool:
     condition = rule.condition
     return (
@@ -158,6 +188,41 @@ def _is_last_hour_rule(rule: Rule) -> bool:
 
 def _is_sudden_rule(rule: Rule) -> bool:
     return rule.condition.type is ConditionType.SUDDEN_GAIN
+
+
+def _important_reminders(config: ImportantConfig) -> list[CheckReminder]:
+    from datetime import time as time_cls
+
+    reminders: list[CheckReminder] = []
+    for item in config.reminders:
+        hour_s, _, minute_s = item.at.partition(":")
+        reminders.append(
+            CheckReminder(
+                item.key,
+                time_cls(int(hour_s), int(minute_s)),
+                tuple(item.rule_ids),
+                item.label,
+            )
+        )
+    return reminders
+
+
+def _wants_important_watchlist(
+    important: ImportantConfig,
+    rule: Rule,
+    *,
+    board: bool = False,
+    moment: datetime | None = None,
+) -> bool:
+    """Whether this alert's symbols should also land in 我的自选."""
+    if board:
+        return False
+    watch = important.watchlist
+    if rule.id in watch.always or rule.id in watch.event:
+        return True
+    if rule.id in watch.afterhours_open:
+        return afterhours_open_window(moment, minutes=watch.afterhours_open_minutes)
+    return False
 
 
 def opend_is_down(exc: BaseException) -> bool:
@@ -520,6 +585,7 @@ class MonitorEngine:
                     logger.info("Session open; scanning every %ss", interval)
                     idle_logged = False
                 await self._maybe_send_check_reminders(config)
+                await self._run_watched_symbols(config)
                 await self.poll_once()
             except Exception as exc:  # noqa: BLE001
                 self.last_error = str(exc)
@@ -664,6 +730,7 @@ class MonitorEngine:
             try:
                 config = self.load_config()
                 await self._maybe_send_check_reminders(config)
+                await self._run_watched_symbols(config)
                 rules = [
                     rule
                     for rule in config.rules
@@ -889,7 +956,11 @@ class MonitorEngine:
                 logger.exception("Circuit breaker scan failed: %s", exc)
                 await self._note_opend_failure(exc)
                 await self._note_problem(str(exc))
-            await asyncio.sleep(10)
+                # Back off when the shared stock-filter budget is exhausted.
+                if "high frequency" in str(exc).lower() or "too frequent" in str(exc).lower():
+                    await asyncio.sleep(20)
+                    continue
+            await asyncio.sleep(15)
 
     def _closing_gains_due(self) -> bool:
         day = now_et().date().isoformat()
@@ -991,7 +1062,7 @@ class MonitorEngine:
                 day, minimum, [quote.symbol for quote in touched]
             )
             if added:
-                logger.info("Recorded day gain > %.0f%%: %s", minimum, ", ".join(added))
+                logger.info("Recorded day gain > %.0f%%: %s", minimum, _symbols_text(added))
                 by_symbol = {quote.symbol.upper(): quote for quote in touched}
                 fresh = [by_symbol[symbol] for symbol in added if symbol in by_symbol]
                 for alert_rule in rules:
@@ -1050,7 +1121,7 @@ class MonitorEngine:
                 logger.info(
                     "Recorded after-hours touch > %.0f%%: %s",
                     minimum,
-                    ", ".join(added),
+                    _symbols_text(added),
                 )
 
     async def _record_closing_gains(self, rules: list[Rule]) -> None:
@@ -1077,7 +1148,7 @@ class MonitorEngine:
             logger.info(
                 "Closing gain > %.0f%%: %s",
                 minimum,
-                ", ".join(symbols) if symbols else "0",
+                _symbols_text(symbols),
             )
 
     def _trend_watch_due(self) -> bool:
@@ -1142,7 +1213,11 @@ class MonitorEngine:
             rows.append(row)
         self.store.replace_trend_watch(rule.id, day, rows)
         if rows:
-            logger.info("Trend watch %s: %s", rule.id, ", ".join(item["symbol"] for item in rows))
+            logger.info(
+                "Trend watch %s: %s",
+                rule.id,
+                _symbols_text(item["symbol"] for item in rows),
+            )
 
     async def _saved_afterhours_quotes(
         self, client: MoomooClient, symbols: list[str]
@@ -1237,8 +1312,7 @@ class MonitorEngine:
             and (now - previous[1]).total_seconds() < 60
         ):
             return
-        shown = ", ".join(symbols) if symbols else "0"
-        logger.info("%s matches for %s: %s", label, rule_id, shown)
+        logger.info("%s matches for %s: %s", label, rule_id, _symbols_text(symbols))
         self._scan_log[rule_id] = (signature, now)
 
     def _breaker_due(self) -> bool:
@@ -1278,11 +1352,14 @@ class MonitorEngine:
         await self._send_system(title, message)
 
     async def _maybe_send_check_reminders(self, config: RulesConfig) -> None:
-        due = due_check_reminders()
+        due = due_check_reminders(extra=_important_reminders(config.important))
         if not due:
             return
         day = now_et().date().isoformat()
-        pending: list[tuple[str, str, str, list[str]]] = []
+        sync_by_key = {
+            item.key: item.sync_watchlist for item in config.important.reminders
+        }
+        pending: list[tuple[str, str, str, list[Rule], bool]] = []
         async with self._lock:
             state = self.store.load_state()
             sent = state.get("check_reminders")
@@ -1308,12 +1385,15 @@ class MonitorEngine:
                         stamp,
                         reminder.key,
                         reminder.label,
-                        [rule.name for rule in ordered],
+                        ordered,
+                        bool(sync_by_key.get(reminder.key)),
                     )
                 )
-        for stamp, key, label, names in pending:
+        for stamp, key, label, rules, sync_watchlist in pending:
             try:
-                await self._deliver_check_reminder(label, names)
+                await self._deliver_check_reminder(label, [rule.name for rule in rules])
+                if sync_watchlist:
+                    await self._sync_important_reminder_watchlist(config, rules)
             except Exception as exc:  # noqa: BLE001
                 self._check_reminder_inflight.discard(stamp)
                 logger.warning("Could not send check reminder: %s", exc)
@@ -1329,6 +1409,39 @@ class MonitorEngine:
                 }
                 self.store.save_state(state)
             logger.info("Check reminder sent: %s", label)
+
+    async def _sync_important_reminder_watchlist(
+        self, config: RulesConfig, rules: list[Rule]
+    ) -> None:
+        if not self.ths.configured or not rules:
+            return
+        self.ths.set_important_group(config.important.ths_group)
+        day = now_et().date().isoformat()
+        session = self._ths_active_session() or "盘后"
+        symbols: list[str] = []
+        seen: set[str] = set()
+        async with self._ths_lock:
+            for rule in rules:
+                try:
+                    members = await self.ths.members(rule.name, day, [], session)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("同花顺 reminder sync failed for %s: %s", rule.name, exc)
+                    continue
+                for symbol in members:
+                    if symbol not in seen:
+                        seen.add(symbol)
+                        symbols.append(symbol)
+            if not symbols:
+                return
+            try:
+                await self.ths.add_important(symbols, session)
+                logger.info(
+                    "同花顺 %s reminder sync: %s",
+                    config.important.ths_group,
+                    _symbols_text(symbols),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("同花顺 important reminder sync failed: %s", exc)
 
     async def _deliver_check_reminder(self, label: str, names: list[str]) -> None:
         text = check_reminder_text(label, names)
@@ -1368,6 +1481,81 @@ class MonitorEngine:
             logger.warning("Check reminder delivery failed: %s", exc)
         if errors and not delivered:
             raise errors[0]
+
+    async def _run_watched_symbols(self, config: RulesConfig) -> None:
+        """Poll named tickers; high-priority alert + 我的自选 when session gain clears the floor."""
+        watched = config.important.watched_symbols
+        if not watched.symbols or self.moomoo is None:
+            return
+        if is_premarket():
+            session = "盘前"
+            quotes = await self.moomoo.premarket_quotes(watched.symbols)
+        elif is_regular_session():
+            session = "盘中"
+            quotes = await self._moomoo_snapshots(self.moomoo, watched.symbols)
+        elif is_afterhours():
+            session = "盘后"
+            quotes = await self.moomoo.after_hours_quotes(watched.symbols)
+        else:
+            return
+        await self._drain_client_problem(self.moomoo)
+        if quotes is None:
+            return
+        notify = watched.notify or CHECK_REMINDER_NOTIFY
+        for symbol in watched.symbols:
+            quote = quotes.get(symbol)
+            if quote is None or quote.change_pct is None:
+                continue
+            if quote.change_pct < watched.min_change:
+                continue
+            cooldown_key = f"important-watched:{symbol}"
+            async with self._lock:
+                state = self.store.load_state()
+                last = self.store.last_fired_at(state, cooldown_key)
+                if last is not None:
+                    age = (datetime.now(timezone.utc) - last).total_seconds()
+                    if age < watched.cooldown_minutes * 60:
+                        continue
+                message = (
+                    f"{quote.company or symbol}    {quote.change_pct:+.1f}%    "
+                    f"${quote.price:.4g}"
+                    if quote.price is not None
+                    else f"{quote.company or symbol}    {quote.change_pct:+.1f}%"
+                )
+                message = f"{message}\n关注股票当前时段涨幅超 {watched.min_change:g}%"
+                alert = self.store.new_alert(
+                    rule_id="important-watched",
+                    rule_name="关注股票",
+                    label="重要提醒",
+                    notify=notify,
+                    symbol=symbol,
+                    message=message,
+                    price=quote.price,
+                    change_pct=quote.change_pct,
+                )
+                alert.url = quote_url(symbol)
+                await self._deliver(alert, priority=1, sound="pushover")
+                self.store.append_alert(alert)
+                self.store.mark_fired(state, cooldown_key, alert.fired_at)
+                self.store.save_state(state)
+            logger.info("ALERT important-watched | %s", alert.message.replace("\n", " | "))
+            if self.ths.configured:
+                self.ths.set_important_group(config.important.ths_group)
+                task = asyncio.create_task(
+                    self._watched_symbol_tonghuashun(symbol, session, config)
+                )
+                self._ths_tasks.add(task)
+                task.add_done_callback(self._ths_tasks.discard)
+
+    async def _watched_symbol_tonghuashun(
+        self, symbol: str, session: str, config: RulesConfig
+    ) -> None:
+        async with self._ths_lock:
+            try:
+                await self.ths.add_daily([symbol], session)
+                await self.ths.add_important([symbol], session)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("同花顺 watched symbol failed for %s: %s", symbol, exc)
 
     async def _send_system(self, title: str, message: str) -> None:
         routes = getattr(self, "routes", None)
@@ -1696,7 +1884,11 @@ class MonitorEngine:
             if evaluation.matched and cap is not None:
                 matched.append((quote, cap))
 
-        logger.info("Premarket matches after market-cap filter: %s", len(matched))
+        logger.info(
+            "Premarket matches after market-cap filter for %s: %s",
+            rule.id,
+            _symbols_text(quote.symbol for quote, _cap in matched),
+        )
         fired: list[Alert] = []
         slack_error: str | None = None
         for quote, cap in matched:
@@ -1734,10 +1926,11 @@ class MonitorEngine:
         fired = []
         slack_error = None
         for rule in rules:
+            scan_rule = _afterhours_scan_rule(rule)
             matched: list[tuple[Quote, float | None]] = []
             for quote, cap in found:
                 evaluation = evaluate_afterhours_scan(
-                    rule, quote, market_cap=cap, in_afterhours=True, cap_filtered=True
+                    scan_rule, quote, market_cap=cap, in_afterhours=True, cap_filtered=True
                 )
                 if self.verbose:
                     logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
@@ -1751,7 +1944,11 @@ class MonitorEngine:
                 or previous[0] != signature
                 or (now - previous[1]).total_seconds() >= 60
             ):
-                logger.info("After-hours matches for %s: %s", rule.id, len(matched))
+                logger.info(
+                    "After-hours matches for %s: %s",
+                    rule.id,
+                    _symbols_text(quote.symbol for quote, _cap in matched),
+                )
                 self._scan_log[rule.id] = (signature, now)
             for quote, cap in matched:
                 extra = None
@@ -1797,7 +1994,12 @@ class MonitorEngine:
             pool[quote.symbol] = quote
         self._stable_pool[rule.id] = pool
         self._stable_ready_day[rule.id] = now_et().date().isoformat()
-        logger.info("%s regular names above %.0f%%: %s", rule.id, minimum, len(pool))
+        logger.info(
+            "%s regular names above %.0f%%: %s",
+            rule.id,
+            minimum,
+            _symbols_text(pool),
+        )
 
     async def _stable_rank_fallback(self, rule: Rule) -> list[Quote]:
         if self.moomoo is None or rule.condition.stable_low is None:
@@ -1815,7 +2017,11 @@ class MonitorEngine:
             ):
                 continue
             quotes.append(quote)
-        logger.info("%s stable fallback from after-hours rank: %s", rule.id, len(quotes))
+        logger.info(
+            "%s stable fallback from after-hours rank: %s",
+            rule.id,
+            _symbols_text(quote.symbol for quote in quotes),
+        )
         return quotes
 
     async def _match_stable_afterhours(self, rule: Rule) -> list[Quote]:
@@ -1865,7 +2071,11 @@ class MonitorEngine:
             if evaluation.matched:
                 matched.append(merged)
         self._stable_done.add(key)
-        logger.info("After-hours stable matches for %s: %s", rule.id, len(matched))
+        logger.info(
+            "After-hours stable matches for %s: %s",
+            rule.id,
+            _symbols_text(quote.symbol for quote in matched),
+        )
         return matched
 
     async def _match_new_high_rule(self, rule: Rule) -> list[Quote]:
@@ -1903,6 +2113,12 @@ class MonitorEngine:
             if watched is None:
                 self.store.note_new_high_watch(
                     day, rule.id, quote.symbol, quote.change_pct, now
+                )
+                logger.info(
+                    "New high watch %s: %s %+.1f%%",
+                    rule.id,
+                    quote.symbol,
+                    quote.change_pct,
                 )
                 continue
             first_at, peak = watched
@@ -1967,7 +2183,12 @@ class MonitorEngine:
             or (now - previous[1]).total_seconds() >= 60
         ):
             session_name = "After-hours" if afterhours else "Pre-market"
-            logger.info("%s pullback matches for %s: %s", session_name, rule.id, len(matched))
+            logger.info(
+                "%s pullback matches for %s: %s",
+                session_name,
+                rule.id,
+                _symbols_text(quote.symbol for quote in matched),
+            )
             self._scan_log[rule.id] = (signature, now)
         return matched
 
@@ -2156,6 +2377,13 @@ class MonitorEngine:
         for symbol in dropped:
             prices.pop(symbol, None)
             self._sudden_session.pop(f"{rule.id}:{symbol}", None)
+        if dropped:
+            logger.info(
+                "Sudden %s pool drop %s (now %s)",
+                rule.id,
+                _symbols_text(sorted(dropped)),
+                len(still),
+            )
         if matched:
             logger.info(
                 "Sudden matches for %s: %s",
@@ -2170,8 +2398,10 @@ class MonitorEngine:
         """Find names already up > pool floor via session gain screens (not smallcap paging)."""
         now = datetime.now(timezone.utc).timestamp()
         last = self._sudden_discovered_at.get(rule.id)
-        # Rank / gainers screens share OpenD quota with other rules; ~15s is enough.
-        if last is not None and now - last < 15:
+        # Stock-filter API: max 10 / 30s shared with newhigh / halt screens.
+        # After-hours / pre-market ranks allow ~60 / 30s, so they can stay faster.
+        discover_every = 15 if session in {"afterhours", "premarket"} else 45
+        if last is not None and now - last < discover_every:
             return
         self._sudden_discovered_at[rule.id] = now
         max_cap = rule.condition.max_market_cap or 1_000_000_000
@@ -2192,7 +2422,7 @@ class MonitorEngine:
             )
         try:
             found = await self._sudden_session_gainers(
-                client, session, pool_floor, max_cap, min_volume
+                client, session, pool_floor, max_cap, min_volume, min_price
             )
         except Exception as exc:
             logger.warning("Sudden %s discover failed: %s", rule.id, exc)
@@ -2207,7 +2437,7 @@ class MonitorEngine:
             (rule.condition.sudden_window_seconds or 60) * 2,
             120,
         )
-        added = 0
+        added: list[str] = []
         for quote in found:
             if quote.change_pct is None or quote.change_pct <= pool_floor:
                 continue
@@ -2216,7 +2446,7 @@ class MonitorEngine:
             if min_price is not None and (quote.price is None or quote.price <= min_price):
                 continue
             if quote.symbol not in pool:
-                added += 1
+                added.append(quote.symbol)
             pool.add(quote.symbol)
             self._sudden_session[f"{rule.id}:{quote.symbol}"] = quote.change_pct
             # Seed/refresh a price sample from the rank so the 1-minute window can start immediately.
@@ -2233,16 +2463,25 @@ class MonitorEngine:
                 reverse=True,
             )
             keep = set(ranked[:200])
+            trimmed = sorted(pool - keep)
             for symbol in pool - keep:
                 self._sudden_prices.get(rule.id, {}).pop(symbol, None)
                 self._sudden_session.pop(f"{rule.id}:{symbol}", None)
             self._sudden_pool[rule.id] = keep
             pool = keep
+            if trimmed:
+                logger.info(
+                    "Sudden %s pool trim %s (now %s)",
+                    rule.id,
+                    _symbols_text(trimmed),
+                    len(pool),
+                )
         if added:
             logger.info(
-                "Sudden %s pool +%s (now %s)",
+                "Sudden %s pool +%s %s (now %s)",
                 rule.id,
-                added,
+                len(added),
+                _symbols_text(added),
                 len(pool),
             )
 
@@ -2253,6 +2492,7 @@ class MonitorEngine:
         pool_floor: float,
         max_cap: float,
         min_volume: float | None,
+        min_price: float | None = None,
     ) -> list[Quote]:
         """Session-gain leaders already above the sudden pool floor."""
         if session == "afterhours":
@@ -2265,6 +2505,7 @@ class MonitorEngine:
             pool_floor,
             max_market_cap=max_cap,
             min_volume=min_volume,
+            min_price=min_price,
         )
 
     async def _sudden_session_quotes(
@@ -2295,7 +2536,12 @@ class MonitorEngine:
         # A halt freezes the price. One batch stays under the 60-snapshot limit.
         symbols = frozen[:50]
         if symbols:
-            logger.info("Halt check: %s unchanged, snapshot %s", len(frozen), len(symbols))
+            logger.info(
+                "Halt check: %s unchanged (%s), snapshot %s",
+                len(frozen),
+                _symbols_text(frozen),
+                _symbols_text(symbols),
+            )
         snaps = await self._moomoo_snapshots(client, symbols)
         seen_at = datetime.now(timezone.utc)
         noted: list[str] = []
@@ -2316,7 +2562,7 @@ class MonitorEngine:
         now = datetime.now(timezone.utc)
         previous = self._scan_log.get(f"{rule.id}:halt")
         if noted and (previous is None or previous[0] != signature):
-            logger.info("Noted upward halts: %s", ", ".join(noted))
+            logger.info("Noted upward halts: %s", _symbols_text(noted))
             self._scan_log[f"{rule.id}:halt"] = (signature, now)
         return newly
 
@@ -2414,7 +2660,11 @@ class MonitorEngine:
             or previous[0] != signature
             or (now - previous[1]).total_seconds() >= 60
         ):
-            logger.info("After-hours circuit breaker matches for %s: %s", rule.id, len(matched))
+            logger.info(
+                "After-hours circuit breaker matches for %s: %s",
+                rule.id,
+                _symbols_text(quote.symbol for quote in matched),
+            )
             self._scan_log[rule.id] = (signature, now)
         return matched
 
@@ -2439,15 +2689,7 @@ class MonitorEngine:
         if not marks:
             return []
         # Same as the half-hour board: waive volume only at the 16:00 open.
-        scan_rule = rule
-        slot = afterhours_board_slot()
-        if (
-            rule.condition.min_volume is not None
-            and slot is not None
-            and slot.time() == AFTERHOURS_START
-        ):
-            scan_rule = rule.model_copy(deep=True)
-            scan_rule.condition.min_volume = None
+        scan_rule = _afterhours_scan_rule(rule)
         matched: list[Quote] = []
         for symbol in symbols:
             quote = marks.get(symbol)
@@ -2488,15 +2730,7 @@ class MonitorEngine:
         marks = await self._saved_afterhours_quotes(client, sorted(symbols))
         if not marks:
             return []
-        scan_rule = rule
-        slot = afterhours_board_slot()
-        if (
-            rule.condition.min_volume is not None
-            and slot is not None
-            and slot.time() == AFTERHOURS_START
-        ):
-            scan_rule = rule.model_copy(deep=True)
-            scan_rule.condition.min_volume = None
+        scan_rule = _afterhours_scan_rule(rule)
         matched: list[Quote] = []
         for symbol in symbols:
             quote = marks.get(symbol)
@@ -2581,11 +2815,15 @@ class MonitorEngine:
         self.store.mark_fired(state, slot_key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, message.replace("\n", " | "))
         if _sorts_ths_by_peak_fade(rule):
-            self._add_to_tonghuashun(rule, self._halt_or_day_pool_symbols(rule))
+            self._add_to_tonghuashun(
+                rule, self._halt_or_day_pool_symbols(rule), board=True
+            )
         elif _is_ah_touch_board_rule(rule):
-            self._add_to_tonghuashun(rule, self._ah_touch_pool_symbols(rule))
+            self._add_to_tonghuashun(
+                rule, self._ah_touch_pool_symbols(rule), board=True
+            )
         else:
-            self._add_to_tonghuashun(rule, leaders)
+            self._add_to_tonghuashun(rule, leaders, board=True)
 
     def _halt_or_day_pool_symbols(self, rule: Rule) -> list[str]:
         """Symbols that hit halt or the regular touch / day-gain threshold today."""
@@ -2740,7 +2978,8 @@ class MonitorEngine:
             await self._drain_client_problem(client)
             checked += 1
             if result is None:
-                self._kline_blocked_until = datetime.now(timezone.utc) + timedelta(seconds=31)
+                # Daily kline quota is tight; wait out the window instead of retrying.
+                self._kline_blocked_until = datetime.now(timezone.utc) + timedelta(minutes=5)
                 quote.session_uptrend = self._uptrend_cache.get(key)
                 break
             self._uptrend_cache[key] = result
@@ -2760,10 +2999,11 @@ class MonitorEngine:
         else:
             found = await self.moomoo.scan_premarket(rule.condition.value, max_cap)
         matched: list[tuple[Quote, float | None]] = []
+        scan_rule = _afterhours_scan_rule(rule) if afterhours else rule
         for quote, cap in found:
             if afterhours:
                 evaluation = evaluate_afterhours_scan(
-                    rule, quote, market_cap=cap, in_afterhours=True, cap_filtered=True
+                    scan_rule, quote, market_cap=cap, in_afterhours=True, cap_filtered=True
                 )
             else:
                 evaluation = evaluate_premarket_scan(
@@ -2783,7 +3023,12 @@ class MonitorEngine:
             or (now - previous[1]).total_seconds() >= 60
         ):
             session_name = "After-hours" if afterhours else "Pre-market"
-            logger.info("%s matches: %s", session_name, len(matched))
+            logger.info(
+                "%s matches for %s: %s",
+                session_name,
+                rule.id,
+                _symbols_text(quote.symbol for quote, _cap in matched),
+            )
             self._scan_log[rule.id] = (signature, now)
         fired: list[Alert] = []
         slack_error: str | None = None
@@ -2832,11 +3077,11 @@ class MonitorEngine:
                 if ok:
                     matched.append((quote, cap))
             logger.info(
-                "Moomoo preview %s: %s names >= %.0f%%, %s matched (not alerting)",
+                "Moomoo preview %s: %s names >= %.0f%%, matched %s (not alerting)",
                 rule.id,
                 len(found),
                 rule.condition.value,
-                len(matched),
+                _symbols_text(quote.symbol for quote, _cap in matched),
             )
             matched.sort(key=lambda item: item[0].change_pct or 0, reverse=True)
             for quote, cap in matched[:15]:
@@ -2926,16 +3171,35 @@ class MonitorEngine:
             alert.model_copy(update={"message": display_message}), prior
         )
         alert.repeat_count = delivery.repeat_count
-        await self._deliver(delivery)
+        important = self.load_config().important
+        high = rule.id in important.high_priority_rule_ids
+        await self._deliver(
+            delivery,
+            priority=1 if high else None,
+            sound="pushover" if high else None,
+        )
         self.store.append_alert(alert)
         self.store.mark_fired(state, key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, alert.message)
+        important_symbols = [quote.symbol]
         if _sorts_ths_by_peak_fade(rule):
-            self._add_to_tonghuashun(rule, self._halt_or_day_pool_symbols(rule))
+            self._add_to_tonghuashun(
+                rule,
+                self._halt_or_day_pool_symbols(rule),
+                board=False,
+                important_symbols=important_symbols,
+            )
         elif _is_ah_touch_board_rule(rule):
-            self._add_to_tonghuashun(rule, self._ah_touch_pool_symbols(rule))
+            self._add_to_tonghuashun(
+                rule,
+                self._ah_touch_pool_symbols(rule),
+                board=False,
+                important_symbols=important_symbols,
+            )
         else:
-            self._add_to_tonghuashun(rule, [quote])
+            self._add_to_tonghuashun(
+                rule, [quote], board=False, important_symbols=important_symbols
+            )
         return alert
 
     def _ths_active_session(self) -> str | None:
@@ -2951,6 +3215,7 @@ class MonitorEngine:
         """Create/remove rule groups once; clear only the current session's groups on a new day."""
         if not self.ths.configured:
             return
+        self.ths.set_important_group(config.important.ths_group)
         day = now_et().date().isoformat()
         names = [rule.name for rule in config.rules if rule.enabled and rule.name]
         session = self._ths_active_session()
@@ -2989,27 +3254,48 @@ class MonitorEngine:
                         )
                     if watchlist_cleared:
                         logger.info(
-                            "同花顺 我的自选 cleared previous session: %s",
+                            "同花顺 summary watchlists cleared previous session: %s",
                             ", ".join(watchlist_cleared),
                         )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 group sync failed: %s", exc)
                 await self._note_problem(f"Tonghuashun add failed: {exc}")
 
-    def _add_to_tonghuashun(self, rule: Rule, quotes: list[Quote] | list[str]) -> None:
+    def _add_to_tonghuashun(
+        self,
+        rule: Rule,
+        quotes: list[Quote] | list[str],
+        *,
+        board: bool = False,
+        important_symbols: list[str] | None = None,
+    ) -> None:
         if not self.ths.configured:
             return
-        task = asyncio.create_task(self._tonghuashun_sync(rule, quotes))
+        task = asyncio.create_task(
+            self._tonghuashun_sync(
+                rule, quotes, board=board, important_symbols=important_symbols
+            )
+        )
         self._ths_tasks.add(task)
         task.add_done_callback(self._ths_tasks.discard)
 
-    async def _tonghuashun_sync(self, rule: Rule, quotes: list[Quote] | list[str]) -> None:
+    async def _tonghuashun_sync(
+        self,
+        rule: Rule,
+        quotes: list[Quote] | list[str],
+        *,
+        board: bool = False,
+        important_symbols: list[str] | None = None,
+    ) -> None:
         group = rule.name
         day = now_et().date().isoformat()
         session = rule.group or rule.condition_session or self._ths_active_session() or "盘中"
         symbols = [
             item.symbol if isinstance(item, Quote) else str(item).upper() for item in quotes
         ]
+        important = self.load_config().important
+        self.ths.set_important_group(important.ths_group)
+        want_important = _wants_important_watchlist(important, rule, board=board)
         async with self._ths_lock:
             try:
                 members = await self.ths.members(group, day, symbols, session)
@@ -3040,6 +3326,14 @@ class MonitorEngine:
                         reverse=True,
                     )
                 await self.ths.arrange(group, ordered)
+                if want_important:
+                    target = [
+                        symbol.strip().upper()
+                        for symbol in (important_symbols if important_symbols is not None else symbols)
+                        if symbol and str(symbol).strip()
+                    ]
+                    if target:
+                        await self.ths.add_important(target, session)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 update failed for %s: %s", group, exc)
                 await self._note_problem(f"Tonghuashun add failed: {exc}")
@@ -3138,7 +3432,13 @@ class MonitorEngine:
         logger.info("Sent test alert for %s at %s", symbol, quote.price)
         return alert
 
-    async def _deliver(self, alert: Alert) -> None:
+    async def _deliver(
+        self,
+        alert: Alert,
+        *,
+        priority: int | None = None,
+        sound: str | None = None,
+    ) -> None:
         errors: list[str] = []
         slack_url = self.routes.slack_url(alert.notify)
         if slack_url:
@@ -3151,7 +3451,9 @@ class MonitorEngine:
         token = self.routes.pushover_token(alert.notify)
         if self.pushover is not None and token and self.settings.pushover_user:
             try:
-                await self.pushover.send_alert(alert, token=token)
+                await self.pushover.send_alert(
+                    alert, token=token, priority=priority, sound=sound
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Pushover send failed for %s: %s", alert.rule_id, exc)
                 errors.append(f"Pushover send failed: {exc}")

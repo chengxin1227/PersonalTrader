@@ -125,6 +125,74 @@ class Rule(BaseModel):
         return cleaned
 
 
+class ImportantWatchlistConfig(BaseModel):
+    """Which alerted rules also land in the important 同花顺 group (我的自选)."""
+
+    always: list[str] = Field(default_factory=list)
+    event: list[str] = Field(default_factory=list)
+    afterhours_open_minutes: int = Field(default=15, ge=1)
+    afterhours_open: list[str] = Field(default_factory=list)
+    reminder_sync: list[str] = Field(default_factory=list)
+
+
+class ImportantWatchedSymbolsConfig(BaseModel):
+    """Named tickers polled each open session; alert when session gain clears the floor."""
+
+    min_change: float = 10
+    cooldown_minutes: int = Field(default=240, ge=0)
+    notify: str = "Important-reminder"
+    symbols: list[str] = Field(default_factory=list)
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_symbols(cls, symbols: list[str]) -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for symbol in symbols:
+            cleaned = symbol.strip().upper()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                ordered.append(cleaned)
+        return ordered
+
+
+class ImportantReminderConfig(BaseModel):
+    key: str
+    at: str
+    label: str
+    rule_ids: list[str] = Field(default_factory=list)
+    sync_watchlist: bool = False
+
+    @field_validator("key", "label")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("cannot be empty")
+        return cleaned
+
+    @field_validator("at")
+    @classmethod
+    def parse_clock(cls, value: str) -> str:
+        text = value.strip()
+        hour_s, _, minute_s = text.partition(":")
+        hour = int(hour_s)
+        minute = int(minute_s)
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            raise ValueError(f"invalid reminder time: {value}")
+        return f"{hour:02d}:{minute:02d}"
+
+
+class ImportantConfig(BaseModel):
+    ths_group: str = "我的自选"
+    high_priority_rule_ids: list[str] = Field(default_factory=list)
+    watchlist: ImportantWatchlistConfig = Field(default_factory=ImportantWatchlistConfig)
+    watched_symbols: ImportantWatchedSymbolsConfig = Field(
+        default_factory=ImportantWatchedSymbolsConfig
+    )
+    reminders: list[ImportantReminderConfig] = Field(default_factory=list)
+
+
 class RulesConfig(BaseModel):
     poll_interval_seconds: int = Field(default=1, ge=1)
     scanner_interval_seconds: int = Field(default=1, ge=1)
@@ -134,6 +202,7 @@ class RulesConfig(BaseModel):
     scanner_feed: str = "iex"
     stream_all_trades: bool = False
     watchlist: list[str] = Field(default_factory=list)
+    important: ImportantConfig = Field(default_factory=ImportantConfig)
     rules: list[Rule] = Field(default_factory=list)
 
     @field_validator("rules", mode="before")

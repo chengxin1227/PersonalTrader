@@ -66,6 +66,9 @@ def test_afterhours_stable_window_is_the_first_five_minutes():
 
 
 def test_check_reminders_fire_once_inside_a_three_minute_window():
+    from monitor.session import CheckReminder, afterhours_open_window
+    from datetime import time
+
     assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 15, 44, tzinfo=ET))] == []
     close = due_check_reminders(datetime(2026, 10, 15, 15, 45, tzinfo=ET))
     assert [item.key for item in close] == ["regular-close-15"]
@@ -73,23 +76,49 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
     assert due_check_reminders(datetime(2026, 10, 15, 15, 47, 59, tzinfo=ET))
     assert due_check_reminders(datetime(2026, 10, 15, 15, 48, tzinfo=ET)) == []
 
-    assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 16, 5, tzinfo=ET))] == [
-        "afterhours-min-5"
+    # Built-in list no longer includes the deleted day30 / 18:30 entries.
+    assert due_check_reminders(datetime(2026, 10, 15, 16, 5, tzinfo=ET)) == []
+    assert due_check_reminders(datetime(2026, 10, 15, 18, 30, tzinfo=ET)) == []
+
+    extra = [
+        CheckReminder(
+            "afterhours-2h30",
+            time(18, 30),
+            ("afterhours-top5", "afterhours-halt-or-day80"),
+            "盘后2.5小时",
+        ),
+        CheckReminder(
+            "afterhours-3h",
+            time(19, 0),
+            ("afterhours-top5", "afterhours-halt-or-day80"),
+            "盘后3小时",
+        ),
     ]
-    assert due_check_reminders(datetime(2026, 10, 15, 16, 4, 59, tzinfo=ET)) == []
-    assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 18, 30, tzinfo=ET))] == [
-        "afterhours-2h30"
-    ]
+    mid = due_check_reminders(datetime(2026, 10, 15, 18, 30, tzinfo=ET), extra=extra)
+    assert [item.key for item in mid] == ["afterhours-2h30"]
+    assert mid[0].rule_ids == ("afterhours-top5", "afterhours-halt-or-day80")
+    assert [
+        item.key for item in due_check_reminders(datetime(2026, 10, 15, 19, 0, tzinfo=ET), extra=extra)
+    ] == ["afterhours-3h"]
+
     assert [item.rule_ids for item in due_check_reminders(datetime(2026, 10, 15, 9, 15, tzinfo=ET))] == [
         ("premarket-sudden-10",)
     ]
     assert due_check_reminders(datetime(2026, 10, 17, 15, 45, tzinfo=ET)) == []  # Saturday
 
+    assert afterhours_open_window(datetime(2026, 10, 15, 16, 0, tzinfo=ET), minutes=15)
+    assert afterhours_open_window(datetime(2026, 10, 15, 16, 14, 59, tzinfo=ET), minutes=15)
+    assert not afterhours_open_window(datetime(2026, 10, 15, 16, 15, tzinfo=ET), minutes=15)
+    assert not afterhours_open_window(datetime(2026, 10, 15, 15, 59, tzinfo=ET), minutes=15)
+
 
 def test_check_reminder_text_names_the_lists_to_review():
     assert (
-        check_reminder_text("盘后2.5小时", ["盘后涨超50%的股票", "盘中熔断或涨超80%的股票"])
-        == "盘后2.5小时，请检查盘后涨超50%的股票和盘中熔断或涨超80%的股票"
+        check_reminder_text(
+            "盘后2.5小时",
+            ["盘后涨幅前5", "盘后涨超50%的股票", "盘中熔断或涨超80%的股票"],
+        )
+        == "盘后2.5小时，请检查盘后涨幅前5和盘后涨超50%的股票和盘中熔断或涨超80%的股票"
     )
 
 

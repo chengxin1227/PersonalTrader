@@ -116,7 +116,14 @@ class PushoverClient:
         if self._owns_client:
             await self._client.aclose()
 
-    async def send_alert(self, alert: Alert, token: str | None = None) -> None:
+    async def send_alert(
+        self,
+        alert: Alert,
+        token: str | None = None,
+        *,
+        priority: int | None = None,
+        sound: str | None = None,
+    ) -> None:
         count = alert.repeat_count or 1
         head = f"{alert.symbol}(#{count})" if count >= 2 else alert.symbol
         parts = [head]
@@ -126,7 +133,12 @@ class PushoverClient:
             parts.append(format_price(alert.price))
         title = "  ".join(parts)
         await self.send_text(
-            html_message(alert.message, alert.url), title=title, html=True, token=token
+            html_message(alert.message, alert.url),
+            title=title,
+            html=True,
+            token=token,
+            priority=priority,
+            sound=sound,
         )
 
     async def send_digest(

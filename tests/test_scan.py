@@ -354,7 +354,7 @@ def test_peak_fade_score_ranks_bigger_givebacks_first():
 
 def test_afterhours_ah50_singles_need_volume_after_the_open():
     rule = Rule(
-        id="afterhours-top5-ah50",
+        id="afterhours-ah50",
         name="盘后涨超50%的股票",
         symbol="*",
         condition=Condition(
@@ -362,8 +362,6 @@ def test_afterhours_ah50_singles_need_volume_after_the_open():
             value=50,
             max_market_cap=500_000_000,
             min_volume=100_000,
-            top_n=5,
-            min_afterhours_touch=50,
         ),
         slack_message="{stock_name}{field_gap}{move_text}{price_text}",
     )

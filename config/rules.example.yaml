@@ -19,6 +19,48 @@ stream_all_trades: false
 
 watchlist: []
 
+# Important watchlist policy (not a scanner rule). All alerts still go to 今日自选;
+# only the configured subset also goes to ths_group (我的自选).
+important:
+  ths_group: 我的自选
+  high_priority_rule_ids:
+    - afterhours-5d50-ah5
+    - afterhours-5d100-ah0
+    - afterhours-halt-or-day80
+    - afterhours-sudden-10
+  watchlist:
+    always:
+      - afterhours-sudden-10
+    event:
+      - afterhours-halt-or-day80
+    afterhours_open_minutes: 15
+    afterhours_open:
+      - afterhours-5d50-ah5
+      - afterhours-5d100-ah0
+    reminder_sync:
+      - afterhours-top5
+      - afterhours-halt-or-day80
+  watched_symbols:
+    min_change: 10
+    cooldown_minutes: 240
+    notify: Important-reminder
+    symbols: []
+  reminders:
+    - key: afterhours-2h30
+      at: "18:30"
+      label: 盘后2.5小时
+      rule_ids:
+        - afterhours-top5
+        - afterhours-halt-or-day80
+      sync_watchlist: true
+    - key: afterhours-3h
+      at: "19:00"
+      label: 盘后3小时
+      rule_ids:
+        - afterhours-top5
+        - afterhours-halt-or-day80
+      sync_watchlist: true
+
 # Rules sit under afterhours, premarket, or regular. The section is the rule's session and must match the condition.
 # name is the short name and the 同花顺 group.
 # description is under single-stock alerts; board_description is under top-N digests.
@@ -78,6 +120,23 @@ rules:
         min_volume: 10000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
+    - id: afterhours-5d100-ah0
+      name: 5日曾涨超100%盘后超0%的股票
+      description: 过去5天有一天涨幅超100%，盘后涨幅超0%，总市值不超过10亿美元，成交量超过1万
+      label: 5-day after-hours 100%
+      notify: 5-day-afterhours-100
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 240
+      condition:
+        type: afterhours_gain
+        value: 0
+        min_recent_day_change: 100
+        recent_day_count: 5
+        max_market_cap: 1000000000
+        min_volume: 10000
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
     - id: afterhours-30-newhigh
       name: 盘后涨超30%后再创新高的股票
       description: 盘后涨幅超过30%，15分钟后任意时刻涨幅超过此前最高涨幅，总市值不超过10亿美元，成交量超过10万
@@ -114,12 +173,27 @@ rules:
         min_volume: 100000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
-    - id: afterhours-top5-ah50
+    - id: afterhours-top5
+      name: 盘后涨幅前5
+      board_description: 半点按盘后涨幅取前5，成交量超过10万（16:00开盘除外），总市值不超过10亿美元
+      label: After-hours top 5
+      notify: Afterhours-top5
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 240
+      condition:
+        type: afterhours_gain
+        value: 0
+        max_market_cap: 1000000000
+        min_volume: 100000
+        top_n: 5
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: afterhours-ah50
       name: 盘后涨超50%的股票
       description: 盘后首次涨超50%，成交量超过10万（16:00开盘除外），总市值不超过10亿美元
-      board_description: 盘后曾涨超50%，半点按盘后涨幅取前5，成交量超过10万（16:00开盘除外），总市值不超过10亿美元
       label: After-hours 50%
-      notify: Top-5-afterhours-boost
+      notify: Afterhours-ah50
       symbol: "*"
       enabled: true
       cooldown_minutes: 240
@@ -128,8 +202,6 @@ rules:
         value: 50
         max_market_cap: 1000000000
         min_volume: 100000
-        top_n: 5
-        min_afterhours_touch: 50
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
     - id: afterhours-halt-or-day80

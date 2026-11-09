@@ -334,11 +334,28 @@ def test_message_uses_the_other_session_change():
 
 
 def test_leaderboard_line_keeps_ticker_unless_company_requested():
+    from monitor.rules import fade_leaderboard_line, peak_leaderboard_line
+
     quote = _quote(price=1.12, prev_close=1.0)
     quote.company = "Acme"
     quote.change_pct = 18.4
     assert leaderboard_line(quote) == f"ABCD{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
     assert leaderboard_line(quote, company=True) == f"Acme{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
+    quote.session_high_pct = 45.2
+    assert peak_leaderboard_line(quote) == (
+        f"ABCD{FIELD_GAP}峰值+45.2%{FIELD_GAP}现+18.4%{FIELD_GAP}$1.12"
+    )
+    assert peak_leaderboard_line(quote, company=True) == (
+        f"Acme{FIELD_GAP}峰值+45.2%{FIELD_GAP}现+18.4%{FIELD_GAP}$1.12"
+    )
+    quote.change_pct = 40.0
+    quote.session_high_pct = 70.0
+    assert fade_leaderboard_line(quote) == (
+        f"ABCD{FIELD_GAP}+40.0%{FIELD_GAP}峰值70%回落30pp{FIELD_GAP}$1.12"
+    )
+    assert fade_leaderboard_line(quote, company=True) == (
+        f"Acme{FIELD_GAP}+40.0%{FIELD_GAP}峰值70%回落30pp{FIELD_GAP}$1.12"
+    )
 
 
 def test_peak_fade_score_ranks_bigger_givebacks_first():
@@ -352,21 +369,45 @@ def test_peak_fade_score_ranks_bigger_givebacks_first():
     assert sorted(names, key=lambda s: scores[s], reverse=True) == ["FADE", "MID", "KEEP"]
 
 
+def test_ah50_matches_sort_by_fade_descending():
+    from monitor.engine import peak_fade_score
+
+    quotes = [
+        _quote(symbol="SMALL", price=1.5, prev_close=1.0, volume=100_001),
+        _quote(symbol="BIG", price=1.4, prev_close=1.0, volume=100_001),
+        _quote(symbol="MID", price=1.45, prev_close=1.0, volume=100_001),
+    ]
+    quotes[0].change_pct = 50.0
+    quotes[0].session_high_pct = 60.0  # fade 10
+    quotes[1].change_pct = 40.0
+    quotes[1].session_high_pct = 80.0  # fade 40
+    quotes[2].change_pct = 45.0
+    quotes[2].session_high_pct = 70.0  # fade 25
+    ordered = sorted(
+        quotes,
+        key=lambda quote: peak_fade_score(quote.session_high_pct, quote.change_pct),
+        reverse=True,
+    )
+    assert [quote.symbol for quote in ordered] == ["BIG", "MID", "SMALL"]
+
+
 def test_afterhours_ah50_singles_need_volume_after_the_open():
     rule = Rule(
         id="afterhours-ah50",
-        name="盘后涨超50%的股票",
+        name="盘后冲高回落的股票",
         symbol="*",
         condition=Condition(
             type=ConditionType.AFTERHOURS_GAIN,
             value=50,
+            min_fade_from_high=20,
             max_market_cap=500_000_000,
             min_volume=100_000,
         ),
         slack_message="{stock_name}{field_gap}{move_text}{price_text}",
     )
     quote = _quote(price=1.12, prev_close=1.0, volume=100_001)
-    quote.change_pct = 51.0
+    quote.change_pct = 52.0
+    quote.session_high_pct = 75.0
     assert evaluate_afterhours_scan(
         rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
     ).matched
@@ -374,10 +415,97 @@ def test_afterhours_ah50_singles_need_volume_after_the_open():
     assert not evaluate_afterhours_scan(
         rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
     ).matched
-    quote.volume = 100_001
-    quote.change_pct = 49.9
+
+
+def test_afterhours_ah50_peak_fade_thresholds():
+    from monitor.rules import evaluate_regular_peak_fade
+
+    afterhours = Rule(
+        id="afterhours-ah50",
+        name="盘后冲高回落的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.AFTERHOURS_GAIN,
+            value=50,
+            min_fade_from_high=20,
+            max_market_cap=500_000_000,
+            min_volume=100_000,
+        ),
+        slack_message="{stock_name}{field_gap}{move_text}{price_text}",
+    )
+    premarket = Rule(
+        id="premarket-ah50",
+        name="盘前冲高回落的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.PREMARKET_GAIN,
+            value=50,
+            min_fade_from_high=20,
+            max_market_cap=500_000_000,
+            min_volume=100_000,
+        ),
+        slack_message="{stock_name}{field_gap}{move_text}{price_text}",
+    )
+    regular = Rule(
+        id="regular-ah50",
+        name="盘中冲高回落的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.REGULAR_GAIN,
+            value=50,
+            min_fade_from_high=20,
+            max_market_cap=500_000_000,
+            min_volume=100_000,
+        ),
+        slack_message="{stock_name}{field_gap}{move_text}{price_text}",
+    )
+    quote = _quote(price=1.5, prev_close=1.0, volume=100_001)
+    # peak 70 / current 50 → fade 20 → hit
+    quote.change_pct = 50.0
+    quote.session_high_pct = 70.0
+    assert evaluate_afterhours_scan(
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
+    assert evaluate_regular_peak_fade(
+        regular, quote, market_cap=None, cap_filtered=True
+    ).matched
+    # peak 65 / current 50 → fade 15 → miss
+    quote.session_high_pct = 65.0
     assert not evaluate_afterhours_scan(
-        rule, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert not evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
+    assert not evaluate_regular_peak_fade(
+        regular, quote, market_cap=None, cap_filtered=True
+    ).matched
+    # peak 65 / current 40 → fade 25 → hit even below 50%
+    quote.change_pct = 40.0
+    quote.session_high_pct = 65.0
+    assert evaluate_afterhours_scan(
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
+    assert evaluate_regular_peak_fade(
+        regular, quote, market_cap=None, cap_filtered=True
+    ).matched
+    # peak never cleared 50 → miss
+    quote.change_pct = 30.0
+    quote.session_high_pct = 49.0
+    assert not evaluate_afterhours_scan(
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert not evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
+    assert not evaluate_regular_peak_fade(
+        regular, quote, market_cap=None, cap_filtered=True
     ).matched
 
 
@@ -591,4 +719,74 @@ def test_recent_day_spike_requires_session_gain_volume_and_a_prior_day():
     ).matched
     assert not evaluate_premarket_scan(
         premarket, quote, market_cap=100_000_001, in_premarket=True
+    ).matched
+
+
+def test_day_gain_tiers_or_across_50_and_100():
+    from monitor.models import DayGainTier
+
+    tiers = [
+        DayGainTier(min_recent_day_change=50, value=5),
+        DayGainTier(min_recent_day_change=100, value=0),
+    ]
+    afterhours = Rule(
+        id="afterhours-5d-boost",
+        name="merged",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.AFTERHOURS_GAIN,
+            value=0,
+            max_market_cap=1_000_000_000,
+            min_volume=10_000,
+            day_gain_tiers=tiers,
+            recent_day_count=5,
+        ),
+    )
+    premarket = Rule(
+        id="premarket-5d-boost",
+        name="merged",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.PREMARKET_GAIN,
+            value=0,
+            max_market_cap=1_000_000_000,
+            min_volume=10_000,
+            day_gain_tiers=tiers,
+            recent_day_count=5,
+        ),
+    )
+    quote = _quote(volume=10_001)
+    # 50% day + session 5.1% → hit
+    quote.change_pct = 5.1
+    quote.recent_day_gain_floors = [50.0]
+    assert evaluate_afterhours_scan(
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
+    # 50% day + session 2% → miss
+    quote.change_pct = 2.0
+    assert not evaluate_afterhours_scan(
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert not evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
+    # 100% day + session 0.1% → hit
+    quote.change_pct = 0.1
+    quote.recent_day_gain_floors = [100.0]
+    assert evaluate_afterhours_scan(
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
+    # 100% day + session 0% → miss
+    quote.change_pct = 0.0
+    assert not evaluate_afterhours_scan(
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert not evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
     ).matched

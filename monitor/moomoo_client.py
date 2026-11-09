@@ -321,16 +321,29 @@ def quote_from_premarket(row: dict[str, Any]) -> Quote | None:
         return None
     volume = _float(row.get("pre_volume"))
     after_price = _float(row.get("after_price"))
+    pre_high = _float(row.get("pre_high_price"))
+    band = after_hours_range_pct(
+        price,
+        change,
+        pre_high,
+        _float(row.get("pre_low_price")),
+    )
+    low_pct = high_pct = None
+    if band is not None:
+        low_pct, high_pct = band
     return Quote(
         symbol=symbol,
         company=name or None,
         price=price,
         change_pct=change,
         premarket_price=price,
+        premarket_high=pre_high if pre_high and pre_high > 0 else None,
         premarket_change_pct=change,
         after_hours_price=after_price if after_price and after_price > 0 else None,
         after_hours_change_pct=_float(row.get("after_change_rate")),
         volume=int(volume) if volume is not None else None,
+        session_low_pct=low_pct,
+        session_high_pct=high_pct,
     )
 
 
@@ -441,6 +454,57 @@ def afterhours_leaders(
         reverse=True,
     )
     return ready[:limit]
+
+
+def observed_session_peak(quote: Quote) -> float | None:
+    """Best session gain seen on this quote: live change or session high."""
+    peak = quote.change_pct
+    if quote.session_high_pct is not None:
+        peak = (
+            quote.session_high_pct
+            if peak is None
+            else max(peak, quote.session_high_pct)
+        )
+    return peak
+
+
+def observed_afterhours_peak(quote: Quote) -> float | None:
+    """Alias for after-hours peak boards."""
+    return observed_session_peak(quote)
+
+
+def peak_leaders(
+    quotes: list[Quote],
+    peaks: dict[str, float],
+    limit: int,
+    min_volume: int | None = None,
+) -> list[Quote]:
+    """Rank by session peak gain (stored or observed), highest first."""
+    ready: list[tuple[float, Quote]] = []
+    for quote in quotes:
+        if quote.price is None or quote.price <= 0:
+            continue
+        if min_volume is not None and (quote.volume is None or quote.volume <= min_volume):
+            continue
+        observed = observed_session_peak(quote)
+        stored = peaks.get(quote.symbol.upper())
+        candidates = [value for value in (observed, stored) if value is not None]
+        if not candidates:
+            continue
+        peak = max(candidates)
+        ready.append((peak, quote.model_copy(update={"session_high_pct": peak})))
+    ready.sort(key=lambda item: item[0], reverse=True)
+    return [quote for _peak, quote in ready[:limit]]
+
+
+def afterhours_peak_leaders(
+    quotes: list[Quote],
+    peaks: dict[str, float],
+    limit: int,
+    min_volume: int | None = None,
+) -> list[Quote]:
+    """Alias for after-hours peak boards."""
+    return peak_leaders(quotes, peaks, limit, min_volume)
 
 
 def afterhours_touch_session(minimum: float) -> str:

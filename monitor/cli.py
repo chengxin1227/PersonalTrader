@@ -186,9 +186,14 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                                 f"; {pool_entry}also alert each name once AH > "
                                 f"{rule.condition.value:g}%"
                             )
+                        session = {
+                            "afterhours_gain": "after-hours",
+                            "premarket_gain": "premarket",
+                            "regular_gain": "regular-session",
+                        }.get(rule.condition.type.value, "session")
                         print(
                             f"    - {rule.name}: top {rule.condition.top_n} "
-                            f"after-hours names{pool} every 30m{singles}, "
+                            f"{session} peak names{pool} every 30m{singles}, "
                             f"total cap <= ${cap:,.0f}{volume}"
                         )
                         continue
@@ -305,6 +310,13 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             f" and gain > {rule.condition.min_prior_change:g}% "
                             f"before the last {rule.condition.prior_change_lag_minutes}m"
                         )
+                    fade_text = ""
+                    if rule.condition.min_fade_from_high is not None:
+                        fade_text = (
+                            f"peak once >= {rule.condition.value:g}% then fade "
+                            f">= {rule.condition.min_fade_from_high:g}pp; "
+                            f"also refresh that list every 30m sorted by fade"
+                        )
                     if rule.condition.require_uptrend:
                         volume += " and regular-session trend up"
                     if (
@@ -344,6 +356,13 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                                     f"{closing_volume} in the last "
                                     f"{rule.condition.recent_day_count} sessions"
                                 )
+                        if rule.condition.day_gain_tiers:
+                            parts = [
+                                f"day>{tier.min_recent_day_change:g}% & "
+                                f"session>{tier.value:g}%"
+                                for tier in rule.condition.day_gain_tiers
+                            ]
+                            volume += " and (" + " or ".join(parts) + ")"
                     if rule.condition.skip_market_cap or (
                         rule.condition.max_market_cap is None
                         and rule.condition.require_circuit_breaker
@@ -356,12 +375,23 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                         ">"
                         if rule.condition.min_regular_change is not None
                         or rule.condition.min_recent_day_change is not None
+                        or rule.condition.day_gain_tiers
                         else ">="
                     )
-                    print(
-                        f"    - {rule.name}: scan {rule.condition.type.value} "
-                        f"{comparator}{rule.condition.value:g}% and {cap_text}{volume}"
-                    )
+                    if fade_text:
+                        print(
+                            f"    - {rule.name}: {fade_text} and {cap_text}{volume}"
+                        )
+                    elif rule.condition.day_gain_tiers:
+                        print(
+                            f"    - {rule.name}: scan {rule.condition.type.value} "
+                            f"tiered day/session gains and {cap_text}{volume}"
+                        )
+                    else:
+                        print(
+                            f"    - {rule.name}: scan {rule.condition.type.value} "
+                            f"{comparator}{rule.condition.value:g}% and {cap_text}{volume}"
+                        )
                 else:
                     print(
                         f"    - {rule.name}: {rule.symbol} {rule.condition.type.value} "

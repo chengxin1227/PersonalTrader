@@ -26,10 +26,55 @@ _API_AGENT = "hevo"
 _GROUP_AGENT = "Hexin_Gphone/11.28.03 (Royal Flush) okhttp/3.14.9"
 _SESSION_SECONDS = 12 * 60 * 60
 # Custom groups (not the default 自选股 list).
-_DAILY_WATCHLIST_GROUP = "今日自选"  # every alerted name
-_DEFAULT_IMPORTANT_GROUP = "我的自选"  # important subset only
-# When a session opens, summary groups drop names tagged with the previous session.
-_PREVIOUS_SESSION = {"盘前": "盘后", "盘中": "盘前", "盘后": "盘中"}
+# Alerted names land in the matching session group; important subset also in 我的自选.
+_SESSION_WATCHLIST_GROUP = {
+    "盘前": "盘前分组",
+    "盘中": "盘中分组",
+    "盘后": "盘后分组",
+}
+_SESSION_WATCHLIST_GROUPS = tuple(_SESSION_WATCHLIST_GROUP.values())
+# 我的自选: when the next session starts, drop names tagged for the previous one.
+_PREVIOUS_WATCHLIST_SESSION = {
+    "盘前": "盘后",
+    "盘中": "盘前",
+    "盘后": "盘中",
+}
+_DEFAULT_IMPORTANT_GROUP = "我的自选"
+
+
+def _session_watchlist_group(session: str) -> str:
+    """Map 盘前/盘中/盘后 → 盘前分组/盘中分组/盘后分组."""
+    cleaned = (session or "").strip()
+    return _SESSION_WATCHLIST_GROUP.get(cleaned, _SESSION_WATCHLIST_GROUP["盘中"])
+
+
+def previous_watchlist_session(session: str) -> str | None:
+    """Session whose 我的自选 tags should clear when ``session`` begins."""
+    return _PREVIOUS_WATCHLIST_SESSION.get((session or "").strip())
+
+
+def summary_group_order(
+    existing: list[str], symbols: list[str], *, bump: bool
+) -> list[str]:
+    """Order for 盘x分组 / 我的自选 after adding ``symbols``.
+
+    ``bump=True``: move ``symbols`` (deduped) to the top, keep the rest in place.
+    ``bump=False``: append only names that are not already present; do not reorder.
+    """
+    leading: list[str] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        key = symbol.strip().upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        leading.append(key)
+    if bump:
+        rest = [code for code in existing if code not in seen]
+        return leading + rest
+    existing_set = set(existing)
+    new_only = [code for code in leading if code not in existing_set]
+    return list(existing) + new_only
 
 
 class TonghuashunError(RuntimeError):
@@ -75,7 +120,7 @@ def _encrypt(pubkey: str, value: str) -> str:
 
 
 class TonghuashunClient:
-    """Adds alerted names to a rule group, 今日自选, and optionally 我的自选."""
+    """Adds alerted names to a rule group, 盘前/盘中/盘后分组, and optionally 我的自选."""
 
     def __init__(self, settings: Settings) -> None:
         self._username = settings.ths_username
@@ -307,8 +352,13 @@ class TonghuashunClient:
         session: str,
         *,
         important: bool,
+        bump: bool = True,
     ) -> None:
-        """Keep alerted names in a custom summary group (今日自选 / 我的自选)."""
+        """Keep alerted names in 盘前/盘中/盘后分组 or 我的自选.
+
+        With ``bump=True`` (default), alerted names — including repeats — move to the top.
+        With ``bump=False``, only append names that are missing; leave order alone.
+        """
         if not symbols:
             return
         group_id, rows = self._group(http, group_name)
@@ -316,19 +366,31 @@ class TonghuashunClient:
         for code, market in rows:
             known.setdefault(code.upper(), market)
         existing = [code.upper() for code, _ in rows]
-        fresh = [symbol for symbol in symbols if symbol not in existing]
-        tags = self._session_tags(important=important)
+        leading: list[str] = []
+        seen: set[str] = set()
         for symbol in symbols:
+            key = symbol.strip().upper()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            leading.append(key)
+        if not leading:
+            return
+        tags = self._session_tags(important=important)
+        for symbol in leading:
             tags[symbol] = session
         self._save_session_tags(important=important)
-        if not fresh:
+        ordered = summary_group_order(existing, leading, bump=bump)
+        if ordered == existing:
             return
-        for symbol in fresh:
-            self._market(http, symbol)
-        ordered = fresh + existing
+        for symbol in ordered:
+            if symbol not in known:
+                self._market(http, symbol)
         self._write(http, "/content/v1/delete", group_id, rows)
         self._write(http, "/content/v1/add", group_id, [(code, known[code]) for code in ordered])
-        logger.info("同花顺 %s: %s", group_name, ", ".join(fresh))
+        shown = leading if bump else [code for code in leading if code not in set(existing)]
+        if shown:
+            logger.info("同花顺 %s: %s", group_name, ", ".join(shown))
 
     def _clear_summary_session_sync(self, session: str, group_name: str, *, important: bool) -> list[str]:
         """Remove summary-group names that were added in ``session`` (previous period)."""
@@ -452,9 +514,9 @@ class TonghuashunClient:
         )
 
     def _sync_groups_sync(self, keep_names: list[str]) -> dict[str, list[str]]:
-        """Ensure rule groups + 今日自选 + 我的自选 exist. Never delete user-created groups."""
+        """Ensure rule groups + 盘前/盘中/盘后分组 + 我的自选 exist. Never delete user-created groups."""
         keep = {
-            _DAILY_WATCHLIST_GROUP,
+            *_SESSION_WATCHLIST_GROUPS,
             self._important_group,
             *(name.strip() for name in keep_names if name.strip()),
         }
@@ -487,24 +549,65 @@ class TonghuashunClient:
 
         return self._with_session(work)
 
-    def _members_sync(self, name: str, day: str, symbols: list[str], session: str) -> list[str]:
+    def _members_sync(
+        self,
+        name: str,
+        day: str,
+        symbols: list[str],
+        session: str,
+        bump_symbols: list[str] | None = None,
+        replace: bool = False,
+    ) -> list[str]:
         def work(http: httpx.Client) -> list[str]:
             group_id, rows = self._group(http, name)
             days = self._group_days()
-            if days.get(name) != day:
+            if replace or days.get(name) != day:
                 self._clear_group_rows(http, name, group_id, rows, day)
                 rows = []
             known = self._known_markets()
             for code, market in rows:
                 known.setdefault(code.upper(), market)
-            members = [code.upper() for code, _ in rows]
-            for symbol in symbols:
-                if symbol not in members:
+            if replace:
+                members = []
+                for symbol in symbols:
+                    if not symbol or symbol in members:
+                        continue
                     self._market(http, symbol)
                     members.append(symbol)
-            self._ensure_summary_group(
-                http, _DAILY_WATCHLIST_GROUP, symbols, session, important=False
+            else:
+                members = [code.upper() for code, _ in rows]
+                for symbol in symbols:
+                    if symbol not in members:
+                        self._market(http, symbol)
+                        members.append(symbol)
+            session_key = session if session in _SESSION_WATCHLIST_GROUP else "盘中"
+            watch_name = _session_watchlist_group(session_key)
+            pin = (
+                [symbol.strip().upper() for symbol in bump_symbols if symbol.strip()]
+                if bump_symbols is not None
+                else list(symbols)
             )
+            pin_set = {symbol for symbol in pin if symbol}
+            if pin_set:
+                self._ensure_summary_group(
+                    http,
+                    watch_name,
+                    [symbol for symbol in pin if symbol in pin_set],
+                    session_key,
+                    important=False,
+                    bump=True,
+                )
+            # Pool refreshes may add many names; keep them in 盘x分组 without reordering.
+            others = [symbol for symbol in symbols if symbol and symbol not in pin_set]
+            if others:
+                self._ensure_summary_group(
+                    http,
+                    watch_name,
+                    others,
+                    session_key,
+                    important=False,
+                    bump=False,
+                )
             return members
 
         return self._with_session(work)
@@ -515,11 +618,16 @@ class TonghuashunClient:
         fresh = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
         if not fresh:
             return
-        group_name = self._important_group if important else _DAILY_WATCHLIST_GROUP
+        session_key = session.strip()
+        if session_key not in _SESSION_WATCHLIST_GROUP:
+            session_key = "盘中"
+        group_name = (
+            self._important_group if important else _session_watchlist_group(session_key)
+        )
 
         def work(http: httpx.Client) -> None:
             self._ensure_summary_group(
-                http, group_name, fresh, session.strip(), important=important
+                http, group_name, fresh, session_key, important=important
             )
 
         self._with_session(work)
@@ -537,11 +645,36 @@ class TonghuashunClient:
 
         self._with_session(work)
 
-    async def members(self, group: str, day: str, symbols: list[str], session: str) -> list[str]:
-        """Clears the group on a new day, then returns its names plus the new ones."""
+    async def members(
+        self,
+        group: str,
+        day: str,
+        symbols: list[str],
+        session: str,
+        bump_symbols: list[str] | None = None,
+        *,
+        replace: bool = False,
+    ) -> list[str]:
+        """Clears the group on a new day, then returns its names plus the new ones.
+
+        ``bump_symbols`` (default: all ``symbols``) are moved to the top of 盘x分组.
+        Other ``symbols`` are only appended if missing, so pool refreshes do not bury repeats.
+        With ``replace=True``, the group is emptied first and only ``symbols`` remain.
+        """
         fresh = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+        bump = (
+            None
+            if bump_symbols is None
+            else [symbol.strip().upper() for symbol in bump_symbols if symbol.strip()]
+        )
         return await asyncio.to_thread(
-            self._members_sync, group.strip(), day, fresh, session.strip()
+            self._members_sync,
+            group.strip(),
+            day,
+            fresh,
+            session.strip(),
+            bump,
+            replace,
         )
 
     async def arrange(self, group: str, ordered: list[str]) -> None:
@@ -556,44 +689,73 @@ class TonghuashunClient:
         return await asyncio.to_thread(self._clear_day_sync, names, day)
 
     async def add_daily(self, symbols: list[str], session: str) -> None:
-        """Keep names in 今日自选 without touching a rule group."""
+        """Keep names in 盘前/盘中/盘后分组 without touching a rule group."""
         await asyncio.to_thread(self._add_summary_sync, symbols, session, important=False)
 
     async def add_important(self, symbols: list[str], session: str) -> None:
         """Also keep names in the important summary group (我的自选)."""
         await asyncio.to_thread(self._add_summary_sync, symbols, session, important=True)
 
-    async def clear_watchlist_previous_session(self, current_session: str) -> list[str]:
-        """Drop 今日自选 + 我的自选 names tagged with the previous session."""
-        previous = _PREVIOUS_SESSION.get(current_session.strip())
-        if not previous:
-            return []
-        from functools import partial
+    def _clear_session_watchlist_tags(self, session: str) -> None:
+        tags = self._session_tags(important=False)
+        stale = [symbol for symbol, tagged in list(tags.items()) if tagged == session]
+        if not stale:
+            return
+        for symbol in stale:
+            del tags[symbol]
+        self._save_session_tags(important=False)
 
-        daily = await asyncio.to_thread(
-            partial(
-                self._clear_summary_session_sync,
-                previous,
-                _DAILY_WATCHLIST_GROUP,
-                important=False,
-            )
+    def _clear_important_session_day_sync(self, session: str, day: str) -> list[str]:
+        """Drop leftover 我的自选 names tagged with ``session`` once per ET day for that session."""
+        session_key = session.strip()
+        if session_key not in _SESSION_WATCHLIST_GROUP:
+            return []
+        stamp = f"{self._important_group}#{session_key}"
+        days = self._group_days()
+        if days.get(stamp) == day:
+            return []
+        removed = self._clear_summary_session_sync(
+            session_key, self._important_group, important=True
         )
-        important = await asyncio.to_thread(
-            partial(
-                self._clear_summary_session_sync,
-                previous,
-                self._important_group,
-                important=True,
-            )
+        days[stamp] = day
+        self._save_group_days()
+        return removed
+
+    def _clear_important_previous_session_sync(self, session: str) -> list[str]:
+        """When ``session`` starts, drop 我的自选 names tagged for the previous session."""
+        prev = previous_watchlist_session(session)
+        if prev is None:
+            return []
+        return self._clear_summary_session_sync(
+            prev, self._important_group, important=True
         )
-        # Preserve call-site logging: report union of removed symbols.
-        seen: set[str] = set()
-        ordered: list[str] = []
-        for symbol in [*daily, *important]:
-            if symbol not in seen:
-                seen.add(symbol)
-                ordered.append(symbol)
-        return ordered
+
+    def _clear_session_day_sync(
+        self, session: str, day: str, rule_names: list[str]
+    ) -> list[str]:
+        """Clear this session's rule groups + 盘x分组 for the new ET day.
+
+        我的自选: clear the previous session's names when this session starts, and drop
+        any leftover same-session tags from an earlier day.
+        """
+        session_key = session.strip()
+        names = [name.strip() for name in rule_names if name.strip()]
+        watch_name = None
+        if session_key in _SESSION_WATCHLIST_GROUP:
+            watch_name = _session_watchlist_group(session_key)
+            names.append(watch_name)
+        cleared = self._clear_day_sync(names, day)
+        if watch_name and watch_name in cleared:
+            self._clear_session_watchlist_tags(session_key)
+        self._clear_important_previous_session_sync(session_key)
+        self._clear_important_session_day_sync(session_key, day)
+        return cleared
+
+    async def clear_session_day(self, session: str, day: str, rule_names: list[str]) -> list[str]:
+        """Clear this session's rule/盘x groups; 我的自选 drops the previous session."""
+        return await asyncio.to_thread(
+            self._clear_session_day_sync, session, day, rule_names
+        )
 
     def list_sync(self) -> list[tuple[str, str]]:
         return self._with_session(lambda http: self._query(http)[1])

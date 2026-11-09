@@ -4,7 +4,46 @@ from pathlib import Path
 
 import yaml
 
-from monitor.models import ConditionType, Quote, Rule, RuleEvaluation, RulesConfig
+from monitor.models import (
+    ConditionType,
+    DayGainTier,
+    Quote,
+    Rule,
+    RuleEvaluation,
+    RulesConfig,
+)
+
+
+def day_gain_tiers_for(rule: Rule) -> list[DayGainTier]:
+    """OR branches for prior-day + session gain; falls back to a single-tier rule."""
+    if rule.condition.day_gain_tiers:
+        return list(rule.condition.day_gain_tiers)
+    if rule.condition.min_recent_day_change is not None:
+        return [
+            DayGainTier(
+                min_recent_day_change=rule.condition.min_recent_day_change,
+                value=rule.condition.value,
+            )
+        ]
+    return []
+
+
+def matched_day_gain_tier(rule: Rule, quote: Quote) -> DayGainTier | None:
+    """First tier whose prior-day floor and session gain both clear."""
+    tiers = day_gain_tiers_for(rule)
+    if not tiers:
+        return None
+    floors = {float(item) for item in (quote.recent_day_gain_floors or [])}
+    if not floors and quote.recent_day_spike is True and rule.condition.min_recent_day_change is not None:
+        floors.add(float(rule.condition.min_recent_day_change))
+    if quote.change_pct is None:
+        return None
+    for tier in tiers:
+        if tier.min_recent_day_change not in floors:
+            continue
+        if quote.change_pct > tier.value:
+            return tier
+    return None
 
 
 def load_rules(path: Path) -> RulesConfig:
@@ -147,21 +186,42 @@ def evaluate_premarket_scan(
     prior = _reject_without_earlier_spike(rule, quote, "pre-market")
     if prior is not None:
         return prior
+    fade = _reject_without_peak_fade(rule, quote)
+    if fade is not None:
+        return fade
+    day_tiers = day_gain_tiers_for(rule)
+    tiered_day = bool(rule.condition.day_gain_tiers)
     day_min = rule.condition.min_recent_day_change
-    if rule.condition.min_prior_change is None and day_min is None and quote.change_pct < rule.condition.value:
-        return RuleEvaluation(
-            matched=False,
-            reason=f"change {quote.change_pct:.2f}% < {rule.condition.value:.2f}%",
-        )
-    if day_min is not None and quote.change_pct <= rule.condition.value:
-        return RuleEvaluation(
-            matched=False,
-            reason=f"pre-market {quote.change_pct:.2f}% <= {rule.condition.value:.2f}%",
-        )
+    matched_tier = matched_day_gain_tier(rule, quote) if day_tiers else None
+    if rule.condition.min_fade_from_high is None and not tiered_day:
+        if (
+            rule.condition.min_prior_change is None
+            and day_min is None
+            and quote.change_pct < rule.condition.value
+        ):
+            return RuleEvaluation(
+                matched=False,
+                reason=f"change {quote.change_pct:.2f}% < {rule.condition.value:.2f}%",
+            )
+        if day_min is not None and quote.change_pct <= rule.condition.value:
+            return RuleEvaluation(
+                matched=False,
+                reason=f"pre-market {quote.change_pct:.2f}% <= {rule.condition.value:.2f}%",
+            )
     low_volume = _reject_low_volume(rule, quote)
     if low_volume is not None:
         return low_volume
-    if day_min is not None and quote.recent_day_spike is not True:
+    if tiered_day:
+        if matched_tier is None:
+            parts = [
+                f"day>{tier.min_recent_day_change:g}% & PM>{tier.value:g}%"
+                for tier in day_tiers
+            ]
+            return RuleEvaluation(
+                matched=False,
+                reason="no tier matched (" + " or ".join(parts) + ")",
+            )
+    elif day_min is not None and quote.recent_day_spike is not True:
         return RuleEvaluation(
             matched=False,
             reason=(
@@ -169,14 +229,29 @@ def evaluate_premarket_scan(
             ),
         )
     max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
+    if (
+        rule.condition.min_fade_from_high is not None
+        and quote.session_high_pct is not None
+        and quote.change_pct is not None
+    ):
+        peak = quote.session_high_pct
+        fade_pp = peak - quote.change_pct
+        session_text = (
+            f"pre-market peak {peak:.2f}% (≥{rule.condition.value:g}%) "
+            f"faded {fade_pp:.2f}pp to {quote.change_pct:.2f}%"
+        )
+    else:
+        session_text = (
+            f"pre-market {quote.change_pct:.2f}% > {matched_tier.value:g}% "
+            f"(day>{matched_tier.min_recent_day_change:g}%)"
+            if matched_tier is not None
+            else f"pre-market {quote.change_pct:.2f}% >= {rule.condition.value:.2f}%"
+        )
     if market_cap is None:
         if cap_filtered:
             return RuleEvaluation(
                 matched=True,
-                reason=(
-                    f"pre-market {quote.change_pct:.2f}% >= {rule.condition.value:.2f}% "
-                    f"and total cap <= ${max_cap:,.0f}"
-                ),
+                reason=f"{session_text} and total cap <= ${max_cap:,.0f}",
             )
         return RuleEvaluation(matched=False, reason="no total market cap")
     if market_cap > max_cap:
@@ -186,10 +261,99 @@ def evaluate_premarket_scan(
         )
     return RuleEvaluation(
         matched=True,
-        reason=(
-            f"pre-market {quote.change_pct:.2f}% >= {rule.condition.value:.2f}% "
-            f"and total cap ${market_cap:,.0f}"
-        ),
+        reason=f"{session_text} and total cap ${market_cap:,.0f}",
+    )
+
+
+def evaluate_regular_peak_fade(
+    rule: Rule,
+    quote: Quote,
+    *,
+    market_cap: float | None = None,
+    cap_filtered: bool = False,
+) -> RuleEvaluation:
+    """Regular-session peak-fade: once-high >= value and peak − current >= fade pp."""
+    if quote.change_pct is None:
+        return RuleEvaluation(matched=False, reason="no regular change")
+    fade = _reject_without_peak_fade(rule, quote)
+    if fade is not None:
+        return fade
+    low_volume = _reject_low_volume(rule, quote)
+    if low_volume is not None:
+        return low_volume
+    max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
+    peak = quote.session_high_pct
+    fade_pp = (peak - quote.change_pct) if peak is not None else 0.0
+    session_text = (
+        f"regular peak {peak:.2f}% (≥{rule.condition.value:g}%) "
+        f"faded {fade_pp:.2f}pp to {quote.change_pct:.2f}%"
+        if peak is not None
+        else f"regular {quote.change_pct:.2f}%"
+    )
+    if market_cap is None:
+        if cap_filtered:
+            return RuleEvaluation(
+                matched=True,
+                reason=f"{session_text} and total cap <= ${max_cap:,.0f}",
+            )
+        return RuleEvaluation(matched=False, reason="no total market cap")
+    if market_cap > max_cap:
+        return RuleEvaluation(
+            matched=False,
+            reason=f"total cap ${market_cap:,.0f} > ${max_cap:,.0f}",
+        )
+    return RuleEvaluation(
+        matched=True,
+        reason=f"{session_text} and total cap ${market_cap:,.0f}",
+    )
+
+
+def _reject_without_peak_fade(rule: Rule, quote: Quote) -> RuleEvaluation | None:
+    """Peak-fade rules: once-high >= value and peak − current >= min_fade_from_high."""
+    fade_min = rule.condition.min_fade_from_high
+    if fade_min is None:
+        return None
+    peak = quote.session_high_pct
+    if peak is None:
+        return RuleEvaluation(matched=False, reason="no session peak")
+    if peak < rule.condition.value:
+        return RuleEvaluation(
+            matched=False,
+            reason=f"peak {peak:.2f}% < {rule.condition.value:.2f}%",
+        )
+    if quote.change_pct is None:
+        return RuleEvaluation(matched=False, reason="no session change")
+    fade = peak - quote.change_pct
+    if fade < fade_min:
+        return RuleEvaluation(
+            matched=False,
+            reason=f"fade {fade:.2f}pp < {fade_min:g}pp (peak {peak:.2f}% → {quote.change_pct:.2f}%)",
+        )
+    return None
+
+
+def _afterhours_match_reason(
+    rule: Rule,
+    quote: Quote,
+    *,
+    suffix: str = "",
+    tier: DayGainTier | None = None,
+) -> str:
+    fade_min = rule.condition.min_fade_from_high
+    if fade_min is not None and quote.session_high_pct is not None and quote.change_pct is not None:
+        peak = quote.session_high_pct
+        fade = peak - quote.change_pct
+        return (
+            f"after-hours peak {peak:.2f}% (≥{rule.condition.value:g}%) "
+            f"faded {fade:.2f}pp to {quote.change_pct:.2f}%{suffix}"
+        )
+    if tier is not None and quote.change_pct is not None:
+        return (
+            f"after-hours {quote.change_pct:.2f}% > {tier.value:g}% "
+            f"after day gain > {tier.min_recent_day_change:g}%{suffix}"
+        )
+    return (
+        f"after-hours {quote.change_pct:.2f}% >= {rule.condition.value:.2f}%{suffix}"
     )
 
 
@@ -205,23 +369,30 @@ def evaluate_afterhours_scan(
         return RuleEvaluation(matched=False, reason="not after-hours")
     if quote.change_pct is None:
         return RuleEvaluation(matched=False, reason="no after-hours change")
+    fade = _reject_without_peak_fade(rule, quote)
+    if fade is not None:
+        return fade
     prior = _reject_without_earlier_spike(rule, quote, "after-hours")
     if prior is not None:
         return prior
     regular_min = rule.condition.min_regular_change
+    day_tiers = day_gain_tiers_for(rule)
+    tiered_day = bool(rule.condition.day_gain_tiers)
     day_min = rule.condition.min_recent_day_change
-    strict_session = regular_min is not None or day_min is not None
-    if rule.condition.min_prior_change is None and not strict_session:
-        if quote.change_pct < rule.condition.value:
+    matched_tier = matched_day_gain_tier(rule, quote) if day_tiers else None
+    strict_session = regular_min is not None or day_min is not None or tiered_day
+    if rule.condition.min_fade_from_high is None and not tiered_day:
+        if rule.condition.min_prior_change is None and not strict_session:
+            if quote.change_pct < rule.condition.value:
+                return RuleEvaluation(
+                    matched=False,
+                    reason=f"change {quote.change_pct:.2f}% < {rule.condition.value:.2f}%",
+                )
+        elif rule.condition.min_prior_change is None and quote.change_pct <= rule.condition.value:
             return RuleEvaluation(
                 matched=False,
-                reason=f"change {quote.change_pct:.2f}% < {rule.condition.value:.2f}%",
+                reason=f"after-hours {quote.change_pct:.2f}% <= {rule.condition.value:.2f}%",
             )
-    elif rule.condition.min_prior_change is None and quote.change_pct <= rule.condition.value:
-        return RuleEvaluation(
-            matched=False,
-            reason=f"after-hours {quote.change_pct:.2f}% <= {rule.condition.value:.2f}%",
-        )
     if regular_min is not None:
         regular = quote.regular_change_pct
         if regular is None or regular <= regular_min:
@@ -245,9 +416,18 @@ def evaluate_afterhours_scan(
     if rule.condition.require_uptrend and quote.session_uptrend is not True:
         return RuleEvaluation(matched=False, reason="regular session trend is not up")
     wants_breaker = rule.condition.require_circuit_breaker
-    wants_day = day_min is not None
+    wants_day = day_min is not None or tiered_day
     has_breaker = quote.session_circuit_breaker is True
-    has_day = quote.recent_day_spike is True
+    has_day = matched_tier is not None if tiered_day else quote.recent_day_spike is True
+    if tiered_day and matched_tier is None and not wants_breaker:
+        parts = [
+            f"day>{tier.min_recent_day_change:g}% & AH>{tier.value:g}%"
+            for tier in day_tiers
+        ]
+        return RuleEvaluation(
+            matched=False,
+            reason="no tier matched (" + " or ".join(parts) + ")",
+        )
     if wants_breaker and wants_day:
         if not has_breaker and not has_day:
             return RuleEvaluation(
@@ -255,11 +435,22 @@ def evaluate_afterhours_scan(
                 reason=(
                     "no regular-session circuit breaker and no day gain "
                     f"> {day_min:.2f}% in the last {rule.condition.recent_day_count} days"
+                    if day_min is not None
+                    else "no regular-session circuit breaker and no day-gain tier matched"
                 ),
             )
     elif wants_breaker and not has_breaker:
         return RuleEvaluation(matched=False, reason="no regular-session circuit breaker")
     elif wants_day and not has_day:
+        if tiered_day:
+            parts = [
+                f"day>{tier.min_recent_day_change:g}% & AH>{tier.value:g}%"
+                for tier in day_tiers
+            ]
+            return RuleEvaluation(
+                matched=False,
+                reason="no tier matched (" + " or ".join(parts) + ")",
+            )
         return RuleEvaluation(
             matched=False,
             reason=f"no day gain > {day_min:.2f}% in the last {rule.condition.recent_day_count} days",
@@ -277,6 +468,8 @@ def evaluate_afterhours_scan(
                 session = (
                     f" and day gain > {day_min:.2f}% in the last "
                     f"{rule.condition.recent_day_count} days"
+                    if day_min is not None
+                    else " and day-gain tier matched"
                 )
         elif wants_breaker:
             session = " and regular-session circuit breaker"
@@ -284,9 +477,8 @@ def evaluate_afterhours_scan(
             session = ""
         return RuleEvaluation(
             matched=True,
-            reason=(
-                f"after-hours {quote.change_pct:.2f}% > {rule.condition.value:.2f}%"
-                f"{trend}{session}"
+            reason=_afterhours_match_reason(
+                rule, quote, suffix=f"{trend}{session}", tier=matched_tier
             ),
         )
     max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
@@ -294,9 +486,11 @@ def evaluate_afterhours_scan(
         if cap_filtered:
             return RuleEvaluation(
                 matched=True,
-                reason=(
-                    f"after-hours {quote.change_pct:.2f}% >= {rule.condition.value:.2f}% "
-                    f"and total cap <= ${max_cap:,.0f}"
+                reason=_afterhours_match_reason(
+                    rule,
+                    quote,
+                    suffix=f" and total cap <= ${max_cap:,.0f}",
+                    tier=matched_tier,
                 ),
             )
         return RuleEvaluation(matched=False, reason="no total market cap")
@@ -307,9 +501,11 @@ def evaluate_afterhours_scan(
         )
     return RuleEvaluation(
         matched=True,
-        reason=(
-            f"after-hours {quote.change_pct:.2f}% >= {rule.condition.value:.2f}% "
-            f"and total cap ${market_cap:,.0f}"
+        reason=_afterhours_match_reason(
+            rule,
+            quote,
+            suffix=f" and total cap ${market_cap:,.0f}",
+            tier=matched_tier,
         ),
     )
 
@@ -454,6 +650,34 @@ def leaderboard_line(quote: Quote, *, company: bool = False) -> str:
     change = quote.change_pct if quote.change_pct is not None else 0.0
     name = display_name(quote) if company else (quote.symbol or "")
     return f"{name}{FIELD_GAP}{change:+.1f}%{FIELD_GAP}{format_price(quote.price or 0.0)}"
+
+
+def peak_leaderboard_line(quote: Quote, *, company: bool = False) -> str:
+    """Half-hour board line ranked by session peak gain, with current gain."""
+    change = quote.change_pct if quote.change_pct is not None else 0.0
+    peak = quote.session_high_pct
+    if peak is None:
+        peak = change
+    name = display_name(quote) if company else (quote.symbol or "")
+    return (
+        f"{name}{FIELD_GAP}峰值{peak:+.1f}%{FIELD_GAP}"
+        f"现{change:+.1f}%{FIELD_GAP}{format_price(quote.price or 0.0)}"
+    )
+
+
+def fade_leaderboard_line(quote: Quote, *, company: bool = False) -> str:
+    """Half-hour fade board line: current %, peak, and giveback in percentage points."""
+    change = quote.change_pct if quote.change_pct is not None else 0.0
+    peak = quote.session_high_pct
+    name = display_name(quote) if company else (quote.symbol or "")
+    price = format_price(quote.price or 0.0)
+    if peak is None:
+        return f"{name}{FIELD_GAP}{change:+.1f}%{FIELD_GAP}{price}"
+    fade = peak - change
+    return (
+        f"{name}{FIELD_GAP}{change:+.1f}%{FIELD_GAP}"
+        f"峰值{peak:.0f}%回落{fade:.0f}pp{FIELD_GAP}{price}"
+    )
 
 
 def format_price(price: float) -> str:

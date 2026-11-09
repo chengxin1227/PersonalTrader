@@ -11,8 +11,6 @@ from monitor.models import Alert
 from monitor.quote_link import quote_url
 from monitor.repeat_alerts import HISTORY_DIVIDER
 from monitor.rules import FIELD_GAP, format_price, split_alert_name
-from monitor.session import seconds_until_session_end
-
 _CHANGE = re.compile(r"[+-]\d+(?:\.\d+)?%")
 _PRICE = re.compile(r"\$\d[\d,.]*")
 
@@ -188,11 +186,9 @@ class PushoverClient:
         if url:
             payload["url"] = url[:512]
             payload["url_title"] = url_title[:100]
-        # Expire with the current ET session (盘前/盘中/盘后). Explicit ttl wins;
-        # ttl=0 skips expiry (OpenD / tests).
-        if ttl is None:
-            ttl = seconds_until_session_end()
-        if ttl and ttl > 0:
+        # Only when callers pass ttl>0. Do not auto-expire with the session —
+        # Pushover shows that as "expires" on the notification.
+        if ttl is not None and ttl > 0:
             payload["ttl"] = str(int(ttl))
         response = await self._client.post(
             PUSHOVER_URL,

@@ -24,6 +24,13 @@ class ConditionType(str, Enum):
     REGULAR_GAIN = "regular_gain"
 
 
+class DayGainTier(BaseModel):
+    """One OR-branch: prior day gain floor + current session gain floor."""
+
+    min_recent_day_change: float
+    value: float
+
+
 class Condition(BaseModel):
     type: ConditionType
     value: float = 0
@@ -32,6 +39,7 @@ class Condition(BaseModel):
     min_regular_change: Optional[float] = None
     min_regular_volume: Optional[float] = None
     min_prior_change: Optional[float] = None
+    min_fade_from_high: Optional[float] = None
     prior_change_lag_minutes: int = Field(default=5, ge=0)
     require_new_high: bool = False
     require_uptrend: bool = False
@@ -42,6 +50,7 @@ class Condition(BaseModel):
     min_afterhours_touch: Optional[float] = None
     min_regular_touch: Optional[float] = None
     min_recent_day_change: Optional[float] = None
+    day_gain_tiers: list[DayGainTier] = Field(default_factory=list)
     recent_day_count: int = Field(default=5, ge=1)
     intraday_touch: bool = False
     stable_minutes: Optional[int] = Field(default=None, ge=1)
@@ -130,8 +139,16 @@ class ImportantWatchlistConfig(BaseModel):
 
     always: list[str] = Field(default_factory=list)
     event: list[str] = Field(default_factory=list)
+    # Half-hour / digest boards whose leaders also go to 我的自选.
+    board: list[str] = Field(default_factory=list)
     afterhours_open_minutes: int = Field(default=15, ge=1)
     afterhours_open: list[str] = Field(default_factory=list)
+    # Last N hours of the rule's own session (盘前/盘中/盘后).
+    session_late_hours: int = Field(default=2, ge=1)
+    session_late: list[str] = Field(default_factory=list)
+    # Deprecated aliases kept for older yaml.
+    afterhours_late_hours: int = Field(default=2, ge=1)
+    afterhours_late: list[str] = Field(default_factory=list)
     reminder_sync: list[str] = Field(default_factory=list)
 
 
@@ -278,6 +295,7 @@ class Quote(BaseModel):
     prior_session_spike: Optional[bool] = None
     session_circuit_breaker: Optional[bool] = None
     recent_day_spike: Optional[bool] = None
+    recent_day_gain_floors: Optional[list[float]] = None
     sec_status: Optional[str] = None
     updated_at: Optional[datetime] = None
     trade_at: Optional[datetime] = None

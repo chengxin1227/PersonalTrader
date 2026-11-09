@@ -137,6 +137,45 @@ def afterhours_open_window(
     return start <= current < start + timedelta(minutes=minutes)
 
 
+def session_late_window(
+    session: str | None,
+    moment: datetime | None = None,
+    hours: int = 2,
+) -> bool:
+    """True during the last ``hours`` of 盘前 / 盘中 / 盘后.
+
+    Premarket → 07:30–09:30, regular → 14:00–16:00, after-hours → 18:00–20:00 (ET, hours=2).
+    """
+    current = now_et(moment)
+    if current.weekday() >= 5:
+        return False
+    key = (session or "").strip()
+    if key in {"premarket", "盘前"}:
+        if not is_premarket(current):
+            return False
+        end = PREMARKET_END
+    elif key in {"regular", "盘中"}:
+        if not is_regular_session(current):
+            return False
+        end = REGULAR_END
+    elif key in {"afterhours", "盘后"}:
+        if not is_afterhours(current):
+            return False
+        end = AFTERHOURS_END
+    else:
+        return False
+    start = datetime.combine(current.date(), end, tzinfo=current.tzinfo) - timedelta(hours=hours)
+    return current >= start
+
+
+def afterhours_late_window(
+    moment: datetime | None = None,
+    hours: int = 2,
+) -> bool:
+    """True during the last ``hours`` of after-hours (default 18:00–20:00 ET)."""
+    return session_late_window("afterhours", moment, hours=hours)
+
+
 def due_check_reminders(
     moment: datetime | None = None,
     extra: list[CheckReminder] | None = None,
@@ -159,13 +198,42 @@ def check_reminder_text(label: str, names: list[str]) -> str:
     return f"{label}，请检查{joined}"
 
 
-def afterhours_board_slot(moment: datetime | None = None) -> datetime | None:
-    """The current half-hour mark during after-hours, from 16:00 through 19:30 ET."""
-    current = now_et(moment)
-    if not is_afterhours(current):
-        return None
+def _half_hour_slot(current: datetime) -> datetime:
     minute = 0 if current.minute < 30 else 30
     return current.replace(minute=minute, second=0, microsecond=0)
+
+
+def afterhours_board_slot(moment: datetime | None = None) -> datetime | None:
+    """Half-hour marks during after-hours (16:00–19:30 ET), plus 16:10.
+
+    16:10 ET ≈ 10:10 NZ — an extra early pass for all after-hours top-5 boards.
+    """
+    return session_board_slot("afterhours", moment)
+
+
+def session_board_slot(
+    session: str, moment: datetime | None = None
+) -> datetime | None:
+    """Half-hour board marks for premarket / regular / afterhours.
+
+    After-hours also includes 16:10 ET (≈10:10 NZ).
+    """
+    current = now_et(moment)
+    if session == "premarket":
+        if not is_premarket(current):
+            return None
+        return _half_hour_slot(current)
+    if session == "regular":
+        if not is_regular_session(current):
+            return None
+        return _half_hour_slot(current)
+    if session == "afterhours":
+        if not is_afterhours(current):
+            return None
+        if current.hour == 16 and 10 <= current.minute < 30:
+            return current.replace(minute=10, second=0, microsecond=0)
+        return _half_hour_slot(current)
+    return None
 
 
 def last_hour_phase(

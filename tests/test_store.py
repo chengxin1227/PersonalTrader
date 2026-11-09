@@ -75,6 +75,18 @@ def test_peak_gains_keep_the_intraday_high(tmp_path):
     assert store.peak_gain("2026-10-08", "AAA") is None
 
 
+def test_afterhours_peaks_stay_separate_from_regular_peaks(tmp_path):
+    store = Store(tmp_path)
+    store.note_peak_gain("2026-10-09", "AAA", 90.0)
+    assert store.note_afterhours_peak("2026-10-09", "aaa", 55.0) == 55.0
+    assert store.note_afterhours_peak("2026-10-09", "AAA", 72.5) == 72.5
+    assert store.note_afterhours_peak("2026-10-09", "aaa", 60.0) == 72.5
+    assert store.afterhours_peak("2026-10-09", "aaa") == 72.5
+    assert store.afterhours_peaks("2026-10-09") == {"AAA": 72.5}
+    assert store.peak_gain("2026-10-09", "AAA") == 90.0
+    assert store.afterhours_peak("2026-10-08", "AAA") is None
+
+
 def test_trend_watch_replaces_the_close_list(tmp_path):
     store = Store(tmp_path)
     store.replace_trend_watch(

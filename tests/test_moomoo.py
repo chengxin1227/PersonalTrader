@@ -250,6 +250,45 @@ def test_afterhours_leaders_skip_zero_prices():
     assert afterhours_touch_session(50) == "afterhours_touch_50"
 
 
+def test_afterhours_peak_leaders_rank_by_peak_desc():
+    from monitor.models import Quote
+    from monitor.moomoo_client import afterhours_peak_leaders
+
+    faded = Quote(
+        symbol="FADE",
+        price=1.5,
+        change_pct=12.0,
+        volume=200_000,
+        session_high_pct=80.0,
+    )
+    hot = Quote(symbol="HOT", price=2.0, change_pct=40.0, volume=200_000)
+    thin = Quote(
+        symbol="THIN",
+        price=1.0,
+        change_pct=90.0,
+        volume=50_000,
+        session_high_pct=95.0,
+    )
+    leaders = afterhours_peak_leaders(
+        [hot, faded, thin],
+        {"STORED": 70.0},
+        5,
+        min_volume=100_000,
+    )
+    assert [quote.symbol for quote in leaders] == ["FADE", "HOT"]
+    assert leaders[0].session_high_pct == 80.0
+
+    stored = Quote(symbol="STORED", price=1.2, change_pct=5.0, volume=150_000)
+    leaders = afterhours_peak_leaders(
+        [hot, faded, stored],
+        {"STORED": 70.0},
+        5,
+        min_volume=100_000,
+    )
+    assert [quote.symbol for quote in leaders] == ["FADE", "STORED", "HOT"]
+    assert leaders[1].session_high_pct == 70.0
+
+
 def test_snapshot_uses_last_price_against_previous_close():
     quote = quote_from_snapshot(
         {

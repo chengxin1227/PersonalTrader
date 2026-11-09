@@ -19,27 +19,33 @@ stream_all_trades: false
 
 watchlist: []
 
-# Important watchlist policy (not a scanner rule). All alerts still go to 今日自选;
-# only the configured subset also goes to ths_group (我的自选).
+# Important watchlist policy (not a scanner rule). All alerts go to the rule group
+# and the session group (盘前分组/盘中分组/盘后分组); only the configured subset
+# also goes to ths_group (我的自选).
 important:
   ths_group: 我的自选
   high_priority_rule_ids:
-    - afterhours-5d50-ah5
-    - afterhours-5d100-ah0
+    - afterhours-5d-boost
     - afterhours-halt-or-day80
     - afterhours-sudden-10
+    - afterhours-ah50
+    - regular-ah50
+    - premarket-ah50
   watchlist:
-    always:
-      - afterhours-sudden-10
-    event:
+    # Half-hour *-top5 / halt-or-day80 digest leaders go to 我的自选.
+    board:
+      - afterhours-top5
+      - regular-top5
+      - premarket-top5
       - afterhours-halt-or-day80
-    afterhours_open_minutes: 15
-    afterhours_open:
-      - afterhours-5d50-ah5
-      - afterhours-5d100-ah0
+    # Last 2h of each session: sudden-10 also goes to 我的自选.
+    session_late_hours: 2
+    session_late:
+      - afterhours-sudden-10
+      - regular-sudden-10
+      - premarket-sudden-10
     reminder_sync:
       - afterhours-top5
-      - afterhours-halt-or-day80
   watched_symbols:
     min_change: 10
     cooldown_minutes: 240
@@ -51,14 +57,12 @@ important:
       label: 盘后2.5小时
       rule_ids:
         - afterhours-top5
-        - afterhours-halt-or-day80
       sync_watchlist: true
     - key: afterhours-3h
       at: "19:00"
       label: 盘后3小时
       rule_ids:
         - afterhours-top5
-        - afterhours-halt-or-day80
       sync_watchlist: true
 
 # Rules sit under afterhours, premarket, or regular. The section is the rule's session and must match the condition.
@@ -103,9 +107,9 @@ rules:
         require_uptrend: true
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
-    - id: afterhours-5d50-ah5
-      name: 5日曾涨超50%盘后超5%的股票
-      description: 过去5天有一天涨幅超50%，盘后涨幅超5%，总市值不超过10亿美元，成交量超过1万
+    - id: afterhours-5d-boost
+      name: 5日曾涨超50%盘后超5%或曾涨超100%盘后超0%的股票
+      description: 过去5天有一天涨幅超50%且盘后超5%，或有一天涨幅超100%且盘后超0%；总市值不超过10亿美元，成交量超过1万
       label: 5-day after-hours boost
       notify: 5-day-afterhours-boost
       symbol: "*"
@@ -113,50 +117,20 @@ rules:
       cooldown_minutes: 240
       condition:
         type: afterhours_gain
-        value: 5
-        min_recent_day_change: 50
-        recent_day_count: 5
-        max_market_cap: 1000000000
-        min_volume: 10000
-      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
-
-    - id: afterhours-5d100-ah0
-      name: 5日曾涨超100%盘后超0%的股票
-      description: 过去5天有一天涨幅超100%，盘后涨幅超0%，总市值不超过10亿美元，成交量超过1万
-      label: 5-day after-hours 100%
-      notify: 5-day-afterhours-100
-      symbol: "*"
-      enabled: true
-      cooldown_minutes: 240
-      condition:
-        type: afterhours_gain
         value: 0
-        min_recent_day_change: 100
+        day_gain_tiers:
+          - min_recent_day_change: 50
+            value: 5
+          - min_recent_day_change: 100
+            value: 0
         recent_day_count: 5
         max_market_cap: 1000000000
         min_volume: 10000
-      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
-
-    - id: afterhours-30-newhigh
-      name: 盘后涨超30%后再创新高的股票
-      description: 盘后涨幅超过30%，15分钟后任意时刻涨幅超过此前最高涨幅，总市值不超过10亿美元，成交量超过10万
-      label: After-hours new high
-      notify: Afterhours-30-newhigh
-      symbol: "*"
-      enabled: true
-      cooldown_minutes: 30
-      condition:
-        type: afterhours_gain
-        value: 30
-        require_new_high: true
-        prior_change_lag_minutes: 15
-        max_market_cap: 1000000000
-        min_volume: 100000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
     - id: afterhours-sudden-10
       name: 盘后1分钟涨超10%的股票
-      description: 盘后涨幅已超10%，约1分钟内再涨超10%，总市值不超过10亿美元，成交量超过10万，价格高于0.1美元
+      description: 盘后涨幅已超10%，约1分钟内再涨超10%，总市值不超过10亿美元，价格高于0.1美元
       label: After-hours sudden 10%
       notify: Afterhours-sudden-10
       symbol: "*"
@@ -170,13 +144,12 @@ rules:
         late_session: afterhours
         min_price: 0.1
         max_market_cap: 1000000000
-        min_volume: 100000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
     - id: afterhours-top5
-      name: 盘后涨幅前5
-      board_description: 半点按盘后涨幅取前5，成交量超过10万（16:00开盘除外），总市值不超过10亿美元
-      label: After-hours top 5
+      name: 盘后最高涨幅前5的股票
+      board_description: 半点及16:10按盘后最高涨幅取前5（从大到小），成交量超过10万（16:00开盘除外），总市值不超过10亿美元
+      label: After-hours peak top 5
       notify: Afterhours-top5
       symbol: "*"
       enabled: true
@@ -190,9 +163,9 @@ rules:
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
     - id: afterhours-ah50
-      name: 盘后涨超50%的股票
-      description: 盘后首次涨超50%，成交量超过10万（16:00开盘除外），总市值不超过10亿美元
-      label: After-hours 50%
+      name: 盘后一度超过50%冲高回落的股票
+      description: 盘后一度涨超50%，且最高涨幅比当前至少高20个百分点，成交量超过10万（16:00开盘除外），总市值不超过10亿美元
+      label: After-hours 50% fade
       notify: Afterhours-ah50
       symbol: "*"
       enabled: true
@@ -200,14 +173,15 @@ rules:
       condition:
         type: afterhours_gain
         value: 50
+        min_fade_from_high: 20
         max_market_cap: 1000000000
         min_volume: 100000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
     - id: afterhours-halt-or-day80
       name: 盘中熔断或涨超80%的股票
-      description: 盘中首次涨超80%或触发涨幅熔断时提醒；盘后首次超5%再提醒，成交量超过10万（16:00开盘除外），总市值不超过10亿美元
-      board_description: 盘中曾涨超80%或盘中触发过涨幅熔断，半点按盘后涨幅取前5，成交量超过10万（16:00开盘除外），总市值不超过10亿美元；同花顺按最高涨幅与收盘涨幅之差从大到小排
+      description: 盘中首次涨超80%或触发涨幅熔断时提醒；盘后首次超5%再提醒，成交量超过1万（16:00开盘除外），总市值不超过10亿美元
+      board_description: 盘中曾涨超80%或盘中触发过涨幅熔断，半点按盘后涨幅取前5，成交量超过1万（16:00开盘除外），总市值不超过10亿美元；同花顺按最高涨幅与收盘涨幅之差从大到小排
       label: Halt or 80%
       notify: Halt-boost
       symbol: "*"
@@ -217,7 +191,7 @@ rules:
         type: afterhours_gain
         value: 5
         max_market_cap: 1000000000
-        min_volume: 100000
+        min_volume: 10000
         top_n: 5
         min_regular_touch: 80
         include_circuit_breaker: true
@@ -228,26 +202,41 @@ rules:
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
   regular:
-    - id: regular-30-newhigh
-      name: 盘中涨超30%后再创新高的股票
-      description: 盘中涨幅超过30%，15分钟后任意时刻涨幅超过此前最高涨幅，总市值不超过10亿美元，成交量超过10万
-      label: Regular new high
-      notify: Regular-30-newhigh
+    - id: regular-top5
+      name: 盘中最高涨幅前5的股票
+      board_description: 半点按盘中最高涨幅取前5（从大到小），成交量超过10万（09:30开盘除外），总市值不超过10亿美元
+      label: Regular peak top 5
+      notify: Regular-top5
       symbol: "*"
       enabled: true
-      cooldown_minutes: 30
+      cooldown_minutes: 240
       condition:
         type: regular_gain
-        value: 30
-        require_new_high: true
-        prior_change_lag_minutes: 15
+        value: 0
+        max_market_cap: 1000000000
+        min_volume: 100000
+        top_n: 5
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: regular-ah50
+      name: 盘中一度超过50%冲高回落的股票
+      description: 盘中一度涨超50%，且最高涨幅比当前至少高20个百分点，成交量超过10万，总市值不超过10亿美元
+      label: Regular 50% fade
+      notify: Regular-ah50
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 240
+      condition:
+        type: regular_gain
+        value: 50
+        min_fade_from_high: 20
         max_market_cap: 1000000000
         min_volume: 100000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
     - id: regular-sudden-10
       name: 盘中1分钟涨超10%的股票
-      description: 盘中涨幅已超10%，约1分钟内再涨超10%，总市值不超过10亿美元，成交量超过10万，价格高于0.1美元
+      description: 盘中涨幅已超10%，约1分钟内再涨超10%，总市值不超过10亿美元，价格高于0.1美元
       label: Regular sudden 10%
       notify: Regular-sudden-10
       symbol: "*"
@@ -261,30 +250,44 @@ rules:
         late_session: regular
         min_price: 0.1
         max_market_cap: 1000000000
-        min_volume: 100000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
   premarket:
-    - id: premarket-30-newhigh
-      name: 盘前涨超30%后再创新高的股票
-      description: 盘前涨幅超过30%，15分钟后任意时刻涨幅超过此前最高涨幅，总市值不超过10亿美元，成交量超过10万
-      label: Premarket new high
-      notify: Premarket-30-newhigh
+    - id: premarket-top5
+      name: 盘前最高涨幅前5的股票
+      board_description: 半点按盘前最高涨幅取前5（从大到小），成交量超过10万（04:00开盘除外），总市值不超过10亿美元
+      label: Premarket peak top 5
+      notify: Premarket-top5
       symbol: "*"
       enabled: true
-      cooldown_minutes: 30
+      cooldown_minutes: 240
       condition:
         type: premarket_gain
-        value: 30
-        require_new_high: true
-        prior_change_lag_minutes: 15
+        value: 0
+        max_market_cap: 1000000000
+        min_volume: 100000
+        top_n: 5
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: premarket-ah50
+      name: 盘前一度超过50%冲高回落的股票
+      description: 盘前一度涨超50%，且最高涨幅比当前至少高20个百分点，成交量超过10万，总市值不超过10亿美元
+      label: Premarket 50% fade
+      notify: Premarket-ah50
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 240
+      condition:
+        type: premarket_gain
+        value: 50
+        min_fade_from_high: 20
         max_market_cap: 1000000000
         min_volume: 100000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
-    - id: premarket-day50-ext5
-      name: 5日曾涨超50%盘前超5%的股票
-      description: 过去5天有一天涨幅超50%，盘前涨幅超5%，总市值不超过10亿美元，成交量超过1万
+    - id: premarket-5d-boost
+      name: 5日曾涨超50%盘前超5%或曾涨超100%盘前超0%的股票
+      description: 过去5天有一天涨幅超50%且盘前超5%，或有一天涨幅超100%且盘前超0%；总市值不超过10亿美元，成交量超过1万
       label: 5-day premarket boost
       notify: 5-day-premarket-boost
       symbol: "*"
@@ -292,8 +295,12 @@ rules:
       cooldown_minutes: 330
       condition:
         type: premarket_gain
-        value: 5
-        min_recent_day_change: 50
+        value: 0
+        day_gain_tiers:
+          - min_recent_day_change: 50
+            value: 5
+          - min_recent_day_change: 100
+            value: 0
         recent_day_count: 5
         max_market_cap: 1000000000
         min_volume: 10000
@@ -301,7 +308,7 @@ rules:
 
     - id: premarket-sudden-10
       name: 盘前1分钟涨超10%的股票
-      description: 盘前涨幅已超10%，约1分钟内再涨超10%，总市值不超过10亿美元，成交量超过10万，价格高于0.1美元
+      description: 盘前涨幅已超10%，约1分钟内再涨超10%，总市值不超过10亿美元，价格高于0.1美元
       label: Premarket sudden 10%
       notify: Premarket-sudden-10
       symbol: "*"
@@ -315,5 +322,4 @@ rules:
         late_session: premarket
         min_price: 0.1
         max_market_cap: 1000000000
-        min_volume: 100000
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"

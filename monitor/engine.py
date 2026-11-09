@@ -14,6 +14,8 @@ from monitor.moomoo_client import (
     afterhours_leaders,
     afterhours_touch_session,
     is_upward_halt,
+    observed_session_peak,
+    peak_leaders,
     regular_touch_change_pct,
     unchanged_symbols,
 )
@@ -34,11 +36,13 @@ from monitor.rules import (
     evaluate_afterhours_scan,
     evaluate_last_hour_scan,
     evaluate_premarket_scan,
+    evaluate_regular_peak_fade,
     evaluate_stable_afterhours,
     evaluate_rule,
     hour_change_pct,
     leaderboard_line,
     load_rules,
+    peak_leaderboard_line,
     price_age_seconds_ago,
     render_message,
     save_rules,
@@ -46,11 +50,15 @@ from monitor.rules import (
 )
 from monitor.session import (
     AFTERHOURS_START,
+    PREMARKET_START,
+    REGULAR_START,
     CHECK_REMINDER_NOTIFY,
     CheckReminder,
     afterhours_board_slot,
     afterhours_just_opened,
     afterhours_open_window,
+    session_board_slot,
+    session_late_window,
     afterhours_stable_due,
     afterhours_stable_missed,
     check_reminder_text,
@@ -97,6 +105,14 @@ def _is_spike_rule(rule: Rule) -> bool:
     )
 
 
+def _is_peak_fade_rule(rule: Rule) -> bool:
+    return rule.condition.min_fade_from_high is not None and rule.condition.type in {
+        ConditionType.AFTERHOURS_GAIN,
+        ConditionType.PREMARKET_GAIN,
+        ConditionType.REGULAR_GAIN,
+    }
+
+
 def _is_new_high_rule(rule: Rule) -> bool:
     return rule.condition.require_new_high
 
@@ -126,8 +142,71 @@ def _is_touched_leaderboard(rule: Rule) -> bool:
     )
 
 
+def _is_peak_top_board(rule: Rule) -> bool:
+    """Plain top-N board ranked by session peak gain (not touch-pool / fade)."""
+    return (
+        _is_leaderboard_rule(rule)
+        and not _is_touched_leaderboard(rule)
+        and rule.condition.min_fade_from_high is None
+    )
+
+
+def _board_session_key(rule: Rule) -> str | None:
+    kind = rule.condition.type
+    if kind is ConditionType.AFTERHOURS_GAIN:
+        return "afterhours"
+    if kind is ConditionType.PREMARKET_GAIN:
+        return "premarket"
+    if kind is ConditionType.REGULAR_GAIN:
+        return "regular"
+    return None
+
+
+def _board_slot_for_rule(rule: Rule) -> datetime | None:
+    session = _board_session_key(rule)
+    if session is None:
+        return None
+    return session_board_slot(session)
+
+
+def _board_min_volume(rule: Rule, slot: datetime) -> int | None:
+    """Waive volume only on the session-open board slot."""
+    minimum = rule.condition.min_volume
+    if minimum is None:
+        return None
+    kind = rule.condition.type
+    open_at = {
+        ConditionType.AFTERHOURS_GAIN: AFTERHOURS_START,
+        ConditionType.PREMARKET_GAIN: PREMARKET_START,
+        ConditionType.REGULAR_GAIN: REGULAR_START,
+    }.get(kind)
+    if open_at is not None and slot.time() == open_at:
+        return None
+    return int(minimum)
+
+
 def _is_day_spike_rule(rule: Rule) -> bool:
-    return rule.condition.min_recent_day_change is not None
+    return (
+        rule.condition.min_recent_day_change is not None
+        or bool(rule.condition.day_gain_tiers)
+    )
+
+
+def _day_gain_floors(rule: Rule) -> list[float]:
+    """Distinct prior-day gain floors this rule needs recorded / pooled."""
+    if rule.condition.day_gain_tiers:
+        found: list[float] = []
+        seen: set[float] = set()
+        for tier in rule.condition.day_gain_tiers:
+            floor = tier.min_recent_day_change
+            if floor in seen:
+                continue
+            seen.add(floor)
+            found.append(floor)
+        return found
+    if rule.condition.min_recent_day_change is not None:
+        return [rule.condition.min_recent_day_change]
+    return []
 
 
 def _is_halt_or_day_rule(rule: Rule) -> bool:
@@ -215,14 +294,39 @@ def _wants_important_watchlist(
     moment: datetime | None = None,
 ) -> bool:
     """Whether this alert's symbols should also land in 我的自选."""
-    if board:
-        return False
     watch = important.watchlist
+    if board:
+        return rule.id in watch.board
     if rule.id in watch.always or rule.id in watch.event:
         return True
     if rule.id in watch.afterhours_open:
         return afterhours_open_window(moment, minutes=watch.afterhours_open_minutes)
+    late_ids = {*watch.session_late, *watch.afterhours_late}
+    if rule.id in late_ids:
+        hours = watch.session_late_hours or watch.afterhours_late_hours
+        session = rule.group or rule.condition_session
+        return session_late_window(session, moment, hours=hours)
     return False
+
+
+def _is_high_priority(
+    important: ImportantConfig,
+    rule: Rule,
+    *,
+    moment: datetime | None = None,
+) -> bool:
+    """High-priority Pushover, except afterhours_open rules during the open window.
+
+    Those still go to 我的自选, but use normal priority for the first N minutes.
+    """
+    if rule.id not in important.high_priority_rule_ids:
+        return False
+    watch = important.watchlist
+    if rule.id in watch.afterhours_open and afterhours_open_window(
+        moment, minutes=watch.afterhours_open_minutes
+    ):
+        return False
+    return True
 
 
 def opend_is_down(exc: BaseException) -> bool:
@@ -431,6 +535,7 @@ class MonitorEngine:
                 for rule in afterhours_rules
                 if not _is_trend_rule(rule)
                 and not _is_spike_rule(rule)
+                and not _is_peak_fade_rule(rule)
                 and not _is_new_high_rule(rule)
                 and not _is_breaker_rule(rule)
                 and not _is_leaderboard_rule(rule)
@@ -458,6 +563,11 @@ class MonitorEngine:
             if spike_rules and not self._spike_loop_running:
                 for rule in spike_rules:
                     matched = await self._match_spike_rule(rule)
+                    fired.extend(await self._emit_trend_matches(rule, matched, state))
+            fade_rules = [rule for rule in open_rules if _is_peak_fade_rule(rule)]
+            if fade_rules:
+                for rule in fade_rules:
+                    matched = await self._match_peak_fade_rule(rule)
                     fired.extend(await self._emit_trend_matches(rule, matched, state))
             new_high_rules = [rule for rule in open_rules if _is_new_high_rule(rule)]
             if new_high_rules and not self._spike_loop_running and not self._regular_loop_running:
@@ -498,6 +608,7 @@ class MonitorEngine:
                 if (
                     rule in afterhours_rules
                     or _is_spike_rule(rule)
+                    or _is_peak_fade_rule(rule)
                     or _is_new_high_rule(rule)
                     or _is_breaker_rule(rule)
                     or _is_leaderboard_rule(rule)
@@ -510,10 +621,23 @@ class MonitorEngine:
                 slack_error = slack_error or scan_error
             self._last_scan_at = datetime.now(timezone.utc)
 
-        if self.moomoo is not None and is_afterhours():
-            for rule in config.rules:
-                if rule.enabled and _is_leaderboard_rule(rule):
-                    await self._maybe_send_leaderboard(rule, state)
+        if self.moomoo is not None:
+            if is_afterhours():
+                for rule in config.rules:
+                    if (
+                        rule.enabled
+                        and _is_leaderboard_rule(rule)
+                        and rule.condition.type is ConditionType.AFTERHOURS_GAIN
+                    ):
+                        await self._maybe_send_leaderboard(rule, state)
+            elif is_premarket():
+                for rule in config.rules:
+                    if (
+                        rule.enabled
+                        and _is_peak_top_board(rule)
+                        and rule.condition.type is ConditionType.PREMARKET_GAIN
+                    ):
+                        await self._maybe_send_leaderboard(rule, state)
 
         for symbol, quote in quotes.items():
             self.store.set_last_price(state, symbol, quote.price)
@@ -776,9 +900,29 @@ class MonitorEngine:
                     continue
                 if is_regular_session():
                     for rule in gain_rules:
-                        if _is_new_high_rule(rule):
+                        if (
+                            _is_new_high_rule(rule)
+                            or _is_peak_fade_rule(rule)
+                            or _is_leaderboard_rule(rule)
+                        ):
                             continue
                         matched = await self._match_regular_gain(rule)
+                        self._note_opend_ok()
+                        if not matched:
+                            continue
+                        async with self._lock:
+                            state = self.store.load_state()
+                            await self._emit_trend_matches(rule, matched, state)
+                            self.store.save_state(state)
+                    regular_fade = [
+                        rule
+                        for rule in config.rules
+                        if rule.enabled
+                        and _is_peak_fade_rule(rule)
+                        and rule.condition.type is ConditionType.REGULAR_GAIN
+                    ]
+                    for rule in regular_fade:
+                        matched = await self._match_peak_fade_rule(rule)
                         self._note_opend_ok()
                         if not matched:
                             continue
@@ -870,6 +1014,19 @@ class MonitorEngine:
                     await self._run_sudden_rules(
                         [rule for rule in sudden_rules if rule.condition.late_session == "regular"]
                     )
+                    regular_boards = [
+                        rule
+                        for rule in config.rules
+                        if rule.enabled
+                        and _is_peak_top_board(rule)
+                        and rule.condition.type is ConditionType.REGULAR_GAIN
+                    ]
+                    if regular_boards:
+                        async with self._lock:
+                            state = self.store.load_state()
+                            for rule in regular_boards:
+                                await self._maybe_send_leaderboard(rule, state)
+                            self.store.save_state(state)
                 elif is_afterhours():
                     if closing_rules and self._closing_gains_due():
                         await self._record_closing_gains(closing_rules)
@@ -1131,25 +1288,23 @@ class MonitorEngine:
         day = now_et().date().isoformat()
         seen: set[tuple[float, float | None, float | None]] = set()
         for rule in rules:
-            minimum = rule.condition.min_recent_day_change
-            if minimum is None:
-                continue
-            key = (minimum, rule.condition.max_market_cap, rule.condition.min_volume)
-            if key in seen:
-                continue
-            seen.add(key)
-            found = await client.regular_gainers(
-                minimum,
-                max_market_cap=rule.condition.max_market_cap,
-                min_volume=rule.condition.min_volume,
-            )
-            symbols = [quote.symbol for quote in found]
-            self.store.replace_day_gains(day, minimum, symbols)
-            logger.info(
-                "Closing gain > %.0f%%: %s",
-                minimum,
-                _symbols_text(symbols),
-            )
+            for minimum in _day_gain_floors(rule):
+                key = (minimum, rule.condition.max_market_cap, rule.condition.min_volume)
+                if key in seen:
+                    continue
+                seen.add(key)
+                found = await client.regular_gainers(
+                    minimum,
+                    max_market_cap=rule.condition.max_market_cap,
+                    min_volume=rule.condition.min_volume,
+                )
+                symbols = [quote.symbol for quote in found]
+                self.store.replace_day_gains(day, minimum, symbols)
+                logger.info(
+                    "Closing gain > %.0f%%: %s",
+                    minimum,
+                    _symbols_text(symbols),
+                )
 
     def _trend_watch_due(self) -> bool:
         now = datetime.now(timezone.utc)
@@ -1239,8 +1394,8 @@ class MonitorEngine:
 
     async def _match_saved_day(self, rule: Rule) -> list[Quote]:
         client = self._trend_moomoo or self.moomoo
-        minimum = rule.condition.min_recent_day_change
-        if client is None or minimum is None:
+        floors = _day_gain_floors(rule)
+        if client is None or not floors:
             return []
         afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
         days = recent_trading_days(
@@ -1248,7 +1403,11 @@ class MonitorEngine:
             rule.condition.recent_day_count,
             include_end=afterhours,
         )
-        symbols = self.store.day_gain_symbols(minimum, days)
+        floors_by_symbol: dict[str, list[float]] = {}
+        for minimum in floors:
+            for symbol in self.store.day_gain_symbols(minimum, days):
+                floors_by_symbol.setdefault(symbol, []).append(minimum)
+        symbols = sorted(floors_by_symbol)
         if afterhours:
             marks = await self._saved_afterhours_quotes(client, symbols)
         else:
@@ -1260,7 +1419,8 @@ class MonitorEngine:
             mark = marks.get(symbol)
             if mark is None:
                 continue
-            mark.recent_day_spike = True
+            mark.recent_day_gain_floors = floors_by_symbol.get(symbol, [])
+            mark.recent_day_spike = bool(mark.recent_day_gain_floors)
             if afterhours:
                 evaluation = evaluate_afterhours_scan(
                     rule, mark, market_cap=None, in_afterhours=True, cap_filtered=True
@@ -2139,6 +2299,123 @@ class MonitorEngine:
         )
         return matched
 
+    async def _match_peak_fade_rule(self, rule: Rule) -> list[Quote]:
+        """Session once peaked >= value and has since faded by min_fade_from_high pp."""
+        client = self._trend_moomoo or self.moomoo
+        fade_min = rule.condition.min_fade_from_high
+        if client is None or fade_min is None:
+            return []
+        kind = rule.condition.type
+        day = now_et().date().isoformat()
+        if kind is ConditionType.AFTERHOURS_GAIN:
+            label = "After-hours peak fade"
+            found_rows = await client.scan_afterhours(
+                rule.condition.value, rule.condition.max_market_cap
+            )
+            found = [quote for quote, _cap in found_rows]
+            note_peak = self.store.note_afterhours_peak
+            peaks = self.store.afterhours_peaks
+            load_marks = self._saved_afterhours_quotes
+        elif kind is ConditionType.PREMARKET_GAIN:
+            label = "Pre-market peak fade"
+            found_rows = await client.scan_premarket(
+                rule.condition.value, rule.condition.max_market_cap
+            )
+            found = [quote for quote, _cap in found_rows]
+            note_peak = self.store.note_premarket_peak
+            peaks = self.store.premarket_peaks
+            load_marks = self._saved_premarket_quotes
+        elif kind is ConditionType.REGULAR_GAIN:
+            label = "Regular peak fade"
+            found = await client.regular_gainers(
+                rule.condition.value,
+                max_market_cap=rule.condition.max_market_cap,
+                min_volume=rule.condition.min_volume,
+            )
+            note_peak = self.store.note_peak_gain
+            peaks = self.store.peak_gains
+
+            async def load_marks(_client: MoomooClient, symbols: list[str]):
+                return await self._moomoo_snapshots(_client, symbols)
+        else:
+            return []
+        for quote in found:
+            observed = quote.change_pct
+            if quote.session_high_pct is not None:
+                observed = (
+                    quote.session_high_pct
+                    if observed is None
+                    else max(observed, quote.session_high_pct)
+                )
+            if observed is not None:
+                note_peak(day, quote.symbol, observed)
+        peak_map = peaks(day)
+        pool = sorted(
+            symbol for symbol, peak in peak_map.items() if peak >= rule.condition.value
+        )
+        if not pool:
+            self._log_saved_matches(rule.id, [], label)
+            return []
+        marks = await load_marks(client, pool)
+        if not marks:
+            return []
+        scan_rule = _afterhours_scan_rule(rule) if kind is ConditionType.AFTERHOURS_GAIN else rule
+        matched: list[Quote] = []
+        for symbol in pool:
+            quote = marks.get(symbol)
+            if quote is None:
+                continue
+            peak = peak_map.get(symbol.upper())
+            if quote.session_high_pct is not None:
+                peak = (
+                    quote.session_high_pct
+                    if peak is None
+                    else max(peak, quote.session_high_pct)
+                )
+            if quote.change_pct is not None:
+                peak = (
+                    quote.change_pct if peak is None else max(peak, quote.change_pct)
+                )
+            if peak is None:
+                continue
+            peak = note_peak(day, symbol, peak)
+            quote.session_high_pct = peak
+            if kind is ConditionType.AFTERHOURS_GAIN:
+                evaluation = evaluate_afterhours_scan(
+                    scan_rule,
+                    quote,
+                    market_cap=None,
+                    in_afterhours=True,
+                    cap_filtered=rule.condition.max_market_cap is not None,
+                )
+            elif kind is ConditionType.PREMARKET_GAIN:
+                evaluation = evaluate_premarket_scan(
+                    scan_rule,
+                    quote,
+                    market_cap=None,
+                    in_premarket=True,
+                    cap_filtered=rule.condition.max_market_cap is not None,
+                )
+            else:
+                evaluation = evaluate_regular_peak_fade(
+                    scan_rule,
+                    quote,
+                    market_cap=None,
+                    cap_filtered=rule.condition.max_market_cap is not None,
+                )
+            if self.verbose:
+                logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
+            if evaluation.matched:
+                matched.append(quote)
+        matched.sort(
+            key=lambda quote: peak_fade_score(quote.session_high_pct, quote.change_pct),
+            reverse=True,
+        )
+        self._log_saved_matches(
+            rule.id, [quote.symbol for quote in matched], label
+        )
+        return matched
+
     async def _match_spike_rule(self, rule: Rule) -> list[Quote]:
         client = self._trend_moomoo or self.moomoo
         if client is None:
@@ -2359,7 +2636,7 @@ class MonitorEngine:
                 symbol=symbol,
                 company=quote.company,
                 price=price,
-                change_pct=sudden,
+                change_pct=session_change,
                 volume=quote.volume,
             )
             if self.verbose:
@@ -2753,8 +3030,10 @@ class MonitorEngine:
         return matched
 
     async def _maybe_send_leaderboard(self, rule: Rule, state: dict) -> None:
-        slot = afterhours_board_slot()
-        if slot is None or rule.condition.top_n is None or self.moomoo is None:
+        slot = _board_slot_for_rule(rule)
+        if slot is None or self.moomoo is None:
+            return
+        if rule.condition.top_n is None:
             return
         slot_key = f"{rule.id}:{slot.strftime('%Y-%m-%dT%H:%M')}"
         if self.store.last_fired_at(state, slot_key) is not None:
@@ -2762,33 +3041,40 @@ class MonitorEngine:
         now = datetime.now(timezone.utc)
         if self._board_retry_at is not None and now < self._board_retry_at:
             return
-        min_volume = None if slot.time() == AFTERHOURS_START else rule.condition.min_volume
+        min_volume = _board_min_volume(rule, slot)
+        peak_board = _is_peak_top_board(rule)
+        kind = rule.condition.type
         try:
             if _is_touched_leaderboard(rule):
                 leaders = await self._touched_afterhours_leaders(rule, min_volume)
+            elif kind is ConditionType.AFTERHOURS_GAIN:
+                leaders = await self._top_afterhours_by_peak(rule, min_volume)
+            elif kind is ConditionType.PREMARKET_GAIN:
+                leaders = await self._top_premarket_by_peak(rule, min_volume)
+            elif kind is ConditionType.REGULAR_GAIN:
+                leaders = await self._top_regular_by_peak(rule, min_volume)
             else:
-                max_cap = rule.condition.max_market_cap or 100_000_000
-                leaders = await self.moomoo.top_afterhours(
-                    max_cap, rule.condition.top_n, min_volume
-                )
+                return
         except Exception as exc:  # noqa: BLE001
-            logger.warning("After-hours leaderboard failed: %s", exc)
+            logger.warning("Leaderboard failed for %s: %s", rule.id, exc)
             self._board_retry_at = now + timedelta(seconds=30)
             await self._note_opend_failure(exc)
             await self._note_problem(str(exc))
             return
         self._board_retry_at = None
         self._note_opend_ok()
-        need = 1 if _is_touched_leaderboard(rule) else rule.condition.top_n
+        need = 1 if _is_touched_leaderboard(rule) else (rule.condition.top_n or 1)
         if len(leaders) < need:
             logger.info(
-                "After-hours leaderboard %s has %s priced names, waiting",
+                "Leaderboard %s %s has %s priced names, waiting",
+                rule.id,
                 slot.strftime("%H:%M"),
                 len(leaders),
             )
             self._board_retry_at = now + timedelta(seconds=30)
             return
-        rows = [(quote.symbol, leaderboard_line(quote)) for quote in leaders]
+        line = peak_leaderboard_line if peak_board else leaderboard_line
+        rows = [(quote.symbol, line(quote)) for quote in leaders]
         title = f"{format_nz_clock(slot)} {rule.name}"
         reason = rule.board_summary
         delivered = await self._deliver_digest(
@@ -2798,7 +3084,7 @@ class MonitorEngine:
             self._board_retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
             return
         # Digest keeps tickers; persist company names so repeat-history bodies stay consistent.
-        message = "\n".join(leaderboard_line(quote, company=True) for quote in leaders)
+        message = "\n".join(line(quote, company=True) for quote in leaders)
         if reason and reason not in message:
             message = f"{message}\n{reason}"
         alert = self.store.new_alert(
@@ -2814,16 +3100,9 @@ class MonitorEngine:
         self.store.append_alert(alert)
         self.store.mark_fired(state, slot_key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, message.replace("\n", " | "))
-        if _sorts_ths_by_peak_fade(rule):
-            self._add_to_tonghuashun(
-                rule, self._halt_or_day_pool_symbols(rule), board=True
-            )
-        elif _is_ah_touch_board_rule(rule):
-            self._add_to_tonghuashun(
-                rule, self._ah_touch_pool_symbols(rule), board=True
-            )
-        else:
-            self._add_to_tonghuashun(rule, leaders, board=True)
+        pin = [quote.symbol for quote in leaders]
+        # Top-N boards replace the rule group with the current leaders only.
+        self._add_to_tonghuashun(rule, leaders, board=True, pin_symbols=pin)
 
     def _halt_or_day_pool_symbols(self, rule: Rule) -> list[str]:
         """Symbols that hit halt or the regular touch / day-gain threshold today."""
@@ -2878,6 +3157,120 @@ class MonitorEngine:
             return []
         volume = int(min_volume) if min_volume is not None else None
         return afterhours_leaders(list(marks.values()), rule.condition.top_n or 5, volume)
+
+    async def _top_afterhours_by_peak(
+        self, rule: Rule, min_volume: float | None
+    ) -> list[Quote]:
+        """Top N by after-hours peak gain (session high), highest first."""
+        if self.moomoo is None:
+            return []
+        max_cap = rule.condition.max_market_cap or 100_000_000
+        limit = rule.condition.top_n or 5
+        volume = int(min_volume) if min_volume is not None else None
+        found_rows = await self.moomoo.scan_afterhours(-1_000_000, max_cap)
+        day = now_et().date().isoformat()
+        peaks = self.store.afterhours_peaks(day)
+        by_symbol = {
+            quote.symbol.upper(): quote for quote, _cap in found_rows
+        }
+        for symbol in peaks:
+            by_symbol.setdefault(symbol.upper(), Quote(symbol=symbol.upper()))
+        candidates = self._peak_board_candidates(by_symbol, peaks, volume)
+        marks = await self._saved_afterhours_quotes(self.moomoo, sorted(candidates))
+        if marks:
+            for symbol, quote in marks.items():
+                by_symbol[symbol.upper()] = quote
+        for quote in by_symbol.values():
+            observed = observed_session_peak(quote)
+            if observed is not None:
+                self.store.note_afterhours_peak(day, quote.symbol, observed)
+        peaks = self.store.afterhours_peaks(day)
+        return peak_leaders(list(by_symbol.values()), peaks, limit, volume)
+
+    async def _top_premarket_by_peak(
+        self, rule: Rule, min_volume: float | None
+    ) -> list[Quote]:
+        """Top N by premarket peak gain (session high), highest first."""
+        if self.moomoo is None:
+            return []
+        max_cap = rule.condition.max_market_cap or 100_000_000
+        limit = rule.condition.top_n or 5
+        volume = int(min_volume) if min_volume is not None else None
+        found_rows = await self.moomoo.scan_premarket(-1_000_000, max_cap)
+        day = now_et().date().isoformat()
+        peaks = self.store.premarket_peaks(day)
+        by_symbol = {
+            quote.symbol.upper(): quote for quote, _cap in found_rows
+        }
+        for symbol in peaks:
+            by_symbol.setdefault(symbol.upper(), Quote(symbol=symbol.upper()))
+        candidates = self._peak_board_candidates(by_symbol, peaks, volume)
+        marks = await self._saved_premarket_quotes(self.moomoo, sorted(candidates))
+        if marks:
+            for symbol, quote in marks.items():
+                by_symbol[symbol.upper()] = quote
+        for quote in by_symbol.values():
+            observed = observed_session_peak(quote)
+            if observed is not None:
+                self.store.note_premarket_peak(day, quote.symbol, observed)
+        peaks = self.store.premarket_peaks(day)
+        return peak_leaders(list(by_symbol.values()), peaks, limit, volume)
+
+    async def _top_regular_by_peak(
+        self, rule: Rule, min_volume: float | None
+    ) -> list[Quote]:
+        """Top N by regular-session peak gain (day high), highest first."""
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return []
+        max_cap = rule.condition.max_market_cap or 100_000_000
+        limit = rule.condition.top_n or 5
+        volume = int(min_volume) if min_volume is not None else None
+        found = await client.regular_gainers(
+            0,
+            max_market_cap=max_cap,
+            min_volume=volume,
+        )
+        day = now_et().date().isoformat()
+        peaks = self.store.peak_gains(day)
+        by_symbol = {quote.symbol.upper(): quote for quote in found}
+        for symbol in peaks:
+            by_symbol.setdefault(symbol.upper(), Quote(symbol=symbol.upper()))
+        candidates = self._peak_board_candidates(by_symbol, peaks, volume)
+        snaps = await self._moomoo_snapshots(client, sorted(candidates))
+        if snaps:
+            for symbol, snap in snaps.items():
+                peak = regular_touch_change_pct(
+                    change_pct=snap.change_pct,
+                    high=snap.daily_high,
+                    prev_close=snap.prev_close,
+                    pre_high=snap.premarket_high,
+                )
+                if peak is not None:
+                    snap.session_high_pct = peak
+                by_symbol[symbol.upper()] = snap
+        for quote in by_symbol.values():
+            observed = observed_session_peak(quote)
+            if observed is not None:
+                self.store.note_peak_gain(day, quote.symbol, observed)
+        peaks = self.store.peak_gains(day)
+        return peak_leaders(list(by_symbol.values()), peaks, limit, volume)
+
+    @staticmethod
+    def _peak_board_candidates(
+        by_symbol: dict[str, Quote],
+        peaks: dict[str, float],
+        volume: int | None,
+    ) -> list[str]:
+        candidates: list[str] = []
+        for symbol, quote in by_symbol.items():
+            if symbol in peaks:
+                candidates.append(symbol)
+            elif volume is None:
+                candidates.append(symbol)
+            elif quote.volume is not None and quote.volume > volume:
+                candidates.append(symbol)
+        return candidates
 
     async def _deliver_digest(
         self,
@@ -3172,7 +3565,7 @@ class MonitorEngine:
         )
         alert.repeat_count = delivery.repeat_count
         important = self.load_config().important
-        high = rule.id in important.high_priority_rule_ids
+        high = _is_high_priority(important, rule, moment=moment)
         await self._deliver(
             delivery,
             priority=1 if high else None,
@@ -3182,12 +3575,14 @@ class MonitorEngine:
         self.store.mark_fired(state, key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, alert.message)
         important_symbols = [quote.symbol]
+        pin = [quote.symbol]
         if _sorts_ths_by_peak_fade(rule):
             self._add_to_tonghuashun(
                 rule,
                 self._halt_or_day_pool_symbols(rule),
                 board=False,
                 important_symbols=important_symbols,
+                pin_symbols=pin,
             )
         elif _is_ah_touch_board_rule(rule):
             self._add_to_tonghuashun(
@@ -3195,10 +3590,15 @@ class MonitorEngine:
                 self._ah_touch_pool_symbols(rule),
                 board=False,
                 important_symbols=important_symbols,
+                pin_symbols=pin,
             )
         else:
             self._add_to_tonghuashun(
-                rule, [quote], board=False, important_symbols=important_symbols
+                rule,
+                [quote],
+                board=False,
+                important_symbols=important_symbols,
+                pin_symbols=pin,
             )
         return alert
 
@@ -3212,7 +3612,10 @@ class MonitorEngine:
         return None
 
     async def _maybe_sync_tonghuashun_groups(self, config: RulesConfig) -> None:
-        """Create/remove rule groups once; clear only the current session's groups on a new day."""
+        """Create groups once; clear each session's rule/盘x groups on that session's next day.
+
+        我的自选 clears the previous session's names when the next session starts.
+        """
         if not self.ths.configured:
             return
         self.ths.set_important_group(config.important.ths_group)
@@ -3242,8 +3645,7 @@ class MonitorEngine:
                         and rule.name
                         and (rule.group or rule.condition_session) == session
                     ]
-                    cleared = await self.ths.clear_for_day(session_names, day)
-                    watchlist_cleared = await self.ths.clear_watchlist_previous_session(session)
+                    cleared = await self.ths.clear_session_day(session, day, session_names)
                     self._ths_cleared_session_day[session] = day
                     if cleared:
                         logger.info(
@@ -3251,11 +3653,6 @@ class MonitorEngine:
                             session,
                             day,
                             ", ".join(cleared),
-                        )
-                    if watchlist_cleared:
-                        logger.info(
-                            "同花顺 summary watchlists cleared previous session: %s",
-                            ", ".join(watchlist_cleared),
                         )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 group sync failed: %s", exc)
@@ -3268,12 +3665,17 @@ class MonitorEngine:
         *,
         board: bool = False,
         important_symbols: list[str] | None = None,
+        pin_symbols: list[str] | None = None,
     ) -> None:
         if not self.ths.configured:
             return
         task = asyncio.create_task(
             self._tonghuashun_sync(
-                rule, quotes, board=board, important_symbols=important_symbols
+                rule,
+                quotes,
+                board=board,
+                important_symbols=important_symbols,
+                pin_symbols=pin_symbols,
             )
         )
         self._ths_tasks.add(task)
@@ -3286,6 +3688,7 @@ class MonitorEngine:
         *,
         board: bool = False,
         important_symbols: list[str] | None = None,
+        pin_symbols: list[str] | None = None,
     ) -> None:
         group = rule.name
         day = now_et().date().isoformat()
@@ -3293,13 +3696,32 @@ class MonitorEngine:
         symbols = [
             item.symbol if isinstance(item, Quote) else str(item).upper() for item in quotes
         ]
+        pin = (
+            [symbol.strip().upper() for symbol in pin_symbols if symbol and str(symbol).strip()]
+            if pin_symbols is not None
+            else [symbol for symbol in symbols if symbol.strip()]
+        )
         important = self.load_config().important
         self.ths.set_important_group(important.ths_group)
         want_important = _wants_important_watchlist(important, rule, board=board)
+        replace_board = board and rule.condition.top_n is not None
+        if replace_board:
+            # Half-hour top-N groups keep only the current leaders.
+            symbols = [symbol for symbol in pin if symbol]
+            pin = list(symbols)
         async with self._ths_lock:
             try:
-                members = await self.ths.members(group, day, symbols, session)
-                if _sorts_ths_by_peak_fade(rule):
+                members = await self.ths.members(
+                    group,
+                    day,
+                    symbols,
+                    session,
+                    bump_symbols=pin,
+                    replace=replace_board,
+                )
+                if replace_board:
+                    ordered = list(pin)
+                elif _sorts_ths_by_peak_fade(rule):
                     peaks = self.store.peak_gains(day)
                     closes = await self._regular_close_changes(members)
                     ordered = sorted(
@@ -3307,6 +3729,47 @@ class MonitorEngine:
                         key=lambda symbol: peak_fade_score(
                             peaks.get(symbol), closes.get(symbol)
                         ),
+                        reverse=True,
+                    )
+                elif _is_peak_fade_rule(rule):
+                    if rule.condition.type is ConditionType.AFTERHOURS_GAIN:
+                        peaks = self.store.afterhours_peaks(day)
+                    elif rule.condition.type is ConditionType.PREMARKET_GAIN:
+                        peaks = self.store.premarket_peaks(day)
+                    else:
+                        peaks = self.store.peak_gains(day)
+                    changes = {
+                        item.symbol: item.change_pct
+                        for item in quotes
+                        if isinstance(item, Quote)
+                    }
+                    changes.update(await self._session_changes(rule, members))
+                    ordered = sorted(
+                        members,
+                        key=lambda symbol: peak_fade_score(
+                            peaks.get(symbol), changes.get(symbol)
+                        ),
+                        reverse=True,
+                    )
+                elif _is_peak_top_board(rule):
+                    if rule.condition.type is ConditionType.AFTERHOURS_GAIN:
+                        peaks = self.store.afterhours_peaks(day)
+                    elif rule.condition.type is ConditionType.PREMARKET_GAIN:
+                        peaks = self.store.premarket_peaks(day)
+                    else:
+                        peaks = self.store.peak_gains(day)
+                    for item in quotes:
+                        if not isinstance(item, Quote):
+                            continue
+                        observed = observed_session_peak(item)
+                        if observed is None:
+                            continue
+                        key = item.symbol.upper()
+                        prior = peaks.get(key)
+                        peaks[key] = observed if prior is None else max(prior, observed)
+                    ordered = sorted(
+                        members,
+                        key=lambda symbol: peaks.get(symbol, float("-inf")),
                         reverse=True,
                     )
                 else:
@@ -3325,11 +3788,18 @@ class MonitorEngine:
                         ),
                         reverse=True,
                     )
+                # Just-alerted names (including repeats) stay at the top of the rule group.
+                if not replace_board:
+                    alerted = {symbol for symbol in pin if symbol}
+                    if alerted:
+                        ordered = [s for s in ordered if s in alerted] + [
+                            s for s in ordered if s not in alerted
+                        ]
                 await self.ths.arrange(group, ordered)
                 if want_important:
                     target = [
                         symbol.strip().upper()
-                        for symbol in (important_symbols if important_symbols is not None else symbols)
+                        for symbol in (important_symbols if important_symbols is not None else pin)
                         if symbol and str(symbol).strip()
                     ]
                     if target:

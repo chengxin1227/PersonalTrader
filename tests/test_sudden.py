@@ -36,6 +36,7 @@ def test_live_rules_include_sudden_gain_for_each_session():
         assert rule.condition.value == 10
         assert rule.condition.pool_min_change == 10
         assert rule.condition.sudden_window_seconds == 60
+        assert rule.condition.min_volume is None
 
 
 def _sudden_rule(session: str) -> Rule:
@@ -55,7 +56,6 @@ def _sudden_rule(session: str) -> Rule:
             late_session=session,
             min_price=0.1,
             max_market_cap=1_000_000_000,
-            min_volume=100_000,
         ),
     )
 
@@ -92,8 +92,9 @@ def test_sudden_discover_uses_afterhours_rank(caplog):
         asyncio.run(run())
     client.scan_afterhours.assert_awaited_once_with(10, 1_000_000_000)
     client.smallcap_page.assert_not_called()
-    assert engine._sudden_pool["afterhours-sudden-10"] == {"DKI"}
-    assert any("pool +1 DKI" in record.message for record in caplog.records)
+    # No volume floor: low-volume THIN is kept; CHEAP still fails min_price.
+    assert engine._sudden_pool["afterhours-sudden-10"] == {"DKI", "THIN"}
+    assert any("pool +2 DKI, THIN" in record.message for record in caplog.records)
 
 
 def test_sudden_discover_uses_premarket_rank():
@@ -125,7 +126,7 @@ def test_sudden_discover_uses_regular_gainers():
 
     asyncio.run(run())
     client.regular_gainers.assert_awaited_once_with(
-        10, max_market_cap=1_000_000_000, min_volume=100_000, min_price=0.1
+        10, max_market_cap=1_000_000_000, min_volume=None, min_price=0.1
     )
     assert engine._sudden_pool["regular-sudden-10"] == {"BBB"}
 
@@ -173,3 +174,34 @@ def test_sudden_match_keeps_pool_when_quote_missing():
     asyncio.run(run())
     assert engine._sudden_pool["afterhours-sudden-10"] == {"CRIS", "DKI"}
     assert "CRIS" in engine._sudden_prices["afterhours-sudden-10"]
+
+
+def test_sudden_alert_shows_session_change_not_window_gain():
+    import time
+
+    from monitor.session import now_et
+
+    engine = _engine()
+    live = time.time()
+    engine._sudden_day = now_et().date().isoformat()
+    engine._sudden_pool["afterhours-sudden-10"] = {"AAA"}
+    # Prior ~60s ago at $1.00; current $1.20 → window +20%, but alert should show session +35%.
+    engine._sudden_prices["afterhours-sudden-10"] = {"AAA": [(live - 60.0, 1.0)]}
+    engine._sudden_discovered_at["afterhours-sudden-10"] = 10**12
+    client = AsyncMock()
+    engine._trend_moomoo = client
+    engine.moomoo = client
+    engine.verbose = False
+    client.after_hours_quotes = AsyncMock(
+        return_value={
+            "AAA": Quote(symbol="AAA", price=1.2, change_pct=35.0, volume=200_000)
+        }
+    )
+
+    async def run() -> None:
+        matched = await engine._match_sudden_rule(_sudden_rule("afterhours"))
+        assert len(matched) == 1
+        assert matched[0].change_pct == 35.0
+        assert matched[0].price == 1.2
+
+    asyncio.run(run())

@@ -51,6 +51,10 @@ class Store:
         self._day_gains: dict[str, Any] | None = None
         self._peak_gains_path = data_dir / "peak_gains.json"
         self._peak_gains: dict[str, Any] | None = None
+        self._afterhours_peaks_path = data_dir / "afterhours_peaks.json"
+        self._afterhours_peaks: dict[str, Any] | None = None
+        self._premarket_peaks_path = data_dir / "premarket_peaks.json"
+        self._premarket_peaks: dict[str, Any] | None = None
         self._new_highs_path = data_dir / "session_new_highs.json"
         self._new_highs: dict[str, Any] | None = None
         self._trend_watch_path = data_dir / "trend_watch.json"
@@ -282,6 +286,136 @@ class Store:
     def _save_peak_gains(self, peaks: dict[str, Any]) -> None:
         self._peak_gains = peaks
         _atomic_write_json(self._peak_gains_path, peaks)
+
+    def note_afterhours_peak(self, day: str, symbol: str, change_pct: float) -> float:
+        """Remember the highest after-hours change seen for `symbol` on `day`."""
+        peaks = self._load_afterhours_peaks()
+        row = peaks.setdefault(day, {})
+        if not isinstance(row, dict):
+            row = {}
+            peaks[day] = row
+        key = symbol.upper()
+        existing = row.get(key)
+        if existing is not None:
+            try:
+                prior = float(existing)
+            except (TypeError, ValueError):
+                prior = float("-inf")
+            if prior >= change_pct:
+                return prior
+        row[key] = change_pct
+        self._prune_afterhours_peaks(peaks, day)
+        self._save_afterhours_peaks(peaks)
+        return change_pct
+
+    def afterhours_peak(self, day: str, symbol: str) -> float | None:
+        row = self._load_afterhours_peaks().get(day, {})
+        if not isinstance(row, dict):
+            return None
+        value = row.get(symbol.upper())
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def afterhours_peaks(self, day: str) -> dict[str, float]:
+        row = self._load_afterhours_peaks().get(day, {})
+        if not isinstance(row, dict):
+            return {}
+        out: dict[str, float] = {}
+        for symbol, value in row.items():
+            if not isinstance(symbol, str):
+                continue
+            try:
+                out[symbol.upper()] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _prune_afterhours_peaks(self, peaks: dict[str, Any], day: str) -> None:
+        cutoff = date.fromisoformat(day) - timedelta(days=21)
+        for stale in [
+            item
+            for item in peaks
+            if _is_iso_date(item) and date.fromisoformat(item) < cutoff
+        ]:
+            peaks.pop(stale, None)
+
+    def _load_afterhours_peaks(self) -> dict[str, Any]:
+        if self._afterhours_peaks is not None:
+            return self._afterhours_peaks
+        if not self._afterhours_peaks_path.exists():
+            self._afterhours_peaks = {}
+            return self._afterhours_peaks
+        with self._afterhours_peaks_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self._afterhours_peaks = payload if isinstance(payload, dict) else {}
+        return self._afterhours_peaks
+
+    def _save_afterhours_peaks(self, peaks: dict[str, Any]) -> None:
+        self._afterhours_peaks = peaks
+        _atomic_write_json(self._afterhours_peaks_path, peaks)
+
+    def note_premarket_peak(self, day: str, symbol: str, change_pct: float) -> float:
+        """Remember the highest pre-market change seen for `symbol` on `day`."""
+        peaks = self._load_premarket_peaks()
+        row = peaks.setdefault(day, {})
+        if not isinstance(row, dict):
+            row = {}
+            peaks[day] = row
+        key = symbol.upper()
+        existing = row.get(key)
+        if existing is not None:
+            try:
+                prior = float(existing)
+            except (TypeError, ValueError):
+                prior = float("-inf")
+            if prior >= change_pct:
+                return prior
+        row[key] = change_pct
+        self._prune_premarket_peaks(peaks, day)
+        self._save_premarket_peaks(peaks)
+        return change_pct
+
+    def premarket_peaks(self, day: str) -> dict[str, float]:
+        row = self._load_premarket_peaks().get(day, {})
+        if not isinstance(row, dict):
+            return {}
+        out: dict[str, float] = {}
+        for symbol, value in row.items():
+            if not isinstance(symbol, str):
+                continue
+            try:
+                out[symbol.upper()] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _prune_premarket_peaks(self, peaks: dict[str, Any], day: str) -> None:
+        cutoff = date.fromisoformat(day) - timedelta(days=21)
+        for stale in [
+            item
+            for item in peaks
+            if _is_iso_date(item) and date.fromisoformat(item) < cutoff
+        ]:
+            peaks.pop(stale, None)
+
+    def _load_premarket_peaks(self) -> dict[str, Any]:
+        if self._premarket_peaks is not None:
+            return self._premarket_peaks
+        if not self._premarket_peaks_path.exists():
+            self._premarket_peaks = {}
+            return self._premarket_peaks
+        with self._premarket_peaks_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self._premarket_peaks = payload if isinstance(payload, dict) else {}
+        return self._premarket_peaks
+
+    def _save_premarket_peaks(self, peaks: dict[str, Any]) -> None:
+        self._premarket_peaks = peaks
+        _atomic_write_json(self._premarket_peaks_path, peaks)
 
     def new_high_watch(
         self, day: str, rule_id: str, symbol: str

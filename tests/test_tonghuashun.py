@@ -1,5 +1,36 @@
 from monitor.problems import problem_notice
-from monitor.tonghuashun import _encrypt, format_selfstock, parse_selfstock
+from monitor.tonghuashun import (
+    _encrypt,
+    format_selfstock,
+    parse_selfstock,
+    previous_watchlist_session,
+    summary_group_order,
+)
+
+
+def test_important_watchlist_previous_session_cycle():
+    assert previous_watchlist_session("盘前") == "盘后"
+    assert previous_watchlist_session("盘中") == "盘前"
+    assert previous_watchlist_session("盘后") == "盘中"
+    assert previous_watchlist_session("其他") is None
+
+
+def test_summary_bump_moves_repeats_to_top():
+    existing = ["IMC", "OMH", "TANH", "BRIA"]
+    assert summary_group_order(existing, ["TANH"], bump=True) == [
+        "TANH",
+        "IMC",
+        "OMH",
+        "BRIA",
+    ]
+
+
+def test_summary_no_bump_preserves_order_and_appends_new():
+    existing = ["TANH", "IMC", "OMH"]
+    # Pool refresh must not bury TANH after a repeat bump.
+    assert summary_group_order(
+        existing, ["CKX", "EDSA", "IMC", "OMH", "TANH"], bump=False
+    ) == ["TANH", "IMC", "OMH", "CKX", "EDSA"]
 
 
 def test_group_content_keeps_the_order_given():

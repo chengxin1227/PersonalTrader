@@ -10,6 +10,9 @@ from monitor.session import (
     is_regular_session,
     is_trading_day,
     afterhours_board_slot,
+    session_board_slot,
+    afterhours_late_window,
+    session_late_window,
     check_reminder_text,
     due_check_reminders,
     afterhours_just_opened,
@@ -116,9 +119,9 @@ def test_check_reminder_text_names_the_lists_to_review():
     assert (
         check_reminder_text(
             "盘后2.5小时",
-            ["盘后涨幅前5", "盘后涨超50%的股票", "盘中熔断或涨超80%的股票"],
+            ["盘后最高涨幅前5的股票", "盘后涨超50%的股票", "盘中熔断或涨超80%的股票"],
         )
-        == "盘后2.5小时，请检查盘后涨幅前5和盘后涨超50%的股票和盘中熔断或涨超80%的股票"
+        == "盘后2.5小时，请检查盘后最高涨幅前5的股票和盘后涨超50%的股票和盘中熔断或涨超80%的股票"
     )
 
 
@@ -165,13 +168,36 @@ def test_last_hour_records_before_the_close_and_alerts_from_15():
     assert last_hour_phase(datetime(2026, 10, 7, 20, 0, tzinfo=ET), hours=2, session="afterhours") is None
 
 
+def test_afterhours_late_window_is_last_two_hours():
+    assert not afterhours_late_window(datetime(2026, 10, 15, 17, 59, tzinfo=ET), hours=2)
+    assert afterhours_late_window(datetime(2026, 10, 15, 18, 0, tzinfo=ET), hours=2)
+    assert afterhours_late_window(datetime(2026, 10, 15, 19, 59, tzinfo=ET), hours=2)
+    assert not afterhours_late_window(datetime(2026, 10, 15, 20, 0, tzinfo=ET), hours=2)
+    assert not afterhours_late_window(datetime(2026, 10, 17, 18, 0, tzinfo=ET), hours=2)
+
+
+def test_session_late_window_covers_premarket_and_regular():
+    assert session_late_window("premarket", datetime(2026, 10, 15, 7, 30, tzinfo=ET), hours=2)
+    assert not session_late_window("premarket", datetime(2026, 10, 15, 7, 29, tzinfo=ET), hours=2)
+    assert session_late_window("regular", datetime(2026, 10, 15, 14, 0, tzinfo=ET), hours=2)
+    assert not session_late_window("regular", datetime(2026, 10, 15, 13, 59, tzinfo=ET), hours=2)
+    assert session_late_window("盘中", datetime(2026, 10, 15, 15, 0, tzinfo=ET), hours=2)
+
+
 def test_afterhours_board_slot_is_each_half_hour():
     assert afterhours_board_slot(datetime(2026, 10, 6, 15, 59, tzinfo=ET)) is None
     assert afterhours_board_slot(datetime(2026, 10, 6, 16, 0, tzinfo=ET)) == datetime(
         2026, 10, 6, 16, 0, tzinfo=ET
     )
-    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 29, tzinfo=ET)) == datetime(
+    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 9, tzinfo=ET)) == datetime(
         2026, 10, 6, 16, 0, tzinfo=ET
+    )
+    # Extra 16:10 ET board (≈10:10 NZ) for all after-hours top-5 digests.
+    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 10, tzinfo=ET)) == datetime(
+        2026, 10, 6, 16, 10, tzinfo=ET
+    )
+    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 29, tzinfo=ET)) == datetime(
+        2026, 10, 6, 16, 10, tzinfo=ET
     )
     assert afterhours_board_slot(datetime(2026, 10, 6, 16, 30, tzinfo=ET)) == datetime(
         2026, 10, 6, 16, 30, tzinfo=ET
@@ -181,6 +207,28 @@ def test_afterhours_board_slot_is_each_half_hour():
     )
     assert afterhours_board_slot(datetime(2026, 10, 6, 20, 0, tzinfo=ET)) is None
     assert afterhours_board_slot(datetime(2026, 10, 10, 17, 0, tzinfo=ET)) is None
+
+
+def test_session_board_slot_covers_premarket_and_regular():
+    assert session_board_slot("premarket", datetime(2026, 10, 6, 3, 59, tzinfo=ET)) is None
+    assert session_board_slot("premarket", datetime(2026, 10, 6, 4, 0, tzinfo=ET)) == datetime(
+        2026, 10, 6, 4, 0, tzinfo=ET
+    )
+    assert session_board_slot("premarket", datetime(2026, 10, 6, 8, 45, tzinfo=ET)) == datetime(
+        2026, 10, 6, 8, 30, tzinfo=ET
+    )
+    assert session_board_slot("premarket", datetime(2026, 10, 6, 9, 30, tzinfo=ET)) is None
+    assert session_board_slot("regular", datetime(2026, 10, 6, 9, 29, tzinfo=ET)) is None
+    assert session_board_slot("regular", datetime(2026, 10, 6, 9, 30, tzinfo=ET)) == datetime(
+        2026, 10, 6, 9, 30, tzinfo=ET
+    )
+    assert session_board_slot("regular", datetime(2026, 10, 6, 11, 5, tzinfo=ET)) == datetime(
+        2026, 10, 6, 11, 0, tzinfo=ET
+    )
+    assert session_board_slot("regular", datetime(2026, 10, 6, 16, 0, tzinfo=ET)) is None
+    assert session_board_slot("afterhours", datetime(2026, 10, 6, 16, 10, tzinfo=ET)) == (
+        afterhours_board_slot(datetime(2026, 10, 6, 16, 10, tzinfo=ET))
+    )
 
 
 def test_afterhours_window():

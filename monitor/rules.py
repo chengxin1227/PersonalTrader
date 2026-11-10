@@ -660,8 +660,8 @@ def peak_leaderboard_line(quote: Quote, *, company: bool = False) -> str:
         peak = change
     name = display_name(quote) if company else (quote.symbol or "")
     return (
-        f"{name}{FIELD_GAP}峰值{peak:+.1f}%{FIELD_GAP}"
-        f"现{change:+.1f}%{FIELD_GAP}{format_price(quote.price or 0.0)}"
+        f"{name}{FIELD_GAP}{peak:+.1f}%{FIELD_GAP}"
+        f"{change:+.1f}%{FIELD_GAP}{format_price(quote.price or 0.0)}"
     )
 
 

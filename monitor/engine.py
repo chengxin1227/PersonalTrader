@@ -1595,6 +1595,7 @@ class MonitorEngine:
                 return
             try:
                 await self.ths.add_important(symbols, session)
+                await self._arrange_important_by_afterhours()
                 logger.info(
                     "同花顺 %s reminder sync: %s",
                     config.important.ths_group,
@@ -1714,6 +1715,7 @@ class MonitorEngine:
             try:
                 await self.ths.add_daily([symbol], session)
                 await self.ths.add_important([symbol], session)
+                await self._arrange_important_by_afterhours()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 watched symbol failed for %s: %s", symbol, exc)
 
@@ -3101,8 +3103,24 @@ class MonitorEngine:
         self.store.mark_fired(state, slot_key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, message.replace("\n", " | "))
         pin = [quote.symbol for quote in leaders]
-        # Top-N boards replace the rule group with the current leaders only.
-        self._add_to_tonghuashun(rule, leaders, board=True, pin_symbols=pin)
+        if _sorts_ths_by_peak_fade(rule):
+            # Halt/80%: keep the full pool, sort by peak−close fade (no clear/replace).
+            self._add_to_tonghuashun(
+                rule,
+                self._halt_or_day_pool_symbols(rule),
+                board=True,
+                pin_symbols=pin,
+            )
+        elif _is_ah_touch_board_rule(rule):
+            self._add_to_tonghuashun(
+                rule,
+                self._ah_touch_pool_symbols(rule),
+                board=True,
+                pin_symbols=pin,
+            )
+        else:
+            # Plain *-top5 boards replace the group with current leaders only.
+            self._add_to_tonghuashun(rule, leaders, board=True, pin_symbols=pin)
 
     def _halt_or_day_pool_symbols(self, rule: Rule) -> list[str]:
         """Symbols that hit halt or the regular touch / day-gain threshold today."""
@@ -3704,9 +3722,9 @@ class MonitorEngine:
         important = self.load_config().important
         self.ths.set_important_group(important.ths_group)
         want_important = _wants_important_watchlist(important, rule, board=board)
-        replace_board = board and rule.condition.top_n is not None
+        replace_board = board and _is_peak_top_board(rule)
         if replace_board:
-            # Half-hour top-N groups keep only the current leaders.
+            # Plain *-top5 groups keep only the current leaders.
             symbols = [symbol for symbol in pin if symbol]
             pin = list(symbols)
         async with self._ths_lock:
@@ -3804,9 +3822,34 @@ class MonitorEngine:
                     ]
                     if target:
                         await self.ths.add_important(target, session)
+                        await self._arrange_important_by_afterhours()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 update failed for %s: %s", group, exc)
                 await self._note_problem(f"Tonghuashun add failed: {exc}")
+
+    async def _arrange_important_by_afterhours(self) -> None:
+        """Reorder 我的自选 by after-hours gain, highest first."""
+        client = self._trend_moomoo or self.moomoo
+        if client is None or not self.ths.configured:
+            return
+        group = self.ths.important_group
+        members = await self.ths.group_symbols(group)
+        if not members:
+            return
+        found = await client.after_hours_quotes(members)
+        changes = {
+            symbol: quote.change_pct
+            for symbol, quote in (found or {}).items()
+            if quote.change_pct is not None
+        }
+        ordered = sorted(
+            members,
+            key=lambda symbol: changes.get(symbol, float("-inf")),
+            reverse=True,
+        )
+        if ordered == members:
+            return
+        await self.ths.arrange(group, ordered)
 
     async def _session_changes(self, rule: Rule, symbols: list[str]) -> dict[str, float | None]:
         """Current gain for the rule's session, so the group sorts high to low."""

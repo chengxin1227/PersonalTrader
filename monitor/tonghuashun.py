@@ -680,6 +680,17 @@ class TonghuashunClient:
     async def arrange(self, group: str, ordered: list[str]) -> None:
         await asyncio.to_thread(self._arrange_sync, group.strip(), ordered)
 
+    def _group_symbols_sync(self, name: str) -> list[str]:
+        def work(http: httpx.Client) -> list[str]:
+            _group_id, rows = self._group(http, name)
+            return [code.upper() for code, _ in rows]
+
+        return self._with_session(work)
+
+    async def group_symbols(self, group: str) -> list[str]:
+        """Current symbols in a custom group, top to bottom."""
+        return await asyncio.to_thread(self._group_symbols_sync, group.strip())
+
     async def sync_groups(self, keep_names: list[str]) -> dict[str, list[str]]:
         """Create missing rule groups and delete unused custom groups."""
         return await asyncio.to_thread(self._sync_groups_sync, keep_names)

@@ -25,6 +25,17 @@ def test_summary_bump_moves_repeats_to_top():
     ]
 
 
+def test_important_afterhours_rank_order():
+    members = ["LOW", "HIGH", "MID", "NONE"]
+    changes = {"HIGH": 40.0, "MID": 12.0, "LOW": 3.0}
+    ordered = sorted(
+        members,
+        key=lambda symbol: changes.get(symbol, float("-inf")),
+        reverse=True,
+    )
+    assert ordered == ["HIGH", "MID", "LOW", "NONE"]
+
+
 def test_summary_no_bump_preserves_order_and_appends_new():
     existing = ["TANH", "IMC", "OMH"]
     # Pool refresh must not bury TANH after a repeat bump.

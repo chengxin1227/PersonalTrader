@@ -343,10 +343,10 @@ def test_leaderboard_line_keeps_ticker_unless_company_requested():
     assert leaderboard_line(quote, company=True) == f"Acme{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
     quote.session_high_pct = 45.2
     assert peak_leaderboard_line(quote) == (
-        f"ABCD{FIELD_GAP}峰值+45.2%{FIELD_GAP}现+18.4%{FIELD_GAP}$1.12"
+        f"ABCD{FIELD_GAP}+45.2%{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
     )
     assert peak_leaderboard_line(quote, company=True) == (
-        f"Acme{FIELD_GAP}峰值+45.2%{FIELD_GAP}现+18.4%{FIELD_GAP}$1.12"
+        f"Acme{FIELD_GAP}+45.2%{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
     )
     quote.change_pct = 40.0
     quote.session_high_pct = 70.0

@@ -250,7 +250,19 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                         )
                         continue
                     if rule.condition.type is ConditionType.REGULAR_CLOSE:
-                        cap = rule.condition.max_market_cap or 100_000_000
+                        if rule.symbol not in {"*", "ALL"} and rule.condition.abs_change:
+                            source = (
+                                "Yahoo"
+                                if rule.symbol.lstrip("^") in {"IXIC", "NDX", "DJI", "GSPC"}
+                                or rule.symbol.startswith("^")
+                                else "Moomoo"
+                            )
+                            print(
+                                f"    - {rule.name}: last {rule.condition.close_minutes}m of the "
+                                f"regular session, |{rule.symbol.lstrip('^')}| > {rule.condition.value:g}% "
+                                f"via {source} (important reminder)"
+                            )
+                            continue
                         if rule.condition.min_recent_day_change is not None:
                             what = f"gained > {rule.condition.min_recent_day_change:g}% at some point today"
                         else:

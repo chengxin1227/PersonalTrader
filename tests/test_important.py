@@ -37,6 +37,7 @@ def test_rules_yaml_loads_important_block():
         "afterhours-sudden-10",
         "regular-sudden-10",
         "premarket-sudden-10",
+        "regular-nasdaq-2",
     }
     assert set(config.important.watchlist.always) == {
         "afterhours-day25-10",

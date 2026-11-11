@@ -63,6 +63,8 @@ class Condition(BaseModel):
     pool_min_change: Optional[float] = None
     min_price: Optional[float] = None
     close_minutes: int = Field(default=5, ge=1)
+    # When true with regular_close + a concrete symbol: match if abs(change) > value.
+    abs_change: bool = False
 
 
 class Rule(BaseModel):

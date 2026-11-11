@@ -128,6 +128,11 @@ def _is_close_rule(rule: Rule) -> bool:
     return rule.condition.type is ConditionType.REGULAR_CLOSE
 
 
+def _is_symbol_close_rule(rule: Rule) -> bool:
+    """Named-symbol close check (e.g. IXIC ±2%), not a scanner pool."""
+    return _is_close_rule(rule) and rule.symbol not in {"*", "ALL"}
+
+
 def _is_regular_gain_rule(rule: Rule) -> bool:
     return rule.condition.type is ConditionType.REGULAR_GAIN
 
@@ -1086,7 +1091,9 @@ class MonitorEngine:
                     ]
                     if close_rules and self._close_due():
                         for rule in close_rules:
-                            if _is_breaker_rule(rule) and not _is_day_spike_rule(rule):
+                            if _is_symbol_close_rule(rule):
+                                matched = await self._match_symbol_close(rule)
+                            elif _is_breaker_rule(rule) and not _is_day_spike_rule(rule):
                                 matched = await self._match_breaker_close(rule)
                             elif _is_day_spike_rule(rule) and not _is_breaker_rule(rule):
                                 matched = await self._match_day_gain_close(rule)
@@ -3119,6 +3126,37 @@ class MonitorEngine:
         touched = self.store.day_gain_symbols(minimum, [day])
         return await self._match_close(rule, touched, f"Regular-close day gain > {minimum:g}%")
 
+    async def _match_symbol_close(self, rule: Rule) -> list[Quote]:
+        """Close-window check for one symbol (Yahoo IXIC, Moomoo ETF, etc.)."""
+        from monitor.yahoo import quote as yahoo_quote
+        from monitor.yahoo import uses_yahoo_quote
+
+        symbol = rule.symbol.strip().upper()
+        if uses_yahoo_quote(symbol):
+            quote = await yahoo_quote(symbol)
+        else:
+            client = self._trend_moomoo or self.moomoo
+            if client is None:
+                return []
+            snaps = await self._moomoo_snapshots(client, [symbol])
+            quote = snaps.get(symbol)
+        if quote is None or quote.change_pct is None:
+            return []
+        change = quote.change_pct
+        threshold = rule.condition.value
+        shown = quote.symbol or symbol
+        if rule.condition.abs_change:
+            if abs(change) <= threshold:
+                return []
+            label = f"Regular-close |{shown}| > {threshold:g}%"
+        else:
+            if change <= threshold:
+                return []
+            label = f"Regular-close {shown} > {threshold:g}%"
+        quote.regular_change_pct = change
+        self._log_saved_matches(rule.id, [shown], label)
+        return [quote]
+
     async def _match_close(self, rule: Rule, symbols: list[str], label: str) -> list[Quote]:
         client = self._trend_moomoo or self.moomoo
         if client is None:
@@ -3937,32 +3975,33 @@ class MonitorEngine:
             )
             if apply_cooldown:
                 self.store.mark_fired(state, key, datetime.now(timezone.utc))
-            important_symbols: list[str] = [] if skip_important else [quote.symbol]
-            pin = [quote.symbol]
-            if _sorts_ths_by_peak_fade(rule):
-                self._add_to_tonghuashun(
-                    rule,
-                    self._halt_or_day_pool_symbols(rule),
-                    board=False,
-                    important_symbols=important_symbols,
-                    pin_symbols=pin,
-                )
-            elif _is_ah_touch_board_rule(rule):
-                self._add_to_tonghuashun(
-                    rule,
-                    self._ah_touch_pool_symbols(rule),
-                    board=False,
-                    important_symbols=important_symbols,
-                    pin_symbols=pin,
-                )
-            else:
-                self._add_to_tonghuashun(
-                    rule,
-                    [quote],
-                    board=False,
-                    important_symbols=important_symbols,
-                    pin_symbols=pin,
-                )
+            if not _is_symbol_close_rule(rule):
+                important_symbols: list[str] = [] if skip_important else [quote.symbol]
+                pin = [quote.symbol]
+                if _sorts_ths_by_peak_fade(rule):
+                    self._add_to_tonghuashun(
+                        rule,
+                        self._halt_or_day_pool_symbols(rule),
+                        board=False,
+                        important_symbols=important_symbols,
+                        pin_symbols=pin,
+                    )
+                elif _is_ah_touch_board_rule(rule):
+                    self._add_to_tonghuashun(
+                        rule,
+                        self._ah_touch_pool_symbols(rule),
+                        board=False,
+                        important_symbols=important_symbols,
+                        pin_symbols=pin,
+                    )
+                else:
+                    self._add_to_tonghuashun(
+                        rule,
+                        [quote],
+                        board=False,
+                        important_symbols=important_symbols,
+                        pin_symbols=pin,
+                    )
             return None
         await self._fill_prior_session(rule, quote)
         # Persist the trigger move for later history; show prior-session on the live top line.
@@ -3999,32 +4038,33 @@ class MonitorEngine:
         if apply_cooldown:
             self.store.mark_fired(state, key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, alert.message)
-        important_symbols = [] if skip_important else [quote.symbol]
-        pin = [quote.symbol]
-        if _sorts_ths_by_peak_fade(rule):
-            self._add_to_tonghuashun(
-                rule,
-                self._halt_or_day_pool_symbols(rule),
-                board=False,
-                important_symbols=important_symbols,
-                pin_symbols=pin,
-            )
-        elif _is_ah_touch_board_rule(rule):
-            self._add_to_tonghuashun(
-                rule,
-                self._ah_touch_pool_symbols(rule),
-                board=False,
-                important_symbols=important_symbols,
-                pin_symbols=pin,
-            )
-        else:
-            self._add_to_tonghuashun(
-                rule,
-                [quote],
-                board=False,
-                important_symbols=important_symbols,
-                pin_symbols=pin,
-            )
+        if not _is_symbol_close_rule(rule):
+            important_symbols = [] if skip_important else [quote.symbol]
+            pin = [quote.symbol]
+            if _sorts_ths_by_peak_fade(rule):
+                self._add_to_tonghuashun(
+                    rule,
+                    self._halt_or_day_pool_symbols(rule),
+                    board=False,
+                    important_symbols=important_symbols,
+                    pin_symbols=pin,
+                )
+            elif _is_ah_touch_board_rule(rule):
+                self._add_to_tonghuashun(
+                    rule,
+                    self._ah_touch_pool_symbols(rule),
+                    board=False,
+                    important_symbols=important_symbols,
+                    pin_symbols=pin,
+                )
+            else:
+                self._add_to_tonghuashun(
+                    rule,
+                    [quote],
+                    board=False,
+                    important_symbols=important_symbols,
+                    pin_symbols=pin,
+                )
         return alert
 
     def _ths_active_session(self) -> str | None:
@@ -4046,7 +4086,11 @@ class MonitorEngine:
             return
         self.ths.set_important_group(config.important.ths_group)
         day = now_et().date().isoformat()
-        names = [rule.name for rule in config.rules if rule.enabled and rule.name]
+        names = [
+            rule.name
+            for rule in config.rules
+            if rule.enabled and rule.name and not _is_symbol_close_rule(rule)
+        ]
         session = self._ths_active_session()
         need_structure = not self._ths_groups_synced
         need_session_clear = bool(session) and self._ths_cleared_session_day.get(session) != day

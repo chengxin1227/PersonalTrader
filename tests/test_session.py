@@ -75,7 +75,7 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
     assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 15, 44, tzinfo=ET))] == []
     close = due_check_reminders(datetime(2026, 10, 15, 15, 45, tzinfo=ET))
     assert [item.key for item in close] == ["regular-close-15"]
-    assert close[0].rule_ids == ("afterhours-halt-or-day80", "regular-sudden-10")
+    assert close[0].rule_ids == ("afterhours-halt-or-day50", "regular-sudden-10")
     assert due_check_reminders(datetime(2026, 10, 15, 15, 47, 59, tzinfo=ET))
     assert due_check_reminders(datetime(2026, 10, 15, 15, 48, tzinfo=ET)) == []
 
@@ -87,19 +87,19 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
         CheckReminder(
             "afterhours-2h30",
             time(18, 30),
-            ("afterhours-top5", "afterhours-halt-or-day80"),
+            ("afterhours-top5", "afterhours-halt-or-day50"),
             "盘后2.5小时",
         ),
         CheckReminder(
             "afterhours-3h",
             time(19, 0),
-            ("afterhours-top5", "afterhours-halt-or-day80"),
+            ("afterhours-top5", "afterhours-halt-or-day50"),
             "盘后3小时",
         ),
     ]
     mid = due_check_reminders(datetime(2026, 10, 15, 18, 30, tzinfo=ET), extra=extra)
     assert [item.key for item in mid] == ["afterhours-2h30"]
-    assert mid[0].rule_ids == ("afterhours-top5", "afterhours-halt-or-day80")
+    assert mid[0].rule_ids == ("afterhours-top5", "afterhours-halt-or-day50")
     assert [
         item.key for item in due_check_reminders(datetime(2026, 10, 15, 19, 0, tzinfo=ET), extra=extra)
     ] == ["afterhours-3h"]
@@ -119,9 +119,9 @@ def test_check_reminder_text_names_the_lists_to_review():
     assert (
         check_reminder_text(
             "盘后2.5小时",
-            ["盘后最高涨幅前5的股票", "盘后涨超50%的股票", "盘中熔断或涨超80%的股票"],
+            ["盘后涨幅最高前5的股票", "盘后涨超50%的股票", "盘中熔断或涨超50%的股票"],
         )
-        == "盘后2.5小时，请检查盘后最高涨幅前5的股票和盘后涨超50%的股票和盘中熔断或涨超80%的股票"
+        == "盘后2.5小时，请检查盘后涨幅最高前5的股票和盘后涨超50%的股票和盘中熔断或涨超50%的股票"
     )
 
 
@@ -186,18 +186,14 @@ def test_session_late_window_covers_premarket_and_regular():
 
 def test_afterhours_board_slot_is_each_half_hour():
     assert afterhours_board_slot(datetime(2026, 10, 6, 15, 59, tzinfo=ET)) is None
-    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 0, tzinfo=ET)) == datetime(
-        2026, 10, 6, 16, 0, tzinfo=ET
-    )
-    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 9, tzinfo=ET)) == datetime(
-        2026, 10, 6, 16, 0, tzinfo=ET
-    )
-    # Extra 16:10 ET board (≈10:10 NZ) for all after-hours top-5 digests.
-    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 10, tzinfo=ET)) == datetime(
-        2026, 10, 6, 16, 10, tzinfo=ET
+    # First board at 16:05 ET (≈10:05 NZ); nothing before that.
+    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 0, tzinfo=ET)) is None
+    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 4, tzinfo=ET)) is None
+    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 5, tzinfo=ET)) == datetime(
+        2026, 10, 6, 16, 5, tzinfo=ET
     )
     assert afterhours_board_slot(datetime(2026, 10, 6, 16, 29, tzinfo=ET)) == datetime(
-        2026, 10, 6, 16, 10, tzinfo=ET
+        2026, 10, 6, 16, 5, tzinfo=ET
     )
     assert afterhours_board_slot(datetime(2026, 10, 6, 16, 30, tzinfo=ET)) == datetime(
         2026, 10, 6, 16, 30, tzinfo=ET
@@ -226,8 +222,8 @@ def test_session_board_slot_covers_premarket_and_regular():
         2026, 10, 6, 11, 0, tzinfo=ET
     )
     assert session_board_slot("regular", datetime(2026, 10, 6, 16, 0, tzinfo=ET)) is None
-    assert session_board_slot("afterhours", datetime(2026, 10, 6, 16, 10, tzinfo=ET)) == (
-        afterhours_board_slot(datetime(2026, 10, 6, 16, 10, tzinfo=ET))
+    assert session_board_slot("afterhours", datetime(2026, 10, 6, 16, 5, tzinfo=ET)) == (
+        afterhours_board_slot(datetime(2026, 10, 6, 16, 5, tzinfo=ET))
     )
 
 

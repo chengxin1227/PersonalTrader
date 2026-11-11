@@ -45,6 +45,39 @@ def _quote(
     )
 
 
+def test_scanner_rejects_total_cap_at_or_under_min_market_cap():
+    rule = Rule(
+        id="premarket-min-cap",
+        name="min cap",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.PREMARKET_GAIN,
+            value=10,
+            min_market_cap=1_000_000,
+            max_market_cap=1_000_000_000,
+        ),
+    )
+    quote = _quote()
+    assert evaluate_premarket_scan(
+        rule, quote, market_cap=1_000_000, in_premarket=True
+    ).matched is False
+    assert evaluate_premarket_scan(
+        rule, quote, market_cap=1_000_001, in_premarket=True
+    ).matched
+    assert evaluate_afterhours_scan(
+        rule.model_copy(
+            update={
+                "condition": rule.condition.model_copy(
+                    update={"type": ConditionType.AFTERHOURS_GAIN}
+                )
+            }
+        ),
+        quote,
+        market_cap=500_000,
+        in_afterhours=True,
+    ).matched is False
+
+
 def test_scanner_requires_gain_and_total_cap_at_or_under_the_limit():
     rule = _scan_rule()
     quote = _quote()
@@ -343,10 +376,10 @@ def test_leaderboard_line_keeps_ticker_unless_company_requested():
     assert leaderboard_line(quote, company=True) == f"Acme{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
     quote.session_high_pct = 45.2
     assert peak_leaderboard_line(quote) == (
-        f"ABCD{FIELD_GAP}+45.2%{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
+        f"ABCD{FIELD_GAP}+18.4%{FIELD_GAP}+45.2%{FIELD_GAP}$1.12"
     )
     assert peak_leaderboard_line(quote, company=True) == (
-        f"Acme{FIELD_GAP}+45.2%{FIELD_GAP}+18.4%{FIELD_GAP}$1.12"
+        f"Acme{FIELD_GAP}+18.4%{FIELD_GAP}+45.2%{FIELD_GAP}$1.12"
     )
     quote.change_pct = 40.0
     quote.session_high_pct = 70.0
@@ -511,8 +544,8 @@ def test_afterhours_ah50_peak_fade_thresholds():
 
 def test_afterhours_halt_or_day80_matches_either_condition():
     rule = Rule(
-        id="afterhours-halt-or-day80",
-        name="盘中熔断或涨超80%的股票",
+        id="afterhours-halt-or-day50",
+        name="盘中熔断或涨超50%的股票",
         symbol="*",
         condition=Condition(
             type=ConditionType.AFTERHOURS_GAIN,
@@ -520,10 +553,10 @@ def test_afterhours_halt_or_day80_matches_either_condition():
             max_market_cap=500_000_000,
             min_volume=100_000,
             top_n=5,
-            min_regular_touch=80,
+            min_regular_touch=50,
             include_circuit_breaker=True,
             require_circuit_breaker=True,
-            min_recent_day_change=80,
+            min_recent_day_change=50,
             recent_day_count=1,
             intraday_touch=True,
         ),

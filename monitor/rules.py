@@ -28,6 +28,54 @@ def day_gain_tiers_for(rule: Rule) -> list[DayGainTier]:
     return []
 
 
+def _market_cap_max(rule: Rule) -> float:
+    if rule.condition.max_market_cap is not None:
+        return rule.condition.max_market_cap
+    return 100_000_000
+
+
+def _market_cap_bound_text(rule: Rule) -> str:
+    """Human-readable cap bounds for match reasons."""
+    parts: list[str] = []
+    if rule.condition.min_market_cap is not None:
+        parts.append(f"> ${rule.condition.min_market_cap:,.0f}")
+    parts.append(f"<= ${_market_cap_max(rule):,.0f}")
+    return " and ".join(parts)
+
+
+def _finish_with_market_cap(
+    rule: Rule,
+    market_cap: float | None,
+    *,
+    cap_filtered: bool,
+    session_text: str,
+) -> RuleEvaluation:
+    """Apply min/max total-cap gates and build the final scan evaluation."""
+    min_cap = rule.condition.min_market_cap
+    max_cap = _market_cap_max(rule)
+    if market_cap is None:
+        if cap_filtered:
+            return RuleEvaluation(
+                matched=True,
+                reason=f"{session_text} and total cap {_market_cap_bound_text(rule)}",
+            )
+        return RuleEvaluation(matched=False, reason="no total market cap")
+    if min_cap is not None and market_cap <= min_cap:
+        return RuleEvaluation(
+            matched=False,
+            reason=f"total cap ${market_cap:,.0f} <= ${min_cap:,.0f}",
+        )
+    if market_cap > max_cap:
+        return RuleEvaluation(
+            matched=False,
+            reason=f"total cap ${market_cap:,.0f} > ${max_cap:,.0f}",
+        )
+    return RuleEvaluation(
+        matched=True,
+        reason=f"{session_text} and total cap ${market_cap:,.0f}",
+    )
+
+
 def matched_day_gain_tier(rule: Rule, quote: Quote) -> DayGainTier | None:
     """First tier whose prior-day floor and session gain both clear."""
     tiers = day_gain_tiers_for(rule)
@@ -149,25 +197,11 @@ def evaluate_last_hour_scan(
     low_volume = _reject_low_volume(rule, quote)
     if low_volume is not None:
         return low_volume
-    max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
-    if market_cap is None:
-        if cap_filtered:
-            return RuleEvaluation(
-                matched=True,
-                reason=(
-                    f"last hour {change:.2f}% > {rule.condition.value:.2f}% "
-                    f"and total cap <= ${max_cap:,.0f}"
-                ),
-            )
-        return RuleEvaluation(matched=False, reason="no total market cap")
-    if market_cap > max_cap:
-        return RuleEvaluation(
-            matched=False,
-            reason=f"total cap ${market_cap:,.0f} > ${max_cap:,.0f}",
-        )
-    return RuleEvaluation(
-        matched=True,
-        reason=f"last hour {change:.2f}% > {rule.condition.value:.2f}% and total cap ${market_cap:,.0f}",
+    return _finish_with_market_cap(
+        rule,
+        market_cap,
+        cap_filtered=cap_filtered,
+        session_text=f"last hour {change:.2f}% > {rule.condition.value:.2f}%",
     )
 
 
@@ -221,14 +255,10 @@ def evaluate_premarket_scan(
                 matched=False,
                 reason="no tier matched (" + " or ".join(parts) + ")",
             )
-    elif day_min is not None and quote.recent_day_spike is not True:
-        return RuleEvaluation(
-            matched=False,
-            reason=(
-                f"no day gain > {day_min:.2f}% in the last {rule.condition.recent_day_count} days"
-            ),
-        )
-    max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
+    else:
+        pool = _reject_without_halt_or_day(rule, quote)
+        if pool is not None:
+            return pool
     if (
         rule.condition.min_fade_from_high is not None
         and quote.session_high_pct is not None
@@ -247,21 +277,86 @@ def evaluate_premarket_scan(
             if matched_tier is not None
             else f"pre-market {quote.change_pct:.2f}% >= {rule.condition.value:.2f}%"
         )
-    if market_cap is None:
-        if cap_filtered:
-            return RuleEvaluation(
-                matched=True,
-                reason=f"{session_text} and total cap <= ${max_cap:,.0f}",
-            )
-        return RuleEvaluation(matched=False, reason="no total market cap")
-    if market_cap > max_cap:
+    return _finish_with_market_cap(
+        rule, market_cap, cap_filtered=cap_filtered, session_text=session_text
+    )
+
+
+def _reject_without_halt_or_day(rule: Rule, quote: Quote) -> RuleEvaluation | None:
+    """Halt/50% pool: upward halt and/or prior-day gain floor."""
+    wants_breaker = rule.condition.require_circuit_breaker
+    day_min = rule.condition.min_recent_day_change
+    wants_day = day_min is not None or bool(rule.condition.day_gain_tiers)
+    has_breaker = quote.session_circuit_breaker is True
+    has_day = quote.recent_day_spike is True
+    if wants_breaker and wants_day:
+        if has_breaker or has_day:
+            return None
+        shown = f"{day_min:g}" if day_min is not None else "?"
         return RuleEvaluation(
             matched=False,
-            reason=f"total cap ${market_cap:,.0f} > ${max_cap:,.0f}",
+            reason=f"no upward halt and no day gain > {shown}%",
         )
-    return RuleEvaluation(
-        matched=True,
-        reason=f"{session_text} and total cap ${market_cap:,.0f}",
+    if wants_breaker and not has_breaker:
+        return RuleEvaluation(matched=False, reason="no upward circuit breaker")
+    if wants_day and not has_day:
+        shown = f"{day_min:.2f}" if day_min is not None else "?"
+        return RuleEvaluation(
+            matched=False,
+            reason=(
+                f"no day gain > {shown}% in the last {rule.condition.recent_day_count} days"
+            ),
+        )
+    return None
+
+
+def evaluate_regular_day_scan(
+    rule: Rule,
+    quote: Quote,
+    *,
+    market_cap: float | None,
+    cap_filtered: bool = False,
+) -> RuleEvaluation:
+    """Regular session among names that cleared a prior-day gain floor and/or halt."""
+    if quote.change_pct is None:
+        return RuleEvaluation(matched=False, reason="no regular change")
+    day_tiers = day_gain_tiers_for(rule)
+    tiered_day = bool(rule.condition.day_gain_tiers)
+    day_min = rule.condition.min_recent_day_change
+    matched_tier = matched_day_gain_tier(rule, quote) if day_tiers else None
+    wants_breaker = rule.condition.require_circuit_breaker
+    if day_min is None and not tiered_day and not wants_breaker:
+        return RuleEvaluation(matched=False, reason="no day-gain floor")
+    if not tiered_day and quote.change_pct <= rule.condition.value:
+        return RuleEvaluation(
+            matched=False,
+            reason=f"regular {quote.change_pct:.2f}% <= {rule.condition.value:.2f}%",
+        )
+    low_volume = _reject_low_volume(rule, quote)
+    if low_volume is not None:
+        return low_volume
+    if tiered_day:
+        if matched_tier is None:
+            parts = [
+                f"day>{tier.min_recent_day_change:g}% & RTH>{tier.value:g}%"
+                for tier in day_tiers
+            ]
+            return RuleEvaluation(
+                matched=False,
+                reason="no tier matched (" + " or ".join(parts) + ")",
+            )
+    else:
+        pool = _reject_without_halt_or_day(rule, quote)
+        if pool is not None:
+            return pool
+    session_text = (
+        f"regular {quote.change_pct:.2f}% > {matched_tier.value:g}% "
+        f"(day>{matched_tier.min_recent_day_change:g}%)"
+        if matched_tier is not None
+        else f"regular {quote.change_pct:.2f}% > {rule.condition.value:.2f}%"
+    )
+    return _finish_with_market_cap(
+        rule, market_cap, cap_filtered=cap_filtered, session_text=session_text
     )
 
 
@@ -281,7 +376,6 @@ def evaluate_regular_peak_fade(
     low_volume = _reject_low_volume(rule, quote)
     if low_volume is not None:
         return low_volume
-    max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
     peak = quote.session_high_pct
     fade_pp = (peak - quote.change_pct) if peak is not None else 0.0
     session_text = (
@@ -290,21 +384,8 @@ def evaluate_regular_peak_fade(
         if peak is not None
         else f"regular {quote.change_pct:.2f}%"
     )
-    if market_cap is None:
-        if cap_filtered:
-            return RuleEvaluation(
-                matched=True,
-                reason=f"{session_text} and total cap <= ${max_cap:,.0f}",
-            )
-        return RuleEvaluation(matched=False, reason="no total market cap")
-    if market_cap > max_cap:
-        return RuleEvaluation(
-            matched=False,
-            reason=f"total cap ${market_cap:,.0f} > ${max_cap:,.0f}",
-        )
-    return RuleEvaluation(
-        matched=True,
-        reason=f"{session_text} and total cap ${market_cap:,.0f}",
+    return _finish_with_market_cap(
+        rule, market_cap, cap_filtered=cap_filtered, session_text=session_text
     )
 
 
@@ -481,32 +562,11 @@ def evaluate_afterhours_scan(
                 rule, quote, suffix=f"{trend}{session}", tier=matched_tier
             ),
         )
-    max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
-    if market_cap is None:
-        if cap_filtered:
-            return RuleEvaluation(
-                matched=True,
-                reason=_afterhours_match_reason(
-                    rule,
-                    quote,
-                    suffix=f" and total cap <= ${max_cap:,.0f}",
-                    tier=matched_tier,
-                ),
-            )
-        return RuleEvaluation(matched=False, reason="no total market cap")
-    if market_cap > max_cap:
-        return RuleEvaluation(
-            matched=False,
-            reason=f"total cap ${market_cap:,.0f} > ${max_cap:,.0f}",
-        )
-    return RuleEvaluation(
-        matched=True,
-        reason=_afterhours_match_reason(
-            rule,
-            quote,
-            suffix=f" and total cap ${market_cap:,.0f}",
-            tier=matched_tier,
-        ),
+    return _finish_with_market_cap(
+        rule,
+        market_cap,
+        cap_filtered=cap_filtered,
+        session_text=_afterhours_match_reason(rule, quote, tier=matched_tier),
     )
 
 
@@ -553,15 +613,16 @@ def evaluate_stable_afterhours(
     low_volume = _reject_low_volume(rule, quote)
     if low_volume is not None:
         return low_volume
-    max_cap = rule.condition.max_market_cap if rule.condition.max_market_cap is not None else 100_000_000
-    if not cap_filtered and rule.condition.max_market_cap is not None:
+    if not cap_filtered and (
+        rule.condition.max_market_cap is not None or rule.condition.min_market_cap is not None
+    ):
         return RuleEvaluation(matched=False, reason="no total market cap")
     return RuleEvaluation(
         matched=True,
         reason=(
             f"after-hours range {band_low:.2f}%..{band_high:.2f}% "
             f"stayed within {low:.2f}%..{high:.2f}% for {minutes:g}m "
-            f"and total cap <= ${max_cap:,.0f}"
+            f"and total cap {_market_cap_bound_text(rule)}"
         ),
     )
 
@@ -653,15 +714,15 @@ def leaderboard_line(quote: Quote, *, company: bool = False) -> str:
 
 
 def peak_leaderboard_line(quote: Quote, *, company: bool = False) -> str:
-    """Half-hour board line ranked by session peak gain, with current gain."""
+    """Half-hour board line: current gain first, then session peak, then price."""
     change = quote.change_pct if quote.change_pct is not None else 0.0
     peak = quote.session_high_pct
     if peak is None:
         peak = change
     name = display_name(quote) if company else (quote.symbol or "")
     return (
-        f"{name}{FIELD_GAP}{peak:+.1f}%{FIELD_GAP}"
-        f"{change:+.1f}%{FIELD_GAP}{format_price(quote.price or 0.0)}"
+        f"{name}{FIELD_GAP}{change:+.1f}%{FIELD_GAP}"
+        f"{peak:+.1f}%{FIELD_GAP}{format_price(quote.price or 0.0)}"
     )
 
 

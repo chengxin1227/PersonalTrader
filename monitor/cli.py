@@ -22,6 +22,15 @@ from monitor.store import Store
 T = TypeVar("T")
 
 
+
+def _cap_text(rule) -> str:
+    max_cap = rule.condition.max_market_cap or 100_000_000
+    min_cap = rule.condition.min_market_cap
+    if min_cap is None:
+        return f"total cap <= ${max_cap:,.0f}"
+    return f"total cap > ${min_cap:,.0f} and <= ${max_cap:,.0f}"
+
+
 def _print_routes(settings: Settings, rules: list) -> None:
     routed = [rule for rule in rules if rule.notify]
     if not routed:
@@ -193,8 +202,8 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                         }.get(rule.condition.type.value, "session")
                         print(
                             f"    - {rule.name}: top {rule.condition.top_n} "
-                            f"{session} peak names{pool} every 30m{singles}, "
-                            f"total cap <= ${cap:,.0f}{volume}"
+                            f"{session} names by current gain{pool} every 30m{singles}, "
+                            f"{_cap_text(rule)}{volume}"
                         )
                         continue
                     if (
@@ -215,7 +224,7 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             f"    - {rule.name}: first {rule.condition.stable_minutes}m "
                             f"after-hours stays within {rule.condition.stable_low:g}%.."
                             f"{rule.condition.stable_high:g}%, {regular}"
-                            f"total cap <= ${cap:,.0f}{volume}"
+                            f"{_cap_text(rule)}{volume}"
                         )
                         continue
                     if rule.condition.require_new_high:
@@ -227,7 +236,7 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             f"    - {rule.name}: after gain > {rule.condition.value:g}%, "
                             f"alert on each new high after "
                             f"{rule.condition.prior_change_lag_minutes}m, "
-                            f"total cap <= ${cap:,.0f}{volume}"
+                            f"{_cap_text(rule)}{volume}"
                         )
                         continue
                     if rule.condition.type is ConditionType.REGULAR_GAIN:
@@ -237,7 +246,7 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             volume = f", volume > {rule.condition.min_volume:,.0f}"
                         print(
                             f"    - {rule.name}: regular session gain > {rule.condition.value:g}% "
-                            f"as soon as it shows, total cap <= ${cap:,.0f}{volume}"
+                            f"as soon as it shows, {_cap_text(rule)}{volume}"
                         )
                         continue
                     if rule.condition.type is ConditionType.REGULAR_CLOSE:
@@ -250,7 +259,7 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             what += f", regular change > {rule.condition.min_regular_change:g}%"
                         print(
                             f"    - {rule.name}: last {rule.condition.close_minutes}m of the "
-                            f"regular session, {what}, total cap <= ${cap:,.0f}"
+                            f"regular session, {what}, {_cap_text(rule)}"
                         )
                         continue
                     if rule.condition.type is ConditionType.LATE_SESSION_GAIN:
@@ -272,7 +281,7 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                         )
                         print(
                             f"    - {rule.name}: {span} "
-                            f">{rule.condition.value:g}% and total cap <= ${cap:,.0f}{volume}"
+                            f">{rule.condition.value:g}% and {_cap_text(rule)}{volume}"
                         )
                         continue
                     if rule.condition.type is ConditionType.SUDDEN_GAIN:
@@ -286,16 +295,11 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             "premarket": "pre-market",
                             "afterhours": "after-hours",
                         }.get(rule.condition.late_session, "regular")
-                        pool = (
-                            rule.condition.pool_min_change
-                            if rule.condition.pool_min_change is not None
-                            else rule.condition.value
-                        )
                         print(
-                            f"    - {rule.name}: {session} names already > {pool:g}%, "
-                            f"then +{rule.condition.value:g}% in "
-                            f"{rule.condition.sudden_window_seconds}s, "
-                            f"total cap <= ${cap:,.0f}{volume}"
+                            f"    - {rule.name}: {session} +{rule.condition.value:g}% in "
+                            f"{rule.condition.sudden_window_seconds}s"
+                            f" (no prior session floor), "
+                            f"{_cap_text(rule)}{volume}"
                         )
                         continue
                     volume = ""
@@ -370,7 +374,7 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                         cap_text = "any market cap"
                     else:
                         cap = rule.condition.max_market_cap or 100_000_000
-                        cap_text = f"total cap <= ${cap:,.0f}"
+                        cap_text = f"{_cap_text(rule)}"
                     comparator = (
                         ">"
                         if rule.condition.min_regular_change is not None

@@ -13,7 +13,7 @@ def test_example_rules_group_by_their_session():
     assert config.rules
     for rule in config.rules:
         assert rule.group == rule.condition_session
-        assert rule.description
+        assert rule.description or rule.board_description
 
 
 def test_rules_can_sit_under_their_session():

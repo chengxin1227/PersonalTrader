@@ -35,6 +35,7 @@ class Condition(BaseModel):
     type: ConditionType
     value: float = 0
     max_market_cap: Optional[float] = None
+    min_market_cap: Optional[float] = None
     min_volume: Optional[float] = None
     min_regular_change: Optional[float] = None
     min_regular_volume: Optional[float] = None
@@ -75,6 +76,9 @@ class Rule(BaseModel):
     symbol: str
     enabled: bool = True
     cooldown_minutes: int = Field(default=60, ge=0)
+    # First match (condition.value) is silent; after this delay, alert when gain > confirm_value.
+    confirm_delay_minutes: int = Field(default=0, ge=0)
+    confirm_value: Optional[float] = None
     condition: Condition
     slack_message: Optional[str] = None
 

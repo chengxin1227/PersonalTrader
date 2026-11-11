@@ -132,11 +132,13 @@ class TonghuashunClient:
         self._days_path = settings.data_dir / "ths_group_days.json"
         self._watchlist_sessions_path = settings.data_dir / "ths_watchlist_sessions.json"
         self._important_sessions_path = settings.data_dir / "ths_important_watchlist_sessions.json"
+        self._rule_group_sessions_path = settings.data_dir / "ths_rule_group_sessions.json"
         self._lock = threading.Lock()
         self._markets: dict[str, str] | None = None
         self._days: dict[str, str] | None = None
         self._watchlist_sessions: dict[str, str] | None = None
         self._important_sessions: dict[str, str] | None = None
+        self._rule_group_sessions: dict[str, dict[str, str]] | None = None
         self._important_group = _DEFAULT_IMPORTANT_GROUP
 
     @property
@@ -344,6 +346,114 @@ class TonghuashunClient:
             encoding="utf-8",
         )
 
+    def _rule_group_tags(self) -> dict[str, dict[str, str]]:
+        if self._rule_group_sessions is None:
+            try:
+                raw = json.loads(self._rule_group_sessions_path.read_text(encoding="utf-8"))
+                parsed: dict[str, dict[str, str]] = {}
+                if isinstance(raw, dict):
+                    for group, tags in raw.items():
+                        if not group or not isinstance(tags, dict):
+                            continue
+                        parsed[str(group)] = {
+                            str(symbol).upper(): str(session)
+                            for symbol, session in tags.items()
+                            if symbol and session
+                        }
+                self._rule_group_sessions = parsed
+            except (OSError, ValueError, AttributeError):
+                self._rule_group_sessions = {}
+        return self._rule_group_sessions
+
+    def _save_rule_group_tags(self) -> None:
+        tags = self._rule_group_tags()
+        self._rule_group_sessions_path.parent.mkdir(parents=True, exist_ok=True)
+        self._rule_group_sessions_path.write_text(
+            json.dumps(tags, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def _tag_rule_group_symbols(
+        self, group_name: str, symbols: list[str], session: str, members: list[str] | None = None
+    ) -> None:
+        """Remember which session added each symbol in a (possibly shared) rule group."""
+        session_key = (session or "").strip()
+        if session_key not in _SESSION_WATCHLIST_GROUP:
+            session_key = "盘中"
+        group_tags = self._rule_group_tags().setdefault(group_name, {})
+        for symbol in symbols:
+            key = symbol.strip().upper()
+            if key:
+                group_tags[key] = session_key
+        if members is not None:
+            keep = {symbol.strip().upper() for symbol in members if symbol and str(symbol).strip()}
+            for symbol in list(group_tags):
+                if symbol not in keep:
+                    del group_tags[symbol]
+        if not group_tags:
+            self._rule_group_tags().pop(group_name, None)
+        self._save_rule_group_tags()
+
+    def _clear_rule_group_tags(self, group_name: str) -> None:
+        tags = self._rule_group_tags()
+        if group_name in tags:
+            del tags[group_name]
+            self._save_rule_group_tags()
+
+    def _dedupe_symbols(self, symbols: list[str]) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for symbol in symbols:
+            key = symbol.strip().upper()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(key)
+        return ordered
+
+    def _replace_summary_group(
+        self,
+        http: httpx.Client,
+        group_name: str,
+        symbols: list[str],
+        session: str,
+        *,
+        important: bool,
+    ) -> None:
+        """Empty a summary group and write ``symbols`` in the given high→low order."""
+        ordered = self._dedupe_symbols(symbols)
+        group_id, rows = self._group(http, group_name)
+        known = self._known_markets()
+        for code, market in rows:
+            known.setdefault(code.upper(), market)
+        for symbol in ordered:
+            if symbol not in known:
+                self._market(http, symbol)
+        tags = self._session_tags(important=important)
+        if important:
+            for symbol in list(tags):
+                del tags[symbol]
+        else:
+            for symbol in list(tags):
+                if tags.get(symbol) == session:
+                    del tags[symbol]
+        for symbol in ordered:
+            tags[symbol] = session
+        self._save_session_tags(important=important)
+        existing = [code.upper() for code, _ in rows]
+        if existing == ordered:
+            return
+        self._write(http, "/content/v1/delete", group_id, rows)
+        if ordered:
+            self._write(
+                http, "/content/v1/add", group_id, [(code, known[code]) for code in ordered]
+            )
+        logger.info(
+            "同花顺 %s: %s",
+            group_name,
+            ", ".join(ordered) if ordered else "(empty)",
+        )
+
     def _ensure_summary_group(
         self,
         http: httpx.Client,
@@ -366,14 +476,7 @@ class TonghuashunClient:
         for code, market in rows:
             known.setdefault(code.upper(), market)
         existing = [code.upper() for code, _ in rows]
-        leading: list[str] = []
-        seen: set[str] = set()
-        for symbol in symbols:
-            key = symbol.strip().upper()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            leading.append(key)
+        leading = self._dedupe_symbols(symbols)
         if not leading:
             return
         tags = self._session_tags(important=important)
@@ -466,14 +569,22 @@ class TonghuashunClient:
         return [g for g in groups if str(g.get("id", "")).startswith("0_")]
 
     def _clear_group_rows(
-        self, http: httpx.Client, name: str, group_id: str, rows: list[tuple[str, str]], day: str
+        self,
+        http: httpx.Client,
+        name: str,
+        group_id: str,
+        rows: list[tuple[str, str]],
+        day: str,
+        *,
+        reason: str = "earlier day",
     ) -> None:
         self._write(http, "/content/v1/delete", group_id, rows)
         if rows:
-            logger.info("同花顺 cleared %s from an earlier day", name)
+            logger.info("同花顺 cleared %s (%s)", name, reason)
         days = self._group_days()
         days[name] = day
         self._save_group_days()
+        self._clear_rule_group_tags(name)
 
     def _group(self, http: httpx.Client, name: str) -> tuple[str, list[tuple[str, str]]]:
         """Group id and its (code, market) rows, newest first. Creates the group if needed."""
@@ -562,7 +673,14 @@ class TonghuashunClient:
             group_id, rows = self._group(http, name)
             days = self._group_days()
             if replace or days.get(name) != day:
-                self._clear_group_rows(http, name, group_id, rows, day)
+                self._clear_group_rows(
+                    http,
+                    name,
+                    group_id,
+                    rows,
+                    day,
+                    reason="replace" if replace else "earlier day",
+                )
                 rows = []
             known = self._known_markets()
             for code, market in rows:
@@ -588,6 +706,9 @@ class TonghuashunClient:
                 else list(symbols)
             )
             pin_set = {symbol for symbol in pin if symbol}
+            if replace:
+                # Peak top-N boards stay in the rule group only; skip 盘x分组 / 我的自选.
+                return members
             if pin_set:
                 self._ensure_summary_group(
                     http,
@@ -632,18 +753,71 @@ class TonghuashunClient:
 
         self._with_session(work)
 
-    def _arrange_sync(self, name: str, ordered: list[str]) -> None:
+    def _arrange_sync(
+        self,
+        name: str,
+        ordered: list[str],
+        session: str | None = None,
+        tag_symbols: list[str] | None = None,
+    ) -> None:
         def work(http: httpx.Client) -> None:
             group_id, rows = self._group(http, name)
-            if [code.upper() for code, _ in rows] == ordered:
-                return
-            known = self._known_markets()
-            # A batch add lands at the top in the order given, so clear and add the full list.
-            self._write(http, "/content/v1/delete", group_id, rows)
-            self._write(http, "/content/v1/add", group_id, [(code, known[code]) for code in ordered])
-            logger.info("同花顺 %s: %s", name, ", ".join(ordered))
+            if [code.upper() for code, _ in rows] != ordered:
+                known = self._known_markets()
+                # A batch add lands at the top in the order given, so clear and add the full list.
+                self._write(http, "/content/v1/delete", group_id, rows)
+                self._write(
+                    http, "/content/v1/add", group_id, [(code, known[code]) for code in ordered]
+                )
+                logger.info("同花顺 %s: %s", name, ", ".join(ordered))
+            if session:
+                tagged = tag_symbols if tag_symbols is not None else ordered
+                self._tag_rule_group_symbols(name, tagged, session, members=ordered)
 
         self._with_session(work)
+
+    def _clear_rule_group_session_sync(self, group_name: str, session: str) -> list[str]:
+        """Remove rule-group names tagged for ``session`` (previous period on shared groups)."""
+
+        def work(http: httpx.Client) -> list[str]:
+            group_id, rows = self._group(http, group_name)
+            group_tags = self._rule_group_tags().setdefault(group_name, {})
+            if not rows:
+                stale = [symbol for symbol, tagged in list(group_tags.items()) if tagged == session]
+                for symbol in stale:
+                    del group_tags[symbol]
+                if not group_tags:
+                    self._rule_group_tags().pop(group_name, None)
+                if stale:
+                    self._save_rule_group_tags()
+                return []
+            known = self._known_markets()
+            keep_rows: list[tuple[str, str]] = []
+            removed: list[str] = []
+            for code, market in rows:
+                symbol = code.upper()
+                known.setdefault(symbol, market)
+                tagged = group_tags.get(symbol)
+                # Untagged leftovers count as the session being cleared once.
+                if tagged == session or tagged is None:
+                    removed.append(symbol)
+                    group_tags.pop(symbol, None)
+                else:
+                    keep_rows.append((symbol, known[symbol]))
+            if not removed:
+                return []
+            self._write(http, "/content/v1/delete", group_id, rows)
+            if keep_rows:
+                self._write(http, "/content/v1/add", group_id, keep_rows)
+            if not group_tags:
+                self._rule_group_tags().pop(group_name, None)
+            self._save_rule_group_tags()
+            logger.info(
+                "同花顺 %s cleared %s: %s", group_name, session, ", ".join(removed)
+            )
+            return removed
+
+        return self._with_session(work)
 
     async def members(
         self,
@@ -677,8 +851,25 @@ class TonghuashunClient:
             replace,
         )
 
-    async def arrange(self, group: str, ordered: list[str]) -> None:
-        await asyncio.to_thread(self._arrange_sync, group.strip(), ordered)
+    async def arrange(
+        self,
+        group: str,
+        ordered: list[str],
+        *,
+        session: str | None = None,
+        tag_symbols: list[str] | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._arrange_sync,
+            group.strip(),
+            ordered,
+            (session or "").strip() or None,
+            (
+                None
+                if tag_symbols is None
+                else [symbol.strip().upper() for symbol in tag_symbols if symbol.strip()]
+            ),
+        )
 
     def _group_symbols_sync(self, name: str) -> list[str]:
         def work(http: httpx.Client) -> list[str]:
@@ -706,6 +897,30 @@ class TonghuashunClient:
     async def add_important(self, symbols: list[str], session: str) -> None:
         """Also keep names in the important summary group (我的自选)."""
         await asyncio.to_thread(self._add_summary_sync, symbols, session, important=True)
+
+    def _replace_summary_sync(
+        self, symbols: list[str], session: str, *, important: bool
+    ) -> None:
+        fresh = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+        session_key = session.strip()
+        if session_key not in _SESSION_WATCHLIST_GROUP:
+            session_key = "盘中"
+        group_name = (
+            self._important_group if important else _session_watchlist_group(session_key)
+        )
+
+        def work(http: httpx.Client) -> None:
+            self._replace_summary_group(
+                http, group_name, fresh, session_key, important=important
+            )
+
+        self._with_session(work)
+
+    async def replace_important(self, symbols: list[str], session: str) -> None:
+        """Clear 我的自选 and write ``symbols`` in the given order."""
+        await asyncio.to_thread(
+            self._replace_summary_sync, symbols, session, important=True
+        )
 
     def _clear_session_watchlist_tags(self, session: str) -> None:
         tags = self._session_tags(important=False)
@@ -742,10 +957,15 @@ class TonghuashunClient:
         )
 
     def _clear_session_day_sync(
-        self, session: str, day: str, rule_names: list[str]
+        self,
+        session: str,
+        day: str,
+        rule_names: list[str],
+        shared_rule_names: list[str] | None = None,
     ) -> list[str]:
         """Clear this session's rule groups + 盘x分组 for the new ET day.
 
+        Shared rule groups: drop the previous session's symbols when this session starts.
         我的自选: clear the previous session's names when this session starts, and drop
         any leftover same-session tags from an earlier day.
         """
@@ -758,14 +978,31 @@ class TonghuashunClient:
         cleared = self._clear_day_sync(names, day)
         if watch_name and watch_name in cleared:
             self._clear_session_watchlist_tags(session_key)
+        prev = previous_watchlist_session(session_key)
+        shared = [
+            name.strip()
+            for name in (shared_rule_names or [])
+            if name and str(name).strip()
+        ]
+        if prev and shared:
+            for name in shared:
+                removed = self._clear_rule_group_session_sync(name, prev)
+                if removed and name not in cleared:
+                    cleared.append(name)
         self._clear_important_previous_session_sync(session_key)
         self._clear_important_session_day_sync(session_key, day)
         return cleared
 
-    async def clear_session_day(self, session: str, day: str, rule_names: list[str]) -> list[str]:
-        """Clear this session's rule/盘x groups; 我的自选 drops the previous session."""
+    async def clear_session_day(
+        self,
+        session: str,
+        day: str,
+        rule_names: list[str],
+        shared_rule_names: list[str] | None = None,
+    ) -> list[str]:
+        """Clear this session's rule/盘x groups; shared + 我的自选 drop the previous session."""
         return await asyncio.to_thread(
-            self._clear_session_day_sync, session, day, rule_names
+            self._clear_session_day_sync, session, day, rule_names, shared_rule_names
         )
 
     def list_sync(self) -> list[tuple[str, str]]:

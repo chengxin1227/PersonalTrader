@@ -440,11 +440,16 @@ def afterhours_leaders(
     quotes: list[Quote],
     limit: int,
     min_volume: int | None = None,
+    min_change: float | None = None,
 ) -> list[Quote]:
     """Rank by after-hours gain. Skip zero prices, and thin names after the open."""
     ready: list[Quote] = []
     for quote in quotes:
         if quote.price is None or quote.price <= 0:
+            continue
+        if quote.change_pct is None:
+            continue
+        if min_change is not None and quote.change_pct <= min_change:
             continue
         if min_volume is not None and (quote.volume is None or quote.volume <= min_volume):
             continue
@@ -479,22 +484,31 @@ def peak_leaders(
     limit: int,
     min_volume: int | None = None,
 ) -> list[Quote]:
-    """Rank by session peak gain (stored or observed), highest first."""
+    """Rank by current session gain, highest first; attach peak for the board line."""
     ready: list[tuple[float, Quote]] = []
     for quote in quotes:
         if quote.price is None or quote.price <= 0:
+            continue
+        if quote.change_pct is None:
             continue
         if min_volume is not None and (quote.volume is None or quote.volume <= min_volume):
             continue
         observed = observed_session_peak(quote)
         stored = peaks.get(quote.symbol.upper())
-        candidates = [value for value in (observed, stored) if value is not None]
-        if not candidates:
-            continue
-        peak = max(candidates)
-        ready.append((peak, quote.model_copy(update={"session_high_pct": peak})))
+        peak_candidates = [
+            value
+            for value in (observed, stored, quote.change_pct)
+            if value is not None
+        ]
+        peak = max(peak_candidates)
+        ready.append(
+            (
+                quote.change_pct,
+                quote.model_copy(update={"session_high_pct": peak}),
+            )
+        )
     ready.sort(key=lambda item: item[0], reverse=True)
-    return [quote for _peak, quote in ready[:limit]]
+    return [quote for _change, quote in ready[:limit]]
 
 
 def afterhours_peak_leaders(
@@ -503,7 +517,7 @@ def afterhours_peak_leaders(
     limit: int,
     min_volume: int | None = None,
 ) -> list[Quote]:
-    """Alias for after-hours peak boards."""
+    """Alias for after-hours top boards (current gain rank, peak on the line)."""
     return peak_leaders(quotes, peaks, limit, min_volume)
 
 
@@ -731,13 +745,19 @@ class MoomooClient:
         max_market_cap: float | None = None,
         limit: int | None = None,
         max_pages: int = _MAX_PAGES,
+        min_market_cap: float | None = None,
     ) -> list[tuple[Quote, float | None]]:
         from moomoo import RET_OK, SimpleRankFilter, SimpleRankIndicatorType
 
         filter_list = None
-        if max_market_cap is not None:
+        if min_market_cap is not None or max_market_cap is not None:
+            kwargs: dict[str, float] = {}
+            if min_market_cap is not None:
+                kwargs["interval_min"] = min_market_cap
+            if max_market_cap is not None:
+                kwargs["interval_max"] = max_market_cap
             filter_list = [
-                SimpleRankFilter(SimpleRankIndicatorType.MARKET_CAP, interval_max=max_market_cap)
+                SimpleRankFilter(SimpleRankIndicatorType.MARKET_CAP, **kwargs)
             ]
         if session == "afterhours":
             rank_method = "get_us_after_hours_rank"
@@ -793,14 +813,33 @@ class MoomooClient:
         return [(quote, None) for quote in quotes if quote.symbol in listed]
 
     async def scan_premarket(
-        self, min_change_pct: float, max_market_cap: float
+        self,
+        min_change_pct: float,
+        max_market_cap: float,
+        min_market_cap: float | None = None,
     ) -> list[tuple[Quote, float | None]]:
-        logger.info(
-            "Moomoo pre-market rank, gain >= %.1f%%, total cap <= %.0f",
+        if min_market_cap is None:
+            logger.info(
+                "Moomoo pre-market rank, gain >= %.1f%%, total cap <= %.0f",
+                min_change_pct,
+                max_market_cap,
+            )
+        else:
+            logger.info(
+                "Moomoo pre-market rank, gain >= %.1f%%, total cap > %.0f and <= %.0f",
+                min_change_pct,
+                min_market_cap,
+                max_market_cap,
+            )
+        found = await asyncio.to_thread(
+            self._scan_sync,
             min_change_pct,
+            "premarket",
             max_market_cap,
+            None,
+            _MAX_PAGES,
+            min_market_cap,
         )
-        found = await asyncio.to_thread(self._scan_sync, min_change_pct, "premarket", max_market_cap)
         logger.info("Moomoo pre-market names above threshold: %s", len(found))
         return found
 
@@ -809,14 +848,22 @@ class MoomooClient:
         min_change_pct: float,
         max_market_cap: float | None = None,
         max_pages: int = _MAX_PAGES,
+        min_market_cap: float | None = None,
     ) -> list[tuple[Quote, float | None]]:
-        if max_market_cap is None:
+        if max_market_cap is None and min_market_cap is None:
             logger.info("Moomoo after-hours rank, gain >= %.1f%%", min_change_pct)
-        else:
+        elif min_market_cap is None:
             logger.info(
                 "Moomoo after-hours rank, gain >= %.1f%%, total cap <= %.0f",
                 min_change_pct,
                 max_market_cap,
+            )
+        else:
+            logger.info(
+                "Moomoo after-hours rank, gain >= %.1f%%, total cap > %.0f and <= %.0f",
+                min_change_pct,
+                min_market_cap,
+                max_market_cap or 0,
             )
         found = await asyncio.to_thread(
             self._scan_sync,
@@ -825,6 +872,7 @@ class MoomooClient:
             max_market_cap,
             None,
             max_pages,
+            min_market_cap,
         )
         logger.info("Moomoo after-hours names above threshold: %s", len(found))
         return found
@@ -918,24 +966,37 @@ class MoomooClient:
         max_market_cap: float,
         limit: int,
         min_volume: int | None = None,
+        min_market_cap: float | None = None,
     ) -> list[Quote]:
+        if min_market_cap is None:
+            cap_text = f"total cap <= {max_market_cap:.0f}"
+        else:
+            cap_text = (
+                f"total cap > {min_market_cap:.0f} and <= {max_market_cap:.0f}"
+            )
         if min_volume is None:
             logger.info(
-                "Moomoo after-hours rank, top %s, total cap <= %.0f",
+                "Moomoo after-hours rank, top %s, %s",
                 limit,
-                max_market_cap,
+                cap_text,
             )
             page_limit = _PAGE_SIZE
         else:
             logger.info(
-                "Moomoo after-hours rank, top %s, total cap <= %.0f, volume > %s",
+                "Moomoo after-hours rank, top %s, %s, volume > %s",
                 limit,
-                max_market_cap,
+                cap_text,
                 min_volume,
             )
             page_limit = _PAGE_SIZE * _MAX_PAGES
         found = await asyncio.to_thread(
-            self._scan_sync, -1_000_000, "afterhours", max_market_cap, page_limit
+            self._scan_sync,
+            -1_000_000,
+            "afterhours",
+            max_market_cap,
+            page_limit,
+            _MAX_PAGES,
+            min_market_cap,
         )
         return afterhours_leaders([quote for quote, _cap in found], limit, min_volume)
 
@@ -1032,6 +1093,7 @@ class MoomooClient:
         max_market_cap: float | None = None,
         min_volume: float | None = None,
         min_price: float | None = None,
+        min_market_cap: float | None = None,
     ) -> list[Quote]:
         from moomoo import RET_OK, AccumulateFilter, Market, SimpleFilter, SortDir, StockField
 
@@ -1049,10 +1111,13 @@ class MoomooClient:
             volume.filter_min = min_volume
             volume.is_no_filter = False
             filters.append(volume)
-        if max_market_cap is not None:
+        if min_market_cap is not None or max_market_cap is not None:
             cap = SimpleFilter()
             cap.stock_field = StockField.MARKET_VAL
-            cap.filter_max = max_market_cap
+            if min_market_cap is not None:
+                cap.filter_min = min_market_cap
+            if max_market_cap is not None:
+                cap.filter_max = max_market_cap
             cap.is_no_filter = False
             filters.append(cap)
         # Filter rows only include fields used as conditions. Ask for CUR_PRICE or
@@ -1126,10 +1191,18 @@ class MoomooClient:
         max_market_cap: float | None = None,
         min_volume: float | None = None,
         min_price: float | None = None,
+        min_market_cap: float | None = None,
     ) -> list[Quote]:
         import time
 
-        cache_key = (min_change_pct, max_pages, max_market_cap, min_volume, min_price)
+        cache_key = (
+            min_change_pct,
+            max_pages,
+            max_market_cap,
+            min_volume,
+            min_price,
+            min_market_cap,
+        )
         now = time.monotonic()
         cached = self._regular_gainers_cache.get(cache_key)
         if cached is not None and now - cached[0] < 20:
@@ -1141,15 +1214,22 @@ class MoomooClient:
                 "Moomoo regular-session screen failed: Stock Screening by Conditions "
                 "request failed due to high frequency. Maximum 10 times per 30 seconds."
             )
-        if max_market_cap is None:
+        if max_market_cap is None and min_market_cap is None:
             logger.info("Moomoo regular-session screen, gain > %.1f%%", min_change_pct)
         else:
             volume = "" if min_volume is None else f", volume > {min_volume:,.0f}"
             price = "" if min_price is None else f", price > {min_price:g}"
+            if min_market_cap is None:
+                cap_text = f", total cap <= {max_market_cap:.0f}"
+            else:
+                cap_text = (
+                    f", total cap > {min_market_cap:.0f}"
+                    + (f" and <= {max_market_cap:.0f}" if max_market_cap is not None else "")
+                )
             logger.info(
-                "Moomoo regular-session screen, gain > %.1f%%, total cap <= %.0f%s%s",
+                "Moomoo regular-session screen, gain > %.1f%%%s%s%s",
                 min_change_pct,
-                max_market_cap,
+                cap_text,
                 volume,
                 price,
             )
@@ -1161,6 +1241,7 @@ class MoomooClient:
                 max_market_cap,
                 min_volume,
                 min_price,
+                min_market_cap,
             )
         except RuntimeError as exc:
             if "high frequency" in str(exc).lower() or "too frequent" in str(exc).lower():
@@ -1176,11 +1257,14 @@ class MoomooClient:
         max_market_cap: float,
         min_volume: float | None,
         min_price: float | None = None,
+        min_market_cap: float | None = None,
     ) -> tuple[list[Quote], int]:
         from moomoo import RET_OK, Market, SimpleFilter, StockField
 
         cap = SimpleFilter()
         cap.stock_field = StockField.MARKET_VAL
+        if min_market_cap is not None:
+            cap.filter_min = min_market_cap
         cap.filter_max = max_market_cap
         cap.is_no_filter = False
         price = SimpleFilter()
@@ -1221,7 +1305,13 @@ class MoomooClient:
         max_market_cap: float,
         min_volume: float | None = None,
         min_price: float | None = None,
+        min_market_cap: float | None = None,
     ) -> tuple[list[Quote], int]:
         return await asyncio.to_thread(
-            self._smallcap_page_sync, begin, max_market_cap, min_volume, min_price
+            self._smallcap_page_sync,
+            begin,
+            max_market_cap,
+            min_volume,
+            min_price,
+            min_market_cap,
         )

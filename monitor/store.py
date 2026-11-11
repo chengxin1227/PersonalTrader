@@ -63,11 +63,12 @@ class Store:
 
     def load_state(self) -> dict[str, Any]:
         if not self._state_path.exists():
-            return {"last_prices": {}, "last_fired": {}}
+            return {"last_prices": {}, "last_fired": {}, "confirm_armed": {}}
         with self._state_path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         payload.setdefault("last_prices", {})
         payload.setdefault("last_fired", {})
+        payload.setdefault("confirm_armed", {})
         return payload
 
     def save_state(self, state: dict[str, Any]) -> None:
@@ -111,6 +112,28 @@ class Store:
             current = current.replace(tzinfo=timezone.utc)
         elapsed = (current - last).total_seconds()
         return elapsed < cooldown_minutes * 60
+
+    def confirm_armed_at(self, state: dict[str, Any], key: str) -> datetime | None:
+        value = state.get("confirm_armed", {}).get(key)
+        if not value:
+            return None
+        seen = datetime.fromisoformat(value)
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+        return seen
+
+    def note_confirm_arm(
+        self, state: dict[str, Any], key: str, when: datetime | None = None
+    ) -> datetime:
+        """First write wins — later calls return the original arm time."""
+        existing = self.confirm_armed_at(state, key)
+        if existing is not None:
+            return existing
+        stamp = when or _now()
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        state.setdefault("confirm_armed", {})[key] = stamp.isoformat()
+        return stamp
 
     def note_spike(self, day: str, session: str, symbol: str, when: datetime) -> datetime:
         """Remember the first time a symbol's session gain exceeded the prior threshold."""

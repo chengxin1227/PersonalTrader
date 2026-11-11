@@ -113,7 +113,7 @@ CHECK_REMINDERS = (
     CheckReminder(
         "regular-close-15",
         time(15, 45),
-        ("afterhours-halt-or-day80", "regular-sudden-10"),
+        ("afterhours-halt-or-day50", "regular-sudden-10"),
         "盘中收盘前15分钟",
     ),
     CheckReminder(
@@ -204,9 +204,9 @@ def _half_hour_slot(current: datetime) -> datetime:
 
 
 def afterhours_board_slot(moment: datetime | None = None) -> datetime | None:
-    """Half-hour marks during after-hours (16:00–19:30 ET), plus 16:10.
+    """After-hours board marks: first at 16:05 ET, then each half hour.
 
-    16:10 ET ≈ 10:10 NZ — an extra early pass for all after-hours top-5 boards.
+    16:05 ET ≈ 10:05 NZ — the first after-hours top-5 digest (no 16:00 board).
     """
     return session_board_slot("afterhours", moment)
 
@@ -216,7 +216,7 @@ def session_board_slot(
 ) -> datetime | None:
     """Half-hour board marks for premarket / regular / afterhours.
 
-    After-hours also includes 16:10 ET (≈10:10 NZ).
+    After-hours starts at 16:05 ET (≈10:05 NZ), then :30 / :00.
     """
     current = now_et(moment)
     if session == "premarket":
@@ -230,8 +230,11 @@ def session_board_slot(
     if session == "afterhours":
         if not is_afterhours(current):
             return None
-        if current.hour == 16 and 10 <= current.minute < 30:
-            return current.replace(minute=10, second=0, microsecond=0)
+        # Wait until 16:05 for the first board (≈10:05 NZ).
+        if current.hour == 16 and current.minute < 5:
+            return None
+        if current.hour == 16 and 5 <= current.minute < 30:
+            return current.replace(minute=5, second=0, microsecond=0)
         return _half_hour_slot(current)
     return None
 

@@ -22,6 +22,7 @@ from monitor.moomoo_client import (
 from monitor.models import (
     Alert,
     ConditionType,
+    DayGainTier,
     ImportantConfig,
     MonitorStatus,
     Quote,
@@ -36,12 +37,14 @@ from monitor.rules import (
     evaluate_afterhours_scan,
     evaluate_last_hour_scan,
     evaluate_premarket_scan,
+    evaluate_regular_day_scan,
     evaluate_regular_peak_fade,
     evaluate_stable_afterhours,
     evaluate_rule,
     hour_change_pct,
     leaderboard_line,
     load_rules,
+    matched_day_gain_tier,
     peak_leaderboard_line,
     price_age_seconds_ago,
     render_message,
@@ -142,6 +145,15 @@ def _is_touched_leaderboard(rule: Rule) -> bool:
     )
 
 
+def _is_pool_gain_board(rule: Rule) -> bool:
+    """Half-hour board: halt/day pool ranked by current session gain (not peak fade)."""
+    return (
+        _is_leaderboard_rule(rule)
+        and _is_touched_leaderboard(rule)
+        and rule.condition.min_fade_from_high is None
+    )
+
+
 def _is_peak_top_board(rule: Rule) -> bool:
     """Plain top-N board ranked by session peak gain (not touch-pool / fade)."""
     return (
@@ -210,11 +222,18 @@ def _day_gain_floors(rule: Rule) -> list[float]:
 
 
 def _is_halt_or_day_rule(rule: Rule) -> bool:
-    return _is_breaker_rule(rule) and _is_day_spike_rule(rule)
+    # Leaderboard variants are digest boards, not single-name pool alerts.
+    return (
+        _is_breaker_rule(rule)
+        and _is_day_spike_rule(rule)
+        and not _is_leaderboard_rule(rule)
+    )
 
 
 def _sorts_ths_by_peak_fade(rule: Rule) -> bool:
-    """Halt/80% 同花顺: sort by (intraday peak % − regular close %), larger fade first."""
+    """Halt/50% 同花顺: sort by (intraday peak % − regular close %), larger fade first."""
+    if _is_pool_gain_board(rule):
+        return False
     return _is_halt_or_day_rule(rule) or (
         _is_touched_leaderboard(rule)
         and rule.condition.min_regular_touch is not None
@@ -252,6 +271,23 @@ def _afterhours_scan_rule(rule: Rule) -> Rule:
     scan_rule.condition.min_volume = None
     return scan_rule
 
+
+def _confirm_scan_rule(rule: Rule) -> Rule:
+    """After the first arm touch, scan at confirm_value (e.g. 0%) instead of arm threshold."""
+    if rule.confirm_delay_minutes <= 0 or rule.confirm_value is None:
+        return rule
+    scan_rule = rule.model_copy(deep=True)
+    scan_rule.condition.value = rule.confirm_value
+    if scan_rule.condition.day_gain_tiers:
+        scan_rule.condition.day_gain_tiers = [
+            DayGainTier(
+                min_recent_day_change=tier.min_recent_day_change,
+                value=rule.confirm_value,
+            )
+            for tier in scan_rule.condition.day_gain_tiers
+        ]
+    return scan_rule
+
 def _is_stable_rule(rule: Rule) -> bool:
     condition = rule.condition
     return (
@@ -267,6 +303,19 @@ def _is_last_hour_rule(rule: Rule) -> bool:
 
 def _is_sudden_rule(rule: Rule) -> bool:
     return rule.condition.type is ConditionType.SUDDEN_GAIN
+
+
+def _shared_rule_group_names(config: RulesConfig) -> list[str]:
+    """Rule group names used in more than one of 盘前/盘中/盘后."""
+    sessions_by_name: dict[str, set[str]] = {}
+    for rule in config.rules:
+        if not rule.enabled or not rule.name:
+            continue
+        session = (rule.group or rule.condition_session or "").strip()
+        if session not in {"盘前", "盘中", "盘后"}:
+            continue
+        sessions_by_name.setdefault(rule.name, set()).add(session)
+    return sorted(name for name, sessions in sessions_by_name.items() if len(sessions) > 1)
 
 
 def _important_reminders(config: ImportantConfig) -> list[CheckReminder]:
@@ -824,15 +873,23 @@ class MonitorEngine:
                     rule
                     for rule in config.rules
                     if rule.enabled
-                    and _is_day_spike_rule(rule)
-                    and not _is_breaker_rule(rule)
                     and self._rule_session_open(rule)
+                    and (
+                        (_is_day_spike_rule(rule) and not _is_breaker_rule(rule))
+                        or (
+                            _is_halt_or_day_rule(rule)
+                            and rule.condition.type is ConditionType.PREMARKET_GAIN
+                        )
+                    )
                 ]
                 if not rules:
                     await asyncio.sleep(interval)
                     continue
                 for rule in rules:
-                    matched = await self._match_saved_day(rule)
+                    if _is_halt_or_day_rule(rule):
+                        matched = await self._match_halt_or_day(rule)
+                    else:
+                        matched = await self._match_saved_day(rule)
                     self._note_opend_ok()
                     if not matched:
                         continue
@@ -904,9 +961,39 @@ class MonitorEngine:
                             _is_new_high_rule(rule)
                             or _is_peak_fade_rule(rule)
                             or _is_leaderboard_rule(rule)
+                            or _is_day_spike_rule(rule)
                         ):
                             continue
                         matched = await self._match_regular_gain(rule)
+                        self._note_opend_ok()
+                        if not matched:
+                            continue
+                        async with self._lock:
+                            state = self.store.load_state()
+                            await self._emit_trend_matches(rule, matched, state)
+                            self.store.save_state(state)
+                    regular_day = [
+                        rule
+                        for rule in day_gain_rules
+                        if rule.condition.type is ConditionType.REGULAR_GAIN
+                        and not _is_breaker_rule(rule)
+                    ]
+                    for rule in regular_day:
+                        matched = await self._match_saved_day(rule)
+                        self._note_opend_ok()
+                        if not matched:
+                            continue
+                        async with self._lock:
+                            state = self.store.load_state()
+                            await self._emit_trend_matches(rule, matched, state)
+                            self.store.save_state(state)
+                    regular_halt_or_day = [
+                        rule
+                        for rule in halt_or_day_rules
+                        if rule.condition.type is ConditionType.REGULAR_GAIN
+                    ]
+                    for rule in regular_halt_or_day:
+                        matched = await self._match_halt_or_day(rule)
                         self._note_opend_ok()
                         if not matched:
                             continue
@@ -1083,7 +1170,10 @@ class MonitorEngine:
                                 await self._emit_trend_matches(rule, matched, state)
                                 self.store.save_state(state)
                     afterhours_halt_or_day = [
-                        rule for rule in halt_or_day_rules if not _is_close_rule(rule)
+                        rule
+                        for rule in halt_or_day_rules
+                        if not _is_close_rule(rule)
+                        and rule.condition.type is ConditionType.AFTERHOURS_GAIN
                     ]
                     if afterhours_halt_or_day and self._breaker_due():
                         for rule in afterhours_halt_or_day:
@@ -1145,14 +1235,14 @@ class MonitorEngine:
         if client is None:
             return
         day = now_et().date().isoformat()
-        seen: set[tuple[float, float | None]] = set()
+        seen: set[tuple[float, float | None, float | None]] = set()
         for rule in rules:
             minimum = rule.condition.min_recent_day_change
             if minimum is None:
                 minimum = rule.condition.min_regular_touch
             if minimum is None:
                 continue
-            key = (minimum, rule.condition.max_market_cap)
+            key = (minimum, rule.condition.max_market_cap, rule.condition.min_market_cap)
             if key in seen:
                 continue
             seen.add(key)
@@ -1166,10 +1256,13 @@ class MonitorEngine:
                     == minimum
                 )
                 and item.condition.max_market_cap == rule.condition.max_market_cap
+                and item.condition.min_market_cap == rule.condition.min_market_cap
                 for item in rules
             )
             found = await client.regular_gainers(
-                minimum, max_market_cap=rule.condition.max_market_cap
+                minimum,
+                max_market_cap=rule.condition.max_market_cap,
+                min_market_cap=rule.condition.min_market_cap,
             )
             touched: list[Quote] = list(found)
             for quote in found:
@@ -1179,7 +1272,9 @@ class MonitorEngine:
                 floor = min(20.0, minimum)
                 if floor < minimum and self._day_high_check_due():
                     wide = await client.regular_gainers(
-                        floor, max_market_cap=rule.condition.max_market_cap
+                        floor,
+                        max_market_cap=rule.condition.max_market_cap,
+                        min_market_cap=rule.condition.min_market_cap,
                     )
                     have = {
                         symbol.upper()
@@ -1232,10 +1327,12 @@ class MonitorEngine:
                         continue
                     if alert_rule.condition.max_market_cap != rule.condition.max_market_cap:
                         continue
+                    if alert_rule.condition.min_market_cap != rule.condition.min_market_cap:
+                        continue
                     await self._emit_halt_or_day_pool_entries(alert_rule, fresh)
 
     async def _emit_halt_or_day_pool_entries(self, rule: Rule, quotes: list[Quote]) -> None:
-        """Push once when a name first joins the halt/80% pool; AH alerts use a separate key."""
+        """Push once when a name first joins the halt/50% pool; AH alerts use a separate key."""
         if not quotes or not _is_halt_or_day_rule(rule):
             return
         async with self._lock:
@@ -1255,17 +1352,17 @@ class MonitorEngine:
         if client is None:
             return
         day = now_et().date().isoformat()
-        seen: set[tuple[float, float | None]] = set()
+        seen: set[tuple[float, float | None, float | None]] = set()
         seen_at = datetime.now(timezone.utc)
         for rule in rules:
             minimum = rule.condition.min_afterhours_touch
             if minimum is None:
                 continue
-            key = (minimum, rule.condition.max_market_cap)
+            key = (minimum, rule.condition.max_market_cap, rule.condition.min_market_cap)
             if key in seen:
                 continue
             seen.add(key)
-            found = await client.scan_afterhours(minimum, rule.condition.max_market_cap)
+            found = await client.scan_afterhours(minimum, rule.condition.max_market_cap, min_market_cap=rule.condition.min_market_cap)
             session = afterhours_touch_session(minimum)
             added: list[str] = []
             for quote, _cap in found:
@@ -1286,16 +1383,22 @@ class MonitorEngine:
         if client is None:
             return
         day = now_et().date().isoformat()
-        seen: set[tuple[float, float | None, float | None]] = set()
+        seen: set[tuple[float, float | None, float | None, float | None]] = set()
         for rule in rules:
             for minimum in _day_gain_floors(rule):
-                key = (minimum, rule.condition.max_market_cap, rule.condition.min_volume)
+                key = (
+                    minimum,
+                    rule.condition.max_market_cap,
+                    rule.condition.min_market_cap,
+                    rule.condition.min_volume,
+                )
                 if key in seen:
                     continue
                 seen.add(key)
                 found = await client.regular_gainers(
                     minimum,
                     max_market_cap=rule.condition.max_market_cap,
+                    min_market_cap=rule.condition.min_market_cap,
                     min_volume=rule.condition.min_volume,
                 )
                 symbols = [quote.symbol for quote in found]
@@ -1320,7 +1423,11 @@ class MonitorEngine:
         if client is None or minimum is None:
             return
         day = now_et().date().isoformat()
-        found = await client.regular_gainers(minimum, max_market_cap=rule.condition.max_market_cap)
+        found = await client.regular_gainers(
+            minimum,
+            max_market_cap=rule.condition.max_market_cap,
+            min_market_cap=rule.condition.min_market_cap,
+        )
         if not found:
             self.store.replace_trend_watch(rule.id, day, [])
             return
@@ -1397,7 +1504,13 @@ class MonitorEngine:
         floors = _day_gain_floors(rule)
         if client is None or not floors:
             return []
-        afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
+        kind = rule.condition.type
+        afterhours = kind is ConditionType.AFTERHOURS_GAIN
+        premarket = kind is ConditionType.PREMARKET_GAIN
+        regular = kind is ConditionType.REGULAR_GAIN
+        if not (afterhours or premarket or regular):
+            return []
+        # After-hours can use today's intraday pool; premarket/regular use prior days.
         days = recent_trading_days(
             now_et().date(),
             rule.condition.recent_day_count,
@@ -1410,8 +1523,10 @@ class MonitorEngine:
         symbols = sorted(floors_by_symbol)
         if afterhours:
             marks = await self._saved_afterhours_quotes(client, symbols)
-        else:
+        elif premarket:
             marks = await self._saved_premarket_quotes(client, symbols)
+        else:
+            marks = await self._moomoo_snapshots(client, symbols)
         if not marks:
             return []
         matched: list[Quote] = []
@@ -1421,17 +1536,27 @@ class MonitorEngine:
                 continue
             mark.recent_day_gain_floors = floors_by_symbol.get(symbol, [])
             mark.recent_day_spike = bool(mark.recent_day_gain_floors)
+            scan_rule = _confirm_scan_rule(rule)
             if afterhours:
                 evaluation = evaluate_afterhours_scan(
-                    rule, mark, market_cap=None, in_afterhours=True, cap_filtered=True
+                    scan_rule, mark, market_cap=None, in_afterhours=True, cap_filtered=True
+                )
+            elif premarket:
+                evaluation = evaluate_premarket_scan(
+                    scan_rule, mark, market_cap=None, in_premarket=True, cap_filtered=True
                 )
             else:
-                evaluation = evaluate_premarket_scan(
-                    rule, mark, market_cap=None, in_premarket=True, cap_filtered=True
+                mark.regular_change_pct = mark.change_pct
+                evaluation = evaluate_regular_day_scan(
+                    scan_rule, mark, market_cap=None, cap_filtered=True
                 )
             if evaluation.matched:
                 matched.append(mark)
-        label = "Saved after-hours" if afterhours else "Saved pre-market"
+        label = {
+            ConditionType.AFTERHOURS_GAIN: "Saved after-hours",
+            ConditionType.PREMARKET_GAIN: "Saved pre-market",
+            ConditionType.REGULAR_GAIN: "Saved regular",
+        }.get(kind, "Saved day-gain")
         self._log_saved_matches(rule.id, [quote.symbol for quote in matched], label)
         return matched
 
@@ -1594,7 +1719,8 @@ class MonitorEngine:
             if not symbols:
                 return
             try:
-                await self.ths.add_important(symbols, session)
+                # Reminder sync replaces 我的自选 with current rule-group leaders.
+                await self.ths.replace_important(symbols, session)
                 await self._arrange_important_by_afterhours()
                 logger.info(
                     "同花顺 %s reminder sync: %s",
@@ -2084,7 +2210,17 @@ class MonitorEngine:
                 fired.extend(scanned)
                 slack_error = slack_error or scan_error
             return fired, slack_error
-        found = await self.moomoo.scan_afterhours(min(rule.condition.value for rule in rules), caps.pop())
+        mins = {
+            rule.condition.min_market_cap
+            for rule in rules
+            if rule.condition.min_market_cap is not None
+        }
+        min_cap = min(mins) if mins else None
+        found = await self.moomoo.scan_afterhours(
+            min(rule.condition.value for rule in rules),
+            caps.pop(),
+            min_market_cap=min_cap,
+        )
         fired = []
         slack_error = None
         for rule in rules:
@@ -2147,7 +2283,9 @@ class MonitorEngine:
         if minimum is None:
             return
         found = await client.regular_gainers(
-            minimum, max_market_cap=rule.condition.max_market_cap
+            minimum,
+            max_market_cap=rule.condition.max_market_cap,
+            min_market_cap=rule.condition.min_market_cap,
         )
         pool: dict[str, Quote] = {}
         for quote in found:
@@ -2170,6 +2308,7 @@ class MonitorEngine:
             rule.condition.stable_low,
             rule.condition.max_market_cap,
             max_pages=8,
+            min_market_cap=rule.condition.min_market_cap,
         )
         minimum = rule.condition.min_regular_change
         quotes: list[Quote] = []
@@ -2248,16 +2387,17 @@ class MonitorEngine:
         max_cap = rule.condition.max_market_cap or 100_000_000
         kind = rule.condition.type
         if kind is ConditionType.AFTERHOURS_GAIN:
-            found_rows = await client.scan_afterhours(rule.condition.value, max_cap)
+            found_rows = await client.scan_afterhours(rule.condition.value, max_cap, min_market_cap=rule.condition.min_market_cap)
             found = [quote for quote, _cap in found_rows]
         elif kind is ConditionType.PREMARKET_GAIN:
-            found_rows = await client.scan_premarket(rule.condition.value, max_cap)
+            found_rows = await client.scan_premarket(rule.condition.value, max_cap, min_market_cap=rule.condition.min_market_cap)
             found = [quote for quote, _cap in found_rows]
         elif kind is ConditionType.REGULAR_GAIN:
             found = await client.regular_gainers(
                 rule.condition.value,
                 max_market_cap=max_cap,
                 min_volume=rule.condition.min_volume,
+                min_market_cap=rule.condition.min_market_cap,
             )
         else:
             return []
@@ -2312,7 +2452,9 @@ class MonitorEngine:
         if kind is ConditionType.AFTERHOURS_GAIN:
             label = "After-hours peak fade"
             found_rows = await client.scan_afterhours(
-                rule.condition.value, rule.condition.max_market_cap
+                rule.condition.value,
+                rule.condition.max_market_cap,
+                min_market_cap=rule.condition.min_market_cap,
             )
             found = [quote for quote, _cap in found_rows]
             note_peak = self.store.note_afterhours_peak
@@ -2321,7 +2463,9 @@ class MonitorEngine:
         elif kind is ConditionType.PREMARKET_GAIN:
             label = "Pre-market peak fade"
             found_rows = await client.scan_premarket(
-                rule.condition.value, rule.condition.max_market_cap
+                rule.condition.value,
+                rule.condition.max_market_cap,
+                min_market_cap=rule.condition.min_market_cap,
             )
             found = [quote for quote, _cap in found_rows]
             note_peak = self.store.note_premarket_peak
@@ -2332,6 +2476,7 @@ class MonitorEngine:
             found = await client.regular_gainers(
                 rule.condition.value,
                 max_market_cap=rule.condition.max_market_cap,
+                min_market_cap=rule.condition.min_market_cap,
                 min_volume=rule.condition.min_volume,
             )
             note_peak = self.store.note_peak_gain
@@ -2388,7 +2533,7 @@ class MonitorEngine:
                     quote,
                     market_cap=None,
                     in_afterhours=True,
-                    cap_filtered=rule.condition.max_market_cap is not None,
+                    cap_filtered=(rule.condition.max_market_cap is not None or rule.condition.min_market_cap is not None),
                 )
             elif kind is ConditionType.PREMARKET_GAIN:
                 evaluation = evaluate_premarket_scan(
@@ -2396,14 +2541,14 @@ class MonitorEngine:
                     quote,
                     market_cap=None,
                     in_premarket=True,
-                    cap_filtered=rule.condition.max_market_cap is not None,
+                    cap_filtered=(rule.condition.max_market_cap is not None or rule.condition.min_market_cap is not None),
                 )
             else:
                 evaluation = evaluate_regular_peak_fade(
                     scan_rule,
                     quote,
                     market_cap=None,
-                    cap_filtered=rule.condition.max_market_cap is not None,
+                    cap_filtered=(rule.condition.max_market_cap is not None or rule.condition.min_market_cap is not None),
                 )
             if self.verbose:
                 logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
@@ -2425,9 +2570,9 @@ class MonitorEngine:
         afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
         max_cap = rule.condition.max_market_cap or 100_000_000
         if afterhours:
-            found = await client.scan_afterhours(rule.condition.value, max_cap)
+            found = await client.scan_afterhours(rule.condition.value, max_cap, min_market_cap=rule.condition.min_market_cap)
         else:
-            found = await client.scan_premarket(rule.condition.value, max_cap)
+            found = await client.scan_premarket(rule.condition.value, max_cap, min_market_cap=rule.condition.min_market_cap)
         candidates: list[Quote] = []
         volume_min = rule.condition.min_volume
         for quote, _cap in found:
@@ -2503,6 +2648,7 @@ class MonitorEngine:
             self._late_phase[rule.id] = phase
         session = rule.condition.late_session or "regular"
         max_cap = rule.condition.max_market_cap or 100_000_000
+        min_cap = rule.condition.min_market_cap
         min_volume = rule.condition.min_volume if phase == "alert" and session == "regular" else None
         min_price = rule.condition.min_price
         begin = self._late_begin.get(rule.id, 0)
@@ -2518,7 +2664,9 @@ class MonitorEngine:
                 volume,
                 price,
             )
-        quotes, next_begin = await client.smallcap_page(begin, max_cap, min_volume, min_price)
+        quotes, next_begin = await client.smallcap_page(
+            begin, max_cap, min_volume, min_price, min_market_cap=min_cap
+        )
         if session != "regular":
             marks = await client.session_marks([quote.symbol for quote in quotes], session)
             await self._drain_client_problem(client)
@@ -2568,17 +2716,94 @@ class MonitorEngine:
 
     async def _run_sudden_rules(self, rules: list[Rule]) -> None:
         for rule in rules:
+            hours = rule.condition.late_session_hours or 2
+            if not session_late_window(rule.condition.late_session, hours=hours):
+                continue
             matched = await self._match_sudden_rule(rule)
             self._note_opend_ok()
-            if not matched:
-                continue
             async with self._lock:
                 state = self.store.load_state()
-                await self._emit_trend_matches(rule, matched, state)
+                if matched:
+                    await self._emit_sudden_first_alerts(rule, matched, state)
+                await self._emit_sudden_hold_alerts(rule, state)
                 self.store.save_state(state)
 
+    async def _emit_sudden_first_alerts(
+        self, rule: Rule, quotes: list[Quote], state: dict
+    ) -> None:
+        """First 1-minute spike: alert + rule group, arm confirm, skip 我的自选/cooldown."""
+        notify = (rule.notify or rule.id).strip() or rule.id
+        for quote in quotes:
+            arm_key = f"confirm:{notify}:{quote.symbol.upper()}"
+            if self.store.confirm_armed_at(state, arm_key) is not None:
+                continue
+            cooldown_key = f"{rule.id}:{quote.symbol}"
+            if self.store.in_cooldown(state, cooldown_key, rule.cooldown_minutes):
+                continue
+            self.store.note_confirm_arm(state, arm_key)
+            logger.info(
+                "Rule %s first spike for %s — alert + group, no 我的自选 yet",
+                rule.id,
+                quote.symbol,
+            )
+            await self._fire_alert(
+                rule,
+                quote,
+                state,
+                extra=None,
+                cooldown_key=cooldown_key,
+                apply_cooldown=False,
+                skip_important=True,
+                skip_confirm=True,
+            )
+
+    async def _emit_sudden_hold_alerts(self, rule: Rule, state: dict) -> None:
+        """After confirm_delay, remind if session gain is still >= confirm_value → 我的自选."""
+        if rule.confirm_delay_minutes <= 0 or rule.confirm_value is None:
+            return
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return
+        notify = (rule.notify or rule.id).strip() or rule.id
+        prefix = f"confirm:{notify}:"
+        now = datetime.now(timezone.utc)
+        ready: list[str] = []
+        for key in list(state.get("confirm_armed", {})):
+            if not key.startswith(prefix):
+                continue
+            armed_at = self.store.confirm_armed_at(state, key)
+            if armed_at is None:
+                continue
+            if (now - armed_at).total_seconds() < rule.confirm_delay_minutes * 60:
+                continue
+            ready.append(key[len(prefix) :])
+        if not ready:
+            return
+        session = rule.condition.late_session or "regular"
+        quotes = await self._sudden_session_quotes(client, ready, session)
+        if not quotes:
+            return
+        floor = rule.confirm_value
+        min_price = rule.condition.min_price
+        for symbol in ready:
+            quote = quotes.get(symbol)
+            if quote is None or quote.change_pct is None:
+                continue
+            if quote.change_pct < floor:
+                continue
+            if min_price is not None and (quote.price is None or quote.price <= min_price):
+                continue
+            await self._fire_alert(
+                rule,
+                quote,
+                state,
+                extra=None,
+                cooldown_key=f"{rule.id}:{symbol}",
+                skip_confirm=True,
+            )
+
     async def _match_sudden_rule(self, rule: Rule) -> list[Quote]:
-        """Watch names already up > pool_min_change; alert on ~1-minute spikes."""
+        """Watch discovered names; alert on ~1-minute spikes (no session-gain floor)."""
         client = self._trend_moomoo or self.moomoo
         if client is None:
             return []
@@ -2603,11 +2828,6 @@ class MonitorEngine:
         prices = self._sudden_prices.setdefault(rule.id, {})
         matched: list[Quote] = []
         still: set[str] = set()
-        pool_floor = (
-            rule.condition.pool_min_change
-            if rule.condition.pool_min_change is not None
-            else rule.condition.value
-        )
         for symbol in pool:
             quote = quotes.get(symbol)
             if quote is None:
@@ -2619,11 +2839,9 @@ class MonitorEngine:
             if price is None or price <= 0:
                 still.add(symbol)
                 continue
-            if session_change is None or session_change <= pool_floor:
-                prices.pop(symbol, None)
-                continue
             still.add(symbol)
-            self._sudden_session[f"{rule.id}:{symbol}"] = session_change
+            if session_change is not None:
+                self._sudden_session[f"{rule.id}:{symbol}"] = session_change
             samples = prices.setdefault(symbol, [])
             samples.append((now, price))
             prices[symbol] = trim_price_samples(samples, now=now, keep_seconds=keep)
@@ -2648,7 +2866,7 @@ class MonitorEngine:
                     symbol,
                     sudden,
                     age,
-                    session_change,
+                    session_change if session_change is not None else 0.0,
                 )
             matched.append(alert_quote)
         self._sudden_pool[rule.id] = still
@@ -2674,7 +2892,7 @@ class MonitorEngine:
     async def _discover_sudden_pool(
         self, rule: Rule, client: MoomooClient, session: str
     ) -> None:
-        """Find names already up > pool floor via session gain screens (not smallcap paging)."""
+        """Seed watch pool via session gain screens (pool_min_change is discover-only)."""
         now = datetime.now(timezone.utc).timestamp()
         last = self._sudden_discovered_at.get(rule.id)
         # Stock-filter API: max 10 / 30s shared with newhigh / halt screens.
@@ -2689,7 +2907,7 @@ class MonitorEngine:
         pool_floor = (
             rule.condition.pool_min_change
             if rule.condition.pool_min_change is not None
-            else rule.condition.value
+            else 0.0
         )
         if last is None:
             logger.info(
@@ -2701,7 +2919,13 @@ class MonitorEngine:
             )
         try:
             found = await self._sudden_session_gainers(
-                client, session, pool_floor, max_cap, min_volume, min_price
+                client,
+                session,
+                pool_floor,
+                max_cap,
+                min_volume,
+                min_price,
+                min_market_cap=rule.condition.min_market_cap,
             )
         except Exception as exc:
             logger.warning("Sudden %s discover failed: %s", rule.id, exc)
@@ -2772,19 +2996,25 @@ class MonitorEngine:
         max_cap: float,
         min_volume: float | None,
         min_price: float | None = None,
+        min_market_cap: float | None = None,
     ) -> list[Quote]:
         """Session-gain leaders already above the sudden pool floor."""
         if session == "afterhours":
-            rows = await client.scan_afterhours(pool_floor, max_cap)
+            rows = await client.scan_afterhours(
+                pool_floor, max_cap, min_market_cap=min_market_cap
+            )
             return [quote for quote, _cap in rows]
         if session == "premarket":
-            rows = await client.scan_premarket(pool_floor, max_cap)
+            rows = await client.scan_premarket(
+                pool_floor, max_cap, min_market_cap=min_market_cap
+            )
             return [quote for quote, _cap in rows]
         return await client.regular_gainers(
             pool_floor,
             max_market_cap=max_cap,
             min_volume=min_volume,
             min_price=min_price,
+            min_market_cap=min_market_cap,
         )
 
     async def _sudden_session_quotes(
@@ -2805,7 +3035,11 @@ class MonitorEngine:
         client = self._trend_moomoo or self.moomoo
         if client is None:
             return []
-        found = await client.regular_gainers(20, max_market_cap=rule.condition.max_market_cap)
+        found = await client.regular_gainers(
+            20,
+            max_market_cap=rule.condition.max_market_cap,
+            min_market_cap=rule.condition.min_market_cap,
+        )
         day = now_et().date().isoformat()
         if self._halt_marks_day != day:
             self._halt_marks = {}
@@ -2860,6 +3094,7 @@ class MonitorEngine:
         found = await client.regular_gainers(
             rule.condition.value,
             max_market_cap=rule.condition.max_market_cap,
+                    min_market_cap=rule.condition.min_market_cap,
             min_volume=rule.condition.min_volume,
         )
         for quote in found:
@@ -2906,7 +3141,7 @@ class MonitorEngine:
         client = self._trend_moomoo or self.moomoo
         if client is None:
             return []
-        found = await client.scan_afterhours(rule.condition.value, rule.condition.max_market_cap)
+        found = await client.scan_afterhours(rule.condition.value, rule.condition.max_market_cap, min_market_cap=rule.condition.min_market_cap)
         day = now_et().date().isoformat()
         regular_min = rule.condition.min_regular_change
         matched: list[Quote] = []
@@ -2925,7 +3160,7 @@ class MonitorEngine:
                 quote,
                 market_cap=None,
                 in_afterhours=True,
-                cap_filtered=rule.condition.max_market_cap is not None,
+                cap_filtered=(rule.condition.max_market_cap is not None or rule.condition.min_market_cap is not None),
             )
             if self.verbose:
                 logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
@@ -2949,48 +3184,97 @@ class MonitorEngine:
 
     async def _match_halt_or_day_afterhours(self, rule: Rule) -> list[Quote]:
         """AH > value among upward-halt names or intraday day-gain touches."""
+        return await self._match_halt_or_day(rule)
+
+    async def _match_halt_or_day(self, rule: Rule) -> list[Quote]:
+        """Session > value among upward-halt names or day-gain touches."""
         client = self._trend_moomoo or self.moomoo
-        minimum = rule.condition.min_recent_day_change
-        if client is None or minimum is None:
+        floors = _day_gain_floors(rule)
+        if client is None or not floors:
             return []
-        day = now_et().date().isoformat()
+        kind = rule.condition.type
+        afterhours = kind is ConditionType.AFTERHOURS_GAIN
+        premarket = kind is ConditionType.PREMARKET_GAIN
+        regular = kind is ConditionType.REGULAR_GAIN
+        if not (afterhours or premarket or regular):
+            return []
+        today = now_et().date().isoformat()
         days = recent_trading_days(
             now_et().date(),
             rule.condition.recent_day_count,
-            include_end=True,
+            include_end=afterhours,
         )
-        symbols = set(self.store.session_symbols(day, "upward_halt"))
-        symbols.update(self.store.day_gain_symbols(minimum, days))
+        symbols: set[str] = set()
+        for day in days:
+            symbols.update(self.store.session_symbols(day, "upward_halt"))
+        for minimum in floors:
+            symbols.update(self.store.day_gain_symbols(minimum, days))
+        label = {
+            ConditionType.AFTERHOURS_GAIN: "Halt-or-day after-hours",
+            ConditionType.PREMARKET_GAIN: "Halt-or-day pre-market",
+            ConditionType.REGULAR_GAIN: "Halt-or-day regular",
+        }.get(kind, "Halt-or-day")
         if not symbols:
-            self._log_saved_matches(rule.id, [], "Halt-or-day after-hours")
+            self._log_saved_matches(rule.id, [], label)
             return []
-        marks = await self._saved_afterhours_quotes(client, sorted(symbols))
+        ordered = sorted(symbols)
+        if afterhours:
+            marks = await self._saved_afterhours_quotes(client, ordered)
+            scan_rule = _confirm_scan_rule(_afterhours_scan_rule(rule))
+        elif premarket:
+            marks = await self._saved_premarket_quotes(client, ordered)
+            scan_rule = _confirm_scan_rule(rule)
+        else:
+            marks = await self._moomoo_snapshots(client, ordered)
+            scan_rule = _confirm_scan_rule(rule)
         if not marks:
             return []
-        # Same as the half-hour board: waive volume only at the 16:00 open.
-        scan_rule = _afterhours_scan_rule(rule)
         matched: list[Quote] = []
-        for symbol in symbols:
+        for symbol in ordered:
             quote = marks.get(symbol)
             if quote is None:
                 continue
-            quote.session_circuit_breaker = (
+            quote.session_circuit_breaker = any(
                 self.store.spike_seen_at(day, "upward_halt", symbol) is not None
+                for day in days
+            ) or (self.store.spike_seen_at(today, "upward_halt", symbol) is not None)
+            quote.recent_day_spike = any(
+                self.store.saw_day_gain(symbol, minimum, days) for minimum in floors
             )
-            quote.recent_day_spike = self.store.saw_day_gain(symbol, minimum, days)
-            evaluation = evaluate_afterhours_scan(
-                scan_rule,
-                quote,
-                market_cap=None,
-                in_afterhours=True,
-                cap_filtered=rule.condition.max_market_cap is not None,
-            )
+            if quote.recent_day_spike:
+                quote.recent_day_gain_floors = [
+                    minimum for minimum in floors if self.store.saw_day_gain(symbol, minimum, days)
+                ]
+            if afterhours:
+                evaluation = evaluate_afterhours_scan(
+                    scan_rule,
+                    quote,
+                    market_cap=None,
+                    in_afterhours=True,
+                    cap_filtered=(
+                        rule.condition.max_market_cap is not None
+                        or rule.condition.min_market_cap is not None
+                    ),
+                )
+            elif premarket:
+                evaluation = evaluate_premarket_scan(
+                    scan_rule,
+                    quote,
+                    market_cap=None,
+                    in_premarket=True,
+                    cap_filtered=True,
+                )
+            else:
+                quote.regular_change_pct = quote.change_pct
+                evaluation = evaluate_regular_day_scan(
+                    scan_rule, quote, market_cap=None, cap_filtered=True
+                )
             if self.verbose:
                 logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
             if evaluation.matched:
                 matched.append(quote)
         self._log_saved_matches(
-            rule.id, [quote.symbol for quote in matched], "Halt-or-day after-hours"
+            rule.id, [quote.symbol for quote in matched], label
         )
         return matched
 
@@ -3020,7 +3304,7 @@ class MonitorEngine:
                 quote,
                 market_cap=None,
                 in_afterhours=True,
-                cap_filtered=rule.condition.max_market_cap is not None,
+                cap_filtered=(rule.condition.max_market_cap is not None or rule.condition.min_market_cap is not None),
             )
             if self.verbose:
                 logger.info("  %s %s: %s", rule.id, quote.symbol, evaluation.reason)
@@ -3104,7 +3388,7 @@ class MonitorEngine:
         logger.info("ALERT %s | %s", rule.id, message.replace("\n", " | "))
         pin = [quote.symbol for quote in leaders]
         if _sorts_ths_by_peak_fade(rule):
-            # Halt/80%: keep the full pool, sort by peak−close fade (no clear/replace).
+            # Halt/50%: keep the full pool, sort by peak−close fade (no clear/replace).
             self._add_to_tonghuashun(
                 rule,
                 self._halt_or_day_pool_symbols(rule),
@@ -3123,20 +3407,21 @@ class MonitorEngine:
             self._add_to_tonghuashun(rule, leaders, board=True, pin_symbols=pin)
 
     def _halt_or_day_pool_symbols(self, rule: Rule) -> list[str]:
-        """Symbols that hit halt or the regular touch / day-gain threshold today."""
+        """Symbols that hit halt or the regular touch / day-gain threshold."""
         day = now_et().date().isoformat()
         symbols: set[str] = set()
         regular_touch = rule.condition.min_regular_touch
         if regular_touch is not None:
             symbols.update(self.store.day_gain_symbols(regular_touch, [day]))
-        day_min = rule.condition.min_recent_day_change
-        if day_min is not None:
+        floors = _day_gain_floors(rule)
+        if floors:
             days = recent_trading_days(
                 now_et().date(),
                 rule.condition.recent_day_count,
                 include_end=True,
             )
-            symbols.update(self.store.day_gain_symbols(day_min, days))
+            for minimum in floors:
+                symbols.update(self.store.day_gain_symbols(minimum, days))
         if rule.condition.include_circuit_breaker or rule.condition.require_circuit_breaker:
             symbols.update(self.store.session_symbols(day, "upward_halt"))
         return sorted(symbols)
@@ -3160,32 +3445,38 @@ class MonitorEngine:
         ah_touch = rule.condition.min_afterhours_touch
         if ah_touch is not None:
             symbols.update(self.store.session_symbols(day, afterhours_touch_session(ah_touch)))
-        if _sorts_ths_by_peak_fade(rule):
+        if (
+            _sorts_ths_by_peak_fade(rule)
+            or _is_pool_gain_board(rule)
+            or _day_gain_floors(rule)
+            or rule.condition.min_regular_touch is not None
+            or rule.condition.include_circuit_breaker
+            or rule.condition.require_circuit_breaker
+        ):
             symbols.update(self._halt_or_day_pool_symbols(rule))
-        else:
-            regular_touch = rule.condition.min_regular_touch
-            if regular_touch is not None:
-                symbols.update(self.store.day_gain_symbols(regular_touch, [day]))
-            if rule.condition.include_circuit_breaker:
-                symbols.update(self.store.session_symbols(day, "upward_halt"))
         if not symbols:
             return []
         marks = await self._saved_afterhours_quotes(self.moomoo, sorted(symbols))
         if not marks:
             return []
         volume = int(min_volume) if min_volume is not None else None
-        return afterhours_leaders(list(marks.values()), rule.condition.top_n or 5, volume)
+        return afterhours_leaders(
+            list(marks.values()),
+            rule.condition.top_n or 5,
+            volume,
+            min_change=rule.condition.value,
+        )
 
     async def _top_afterhours_by_peak(
         self, rule: Rule, min_volume: float | None
     ) -> list[Quote]:
-        """Top N by after-hours peak gain (session high), highest first."""
+        """Top N by after-hours current gain, highest first (peak kept for the line)."""
         if self.moomoo is None:
             return []
         max_cap = rule.condition.max_market_cap or 100_000_000
         limit = rule.condition.top_n or 5
         volume = int(min_volume) if min_volume is not None else None
-        found_rows = await self.moomoo.scan_afterhours(-1_000_000, max_cap)
+        found_rows = await self.moomoo.scan_afterhours(-1_000_000, max_cap, min_market_cap=rule.condition.min_market_cap)
         day = now_et().date().isoformat()
         peaks = self.store.afterhours_peaks(day)
         by_symbol = {
@@ -3208,13 +3499,13 @@ class MonitorEngine:
     async def _top_premarket_by_peak(
         self, rule: Rule, min_volume: float | None
     ) -> list[Quote]:
-        """Top N by premarket peak gain (session high), highest first."""
+        """Top N by premarket current gain, highest first (peak kept for the line)."""
         if self.moomoo is None:
             return []
         max_cap = rule.condition.max_market_cap or 100_000_000
         limit = rule.condition.top_n or 5
         volume = int(min_volume) if min_volume is not None else None
-        found_rows = await self.moomoo.scan_premarket(-1_000_000, max_cap)
+        found_rows = await self.moomoo.scan_premarket(-1_000_000, max_cap, min_market_cap=rule.condition.min_market_cap)
         day = now_et().date().isoformat()
         peaks = self.store.premarket_peaks(day)
         by_symbol = {
@@ -3237,7 +3528,7 @@ class MonitorEngine:
     async def _top_regular_by_peak(
         self, rule: Rule, min_volume: float | None
     ) -> list[Quote]:
-        """Top N by regular-session peak gain (day high), highest first."""
+        """Top N by regular-session current gain, highest first (peak kept for the line)."""
         client = self._trend_moomoo or self.moomoo
         if client is None:
             return []
@@ -3248,6 +3539,7 @@ class MonitorEngine:
             0,
             max_market_cap=max_cap,
             min_volume=volume,
+            min_market_cap=rule.condition.min_market_cap,
         )
         day = now_et().date().isoformat()
         peaks = self.store.peak_gains(day)
@@ -3406,9 +3698,9 @@ class MonitorEngine:
         afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
         max_cap = rule.condition.max_market_cap or 100_000_000
         if afterhours:
-            found = await self.moomoo.scan_afterhours(rule.condition.value, max_cap)
+            found = await self.moomoo.scan_afterhours(rule.condition.value, max_cap, min_market_cap=rule.condition.min_market_cap)
         else:
-            found = await self.moomoo.scan_premarket(rule.condition.value, max_cap)
+            found = await self.moomoo.scan_premarket(rule.condition.value, max_cap, min_market_cap=rule.condition.min_market_cap)
         matched: list[tuple[Quote, float | None]] = []
         scan_rule = _afterhours_scan_rule(rule) if afterhours else rule
         for quote, cap in found:
@@ -3472,9 +3764,9 @@ class MonitorEngine:
             afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
             max_cap = None if rule.condition.skip_market_cap else (rule.condition.max_market_cap or 100_000_000)
             if afterhours:
-                found = await self.moomoo.scan_afterhours(rule.condition.value, max_cap)
+                found = await self.moomoo.scan_afterhours(rule.condition.value, max_cap, min_market_cap=rule.condition.min_market_cap)
             else:
-                found = await self.moomoo.scan_premarket(rule.condition.value, max_cap)
+                found = await self.moomoo.scan_premarket(rule.condition.value, max_cap, min_market_cap=rule.condition.min_market_cap)
             matched = []
             for quote, cap in found:
                 if afterhours:
@@ -3544,6 +3836,55 @@ class MonitorEngine:
             if snap.premarket_change_pct is not None:
                 quote.premarket_change_pct = snap.premarket_change_pct
 
+    def _blocked_by_confirm_delay(
+        self, rule: Rule, quote: Quote, state: dict, cooldown_key: str
+    ) -> bool:
+        """Arm on first touch above condition.value; alert after delay when > confirm_value."""
+        if rule.confirm_delay_minutes <= 0:
+            return False
+        if ":pool:" in cooldown_key:
+            return False
+        notify = (rule.notify or rule.id).strip() or rule.id
+        arm_key = f"confirm:{notify}:{quote.symbol.upper()}"
+        now = datetime.now(timezone.utc)
+        armed_at = self.store.confirm_armed_at(state, arm_key)
+        change = quote.change_pct
+        sudden = rule.condition.type is ConditionType.SUDDEN_GAIN
+        if armed_at is None:
+            if sudden:
+                # 1-minute spike already matched; arm regardless of session gain.
+                arm_floor = rule.condition.value
+            elif rule.condition.day_gain_tiers:
+                if matched_day_gain_tier(rule, quote) is None:
+                    return True
+                arm_floor = rule.condition.value
+            else:
+                if change is None or change <= rule.condition.value:
+                    return True
+                arm_floor = rule.condition.value
+            self.store.note_confirm_arm(state, arm_key, now)
+            logger.info(
+                "Rule %s first +%.0f%% for %s — armed, no alert yet",
+                rule.id,
+                change if change is not None else arm_floor,
+                quote.symbol,
+            )
+            return True
+        elapsed = (now - armed_at).total_seconds()
+        if elapsed < rule.confirm_delay_minutes * 60:
+            logger.info(
+                "Rule %s matched %s but confirm delay %.0f/%.0f min",
+                rule.id,
+                quote.symbol,
+                elapsed / 60,
+                rule.confirm_delay_minutes,
+            )
+            return True
+        if sudden and rule.confirm_value is not None:
+            if change is None or change < rule.confirm_value:
+                return True
+        return False
+
     async def _fire_alert(
         self,
         rule: Rule,
@@ -3551,8 +3892,14 @@ class MonitorEngine:
         state: dict,
         extra: dict | None,
         cooldown_key: str | None = None,
+        *,
+        apply_cooldown: bool = True,
+        skip_important: bool = False,
+        skip_confirm: bool = False,
     ) -> Alert | None:
         key = cooldown_key or rule.id
+        if not skip_confirm and self._blocked_by_confirm_delay(rule, quote, state, key):
+            return None
         if self.store.in_cooldown(state, key, rule.cooldown_minutes):
             logger.info("Rule %s matched %s but is in cooldown", rule.id, quote.symbol)
             return None
@@ -3590,9 +3937,10 @@ class MonitorEngine:
             sound="pushover" if high else None,
         )
         self.store.append_alert(alert)
-        self.store.mark_fired(state, key, alert.fired_at)
+        if apply_cooldown:
+            self.store.mark_fired(state, key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, alert.message)
-        important_symbols = [quote.symbol]
+        important_symbols: list[str] = [] if skip_important else [quote.symbol]
         pin = [quote.symbol]
         if _sorts_ths_by_peak_fade(rule):
             self._add_to_tonghuashun(
@@ -3632,7 +3980,8 @@ class MonitorEngine:
     async def _maybe_sync_tonghuashun_groups(self, config: RulesConfig) -> None:
         """Create groups once; clear each session's rule/盘x groups on that session's next day.
 
-        我的自选 clears the previous session's names when the next session starts.
+        Shared rule groups and 我的自选 clear the previous session's names when the next
+        session starts.
         """
         if not self.ths.configured:
             return
@@ -3663,7 +4012,10 @@ class MonitorEngine:
                         and rule.name
                         and (rule.group or rule.condition_session) == session
                     ]
-                    cleared = await self.ths.clear_session_day(session, day, session_names)
+                    shared_names = _shared_rule_group_names(config)
+                    cleared = await self.ths.clear_session_day(
+                        session, day, session_names, shared_rule_names=shared_names
+                    )
                     self._ths_cleared_session_day[session] = day
                     if cleared:
                         logger.info(
@@ -3722,7 +4074,9 @@ class MonitorEngine:
         important = self.load_config().important
         self.ths.set_important_group(important.ths_group)
         want_important = _wants_important_watchlist(important, rule, board=board)
-        replace_board = board and _is_peak_top_board(rule)
+        replace_board = board and (
+            _is_peak_top_board(rule) or _is_pool_gain_board(rule)
+        )
         if replace_board:
             # Plain *-top5 groups keep only the current leaders.
             symbols = [symbol for symbol in pin if symbol]
@@ -3738,6 +4092,7 @@ class MonitorEngine:
                     replace=replace_board,
                 )
                 if replace_board:
+                    # Peak top-N: group is only the current leaders, ranked high→low.
                     ordered = list(pin)
                 elif _sorts_ths_by_peak_fade(rule):
                     peaks = self.store.peak_gains(day)
@@ -3770,24 +4125,19 @@ class MonitorEngine:
                         reverse=True,
                     )
                 elif _is_peak_top_board(rule):
-                    if rule.condition.type is ConditionType.AFTERHOURS_GAIN:
-                        peaks = self.store.afterhours_peaks(day)
-                    elif rule.condition.type is ConditionType.PREMARKET_GAIN:
-                        peaks = self.store.premarket_peaks(day)
-                    else:
-                        peaks = self.store.peak_gains(day)
-                    for item in quotes:
-                        if not isinstance(item, Quote):
-                            continue
-                        observed = observed_session_peak(item)
-                        if observed is None:
-                            continue
-                        key = item.symbol.upper()
-                        prior = peaks.get(key)
-                        peaks[key] = observed if prior is None else max(prior, observed)
+                    changes = {
+                        item.symbol: item.change_pct
+                        for item in quotes
+                        if isinstance(item, Quote)
+                    }
+                    changes.update(await self._session_changes(rule, members))
                     ordered = sorted(
                         members,
-                        key=lambda symbol: peaks.get(symbol, float("-inf")),
+                        key=lambda symbol: (
+                            changes[symbol]
+                            if changes.get(symbol) is not None
+                            else float("-inf")
+                        ),
                         reverse=True,
                     )
                 else:
@@ -3813,7 +4163,12 @@ class MonitorEngine:
                         ordered = [s for s in ordered if s in alerted] + [
                             s for s in ordered if s not in alerted
                         ]
-                await self.ths.arrange(group, ordered)
+                await self.ths.arrange(
+                    group,
+                    ordered,
+                    session=session,
+                    tag_symbols=pin if not replace_board else ordered,
+                )
                 if want_important:
                     target = [
                         symbol.strip().upper()

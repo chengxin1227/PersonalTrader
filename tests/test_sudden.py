@@ -32,11 +32,17 @@ def test_live_rules_include_sudden_gain_for_each_session():
     sudden = [rule for rule in config.rules if rule.condition.type.value == "sudden_gain"]
     sessions = {rule.condition.late_session for rule in sudden}
     assert sessions == {"premarket", "regular", "afterhours"}
+    assert {rule.notify for rule in sudden} == {"Sudden-10"}
     for rule in sudden:
         assert rule.condition.value == 10
-        assert rule.condition.pool_min_change == 10
+        assert rule.condition.pool_min_change == 0
         assert rule.condition.sudden_window_seconds == 60
+        assert rule.condition.late_session_hours == 2
         assert rule.condition.min_volume is None
+        assert rule.condition.min_market_cap == 1_000_000
+        assert rule.confirm_delay_minutes == 10
+        assert rule.confirm_value == 10
+        assert rule.cooldown_minutes == 240
 
 
 def _sudden_rule(session: str) -> Rule:
@@ -47,14 +53,19 @@ def _sudden_rule(session: str) -> Rule:
         description="test",
         group=group,
         symbol="*",
-        cooldown_minutes=30,
+        cooldown_minutes=240,
+        confirm_delay_minutes=10,
+        confirm_value=10,
+        notify="Sudden-10",
         condition=Condition(
             type=ConditionType.SUDDEN_GAIN,
             value=10,
-            pool_min_change=10,
+            pool_min_change=0,
             sudden_window_seconds=60,
             late_session=session,
+            late_session_hours=2,
             min_price=0.1,
+            min_market_cap=1_000_000,
             max_market_cap=1_000_000_000,
         ),
     )
@@ -90,7 +101,9 @@ def test_sudden_discover_uses_afterhours_rank(caplog):
 
     with caplog.at_level(logging.INFO, logger="personaltrader.monitor"):
         asyncio.run(run())
-    client.scan_afterhours.assert_awaited_once_with(10, 1_000_000_000)
+    client.scan_afterhours.assert_awaited_once_with(
+        0, 1_000_000_000, min_market_cap=1_000_000
+    )
     client.smallcap_page.assert_not_called()
     # No volume floor: low-volume THIN is kept; CHEAP still fails min_price.
     assert engine._sudden_pool["afterhours-sudden-10"] == {"DKI", "THIN"}
@@ -110,7 +123,9 @@ def test_sudden_discover_uses_premarket_rank():
         await engine._discover_sudden_pool(_sudden_rule("premarket"), client, "premarket")
 
     asyncio.run(run())
-    client.scan_premarket.assert_awaited_once_with(10, 1_000_000_000)
+    client.scan_premarket.assert_awaited_once_with(
+        0, 1_000_000_000, min_market_cap=1_000_000
+    )
     assert engine._sudden_pool["premarket-sudden-10"] == {"AAA"}
 
 
@@ -126,7 +141,11 @@ def test_sudden_discover_uses_regular_gainers():
 
     asyncio.run(run())
     client.regular_gainers.assert_awaited_once_with(
-        10, max_market_cap=1_000_000_000, min_volume=None, min_price=0.1
+        0,
+        max_market_cap=1_000_000_000,
+        min_volume=None,
+        min_price=0.1,
+        min_market_cap=1_000_000,
     )
     assert engine._sudden_pool["regular-sudden-10"] == {"BBB"}
 
@@ -203,5 +222,135 @@ def test_sudden_alert_shows_session_change_not_window_gain():
         assert len(matched) == 1
         assert matched[0].change_pct == 35.0
         assert matched[0].price == 1.2
+
+    asyncio.run(run())
+
+
+def test_sudden_match_without_prior_session_floor():
+    import time
+
+    from monitor.session import now_et
+
+    engine = _engine()
+    live = time.time()
+    engine._sudden_day = now_et().date().isoformat()
+    engine._sudden_pool["afterhours-sudden-10"] = {"LOW"}
+    engine._sudden_prices["afterhours-sudden-10"] = {"LOW": [(live - 60.0, 1.0)]}
+    engine._sudden_discovered_at["afterhours-sudden-10"] = 10**12
+    client = AsyncMock()
+    engine._trend_moomoo = client
+    engine.moomoo = client
+    engine.verbose = False
+    # Session only +5%, but 1-minute window +20% — still a match.
+    client.after_hours_quotes = AsyncMock(
+        return_value={
+            "LOW": Quote(symbol="LOW", price=1.2, change_pct=5.0, volume=200_000)
+        }
+    )
+
+    async def run() -> None:
+        matched = await engine._match_sudden_rule(_sudden_rule("afterhours"))
+        assert len(matched) == 1
+        assert matched[0].symbol == "LOW"
+        assert matched[0].change_pct == 5.0
+
+    asyncio.run(run())
+
+
+def test_sudden_first_alerts_skip_important_hold_adds(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from monitor.store import Store
+
+    store = Store(tmp_path)
+    engine = MonitorEngine.__new__(MonitorEngine)
+    engine.store = store
+    engine._lock = asyncio.Lock()
+    engine.moomoo = None
+    engine._trend_moomoo = None
+    engine.slack = None
+    engine.pushover = None
+    engine.ths = type("THS", (), {"configured": False})()
+    engine.routes = type(
+        "Routes",
+        (),
+        {
+            "slack_url": lambda self, _notify=None: "",
+            "pushover_token": lambda self, _notify=None: None,
+        },
+    )()
+    engine.last_error = None
+    engine._cached_config = type(
+        "Cfg",
+        (),
+        {
+            "important": type(
+                "Important",
+                (),
+                {"high_priority_rule_ids": [], "watchlist": None, "watched_symbols": None},
+            )()
+        },
+    )()
+    engine._config_loaded_at = datetime.now(timezone.utc)
+    delivered: list[str] = []
+    ths_calls: list[dict] = []
+
+    async def _deliver(alert, **_kwargs) -> None:
+        delivered.append(alert.symbol)
+
+    def _ths(rule, quotes, board=False, important_symbols=None, pin_symbols=None):
+        ths_calls.append({"important_symbols": list(important_symbols or [])})
+
+    engine._deliver = _deliver  # type: ignore[method-assign]
+    engine._fill_prior_session = AsyncMock()
+    engine._add_to_tonghuashun = _ths  # type: ignore[method-assign]
+
+    rule = _sudden_rule("afterhours")
+    spike = Quote(
+        symbol="SPIK",
+        company="Spike Co",
+        price=1.2,
+        change_pct=5.0,
+        volume=200_000,
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    async def run() -> None:
+        state = store.load_state()
+        await engine._emit_sudden_first_alerts(rule, [spike], state)
+        assert delivered == ["SPIK"]
+        assert ths_calls[-1]["important_symbols"] == []
+        assert "confirm:Sudden-10:SPIK" in state["confirm_armed"]
+        assert f"{rule.id}:SPIK" not in state.get("last_fired", {})
+
+        # Second spike while armed: no duplicate first alert.
+        await engine._emit_sudden_first_alerts(rule, [spike], state)
+        assert delivered == ["SPIK"]
+
+        # Hold before delay: nothing.
+        engine._sudden_session_quotes = AsyncMock(  # type: ignore[method-assign]
+            return_value={"SPIK": spike}
+        )
+        engine._trend_moomoo = object()
+        await engine._emit_sudden_hold_alerts(rule, state)
+        assert delivered == ["SPIK"]
+
+        armed = datetime.fromisoformat(state["confirm_armed"]["confirm:Sudden-10:SPIK"])
+        state["confirm_armed"]["confirm:Sudden-10:SPIK"] = (
+            armed - timedelta(minutes=10)
+        ).isoformat()
+        held = Quote(
+            symbol="SPIK",
+            company="Spike Co",
+            price=1.3,
+            change_pct=12.0,
+            volume=200_000,
+            updated_at=datetime.now(timezone.utc),
+        )
+        engine._sudden_session_quotes = AsyncMock(return_value={"SPIK": held})  # type: ignore[method-assign]
+        await engine._emit_sudden_hold_alerts(rule, state)
+        assert delivered == ["SPIK", "SPIK"]
+        assert ths_calls[-1]["important_symbols"] == ["SPIK"]
+        assert f"{rule.id}:SPIK" in state["last_fired"]
 
     asyncio.run(run())

@@ -63,12 +63,18 @@ class Store:
 
     def load_state(self) -> dict[str, Any]:
         if not self._state_path.exists():
-            return {"last_prices": {}, "last_fired": {}, "confirm_armed": {}}
+            return {
+                "last_prices": {},
+                "last_fired": {},
+                "confirm_armed": {},
+                "symbol_coalesce_alerts": {},
+            }
         with self._state_path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         payload.setdefault("last_prices", {})
         payload.setdefault("last_fired", {})
         payload.setdefault("confirm_armed", {})
+        payload.setdefault("symbol_coalesce_alerts", {})
         return payload
 
     def save_state(self, state: dict[str, Any]) -> None:
@@ -92,6 +98,71 @@ class Store:
     def mark_fired(self, state: dict[str, Any], rule_id: str, when: datetime | None = None) -> None:
         stamp = when or _now()
         state.setdefault("last_fired", {})[rule_id] = stamp.isoformat()
+
+    def claim_symbol_coalesce_alert(
+        self,
+        state: dict[str, Any],
+        *,
+        symbol: str,
+        rule_id: str,
+        window_seconds: int = 5,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Collapse near-simultaneous multi-rule hits for one symbol into one notify.
+
+        If another rule already notified this symbol within ``window_seconds``, return
+        that rule id (caller should skip deliver). Same ``rule_id`` may notify again.
+        """
+        current = now or _now()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        claims = state.setdefault("symbol_coalesce_alerts", {})
+        # Drop expired entries so state stays small.
+        stale: list[str] = []
+        for key, payload in list(claims.items()):
+            if not isinstance(payload, dict):
+                stale.append(key)
+                continue
+            raw = payload.get("at")
+            if not raw:
+                stale.append(key)
+                continue
+            try:
+                stamped = datetime.fromisoformat(str(raw))
+            except ValueError:
+                stale.append(key)
+                continue
+            if stamped.tzinfo is None:
+                stamped = stamped.replace(tzinfo=timezone.utc)
+            if (current - stamped).total_seconds() >= window_seconds:
+                stale.append(key)
+        for key in stale:
+            claims.pop(key, None)
+
+        claim_key = symbol.strip().upper()
+        existing = claims.get(claim_key)
+        if isinstance(existing, dict):
+            other = str(existing.get("rule_id") or "")
+            raw = existing.get("at")
+            stamped = None
+            if raw:
+                try:
+                    stamped = datetime.fromisoformat(str(raw))
+                except ValueError:
+                    stamped = None
+            if stamped is not None and stamped.tzinfo is None:
+                stamped = stamped.replace(tzinfo=timezone.utc)
+            if (
+                other
+                and stamped is not None
+                and (current - stamped).total_seconds() < window_seconds
+            ):
+                if other != rule_id:
+                    return other
+                # Same rule: allow notify, keep the original coalesce window.
+                return None
+        claims[claim_key] = {"rule_id": rule_id, "at": current.isoformat()}
+        return None
 
     def in_cooldown(
         self,

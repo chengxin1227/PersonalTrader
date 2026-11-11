@@ -115,3 +115,11 @@ def test_add_failure_is_its_own_notice():
     notice = problem_notice("Tonghuashun add failed: 同花顺登录失败: 密码错误")
     assert notice is not None
     assert notice[0] == "error:tonghuashun"
+    assert notice[1] == "加自选失败"
+    assert notice[2] == "同花顺加自选失败。"
+
+    named = problem_notice("Tonghuashun add failed for NFT, OMH: 同花顺加自选失败: 网络错误")
+    assert named is not None
+    assert named[0] == "error:tonghuashun:NFT OMH"
+    assert named[1] == "加自选失败 NFT OMH"
+    assert "NFT OMH" in named[2]

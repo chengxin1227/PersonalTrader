@@ -48,6 +48,13 @@ def problem_notice(text: str) -> tuple[str, str, str] | None:
             body = f"{body}{detail}"
         return key, "OpenD 超限", body
     if lowered.startswith("tonghuashun add failed"):
+        symbols = _ths_fail_symbols(raw)
+        if symbols:
+            return (
+                f"error:tonghuashun:{symbols}",
+                f"加自选失败 {symbols}",
+                f"同花顺加自选失败：{symbols}。",
+            )
         return "error:tonghuashun", "加自选失败", "同花顺加自选失败。"
     if lowered.startswith("slack send failed"):
         return "error:slack", "发送失败", "Slack 发送失败。"
@@ -110,3 +117,26 @@ def _clause(raw: str, marker: str) -> str:
     if not sentence:
         return ""
     return f"{sentence}."
+
+
+def _ths_fail_symbols(raw: str) -> str:
+    """Parse ``Tonghuashun add failed for AAPL, TSLA: ...`` → ``AAPL TSLA``."""
+    lowered = raw.lower()
+    marker = "tonghuashun add failed for "
+    start = lowered.find(marker)
+    if start < 0:
+        return ""
+    rest = raw[start + len(marker) :]
+    cut = rest.find(":")
+    chunk = rest[:cut] if cut >= 0 else rest
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for part in chunk.replace("，", ",").replace("、", ",").split(","):
+        symbol = part.strip().upper()
+        if not symbol or not symbol.replace(".", "").isalnum():
+            continue
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        symbols.append(symbol)
+    return " ".join(symbols)

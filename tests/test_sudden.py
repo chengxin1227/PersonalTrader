@@ -266,6 +266,7 @@ def test_sudden_first_alerts_skip_important_hold_adds(tmp_path):
     engine = MonitorEngine.__new__(MonitorEngine)
     engine.store = store
     engine._lock = asyncio.Lock()
+    engine._symbol_alert_lock = asyncio.Lock()
     engine.moomoo = None
     engine._trend_moomoo = None
     engine.slack = None

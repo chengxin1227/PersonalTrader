@@ -39,6 +39,7 @@ def test_pool_entry_alert_does_not_block_afterhours_single(tmp_path):
     engine = MonitorEngine.__new__(MonitorEngine)
     engine.store = store
     engine._lock = asyncio.Lock()
+    engine._symbol_alert_lock = asyncio.Lock()
     engine.moomoo = None
     engine.slack = None
     engine.pushover = None

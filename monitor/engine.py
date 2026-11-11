@@ -418,6 +418,8 @@ class MonitorEngine:
         self.market = None
         self._running = False
         self._lock = asyncio.Lock()
+        # Serialize cross-rule same-symbol notify claims (parallel scanners).
+        self._symbol_alert_lock = asyncio.Lock()
         self._last_scan_at: Optional[datetime] = None
         self._universe = UniverseCache(settings.data_dir)
         self._marketcap = MarketCapClient()
@@ -3903,6 +3905,65 @@ class MonitorEngine:
         if self.store.in_cooldown(state, key, rule.cooldown_minutes):
             logger.info("Rule %s matched %s but is in cooldown", rule.id, quote.symbol)
             return None
+        moment = now_et()
+        session = et_session_name(moment)
+        # Same symbol hitting several rules at once → one Slack/Pushover ping.
+        # Short coalesce window only; later separate hits still notify. Pool keys skipped.
+        suppress_deliver = False
+        blocked_by: str | None = None
+        if ":pool:" not in key:
+            lock = getattr(self, "_symbol_alert_lock", None)
+            if lock is None:
+                self._symbol_alert_lock = asyncio.Lock()
+                lock = self._symbol_alert_lock
+            async with lock:
+                live = self.store.load_state()
+                blocked_by = self.store.claim_symbol_coalesce_alert(
+                    live,
+                    symbol=quote.symbol,
+                    rule_id=rule.id,
+                )
+                state.setdefault("symbol_coalesce_alerts", {}).update(
+                    live.get("symbol_coalesce_alerts", {})
+                )
+                self.store.save_state(live)
+                suppress_deliver = blocked_by is not None
+        if suppress_deliver:
+            logger.info(
+                "Rule %s matched %s but skipped notify — simultaneous hit already sent via %s",
+                rule.id,
+                quote.symbol,
+                blocked_by,
+            )
+            if apply_cooldown:
+                self.store.mark_fired(state, key, datetime.now(timezone.utc))
+            important_symbols: list[str] = [] if skip_important else [quote.symbol]
+            pin = [quote.symbol]
+            if _sorts_ths_by_peak_fade(rule):
+                self._add_to_tonghuashun(
+                    rule,
+                    self._halt_or_day_pool_symbols(rule),
+                    board=False,
+                    important_symbols=important_symbols,
+                    pin_symbols=pin,
+                )
+            elif _is_ah_touch_board_rule(rule):
+                self._add_to_tonghuashun(
+                    rule,
+                    self._ah_touch_pool_symbols(rule),
+                    board=False,
+                    important_symbols=important_symbols,
+                    pin_symbols=pin,
+                )
+            else:
+                self._add_to_tonghuashun(
+                    rule,
+                    [quote],
+                    board=False,
+                    important_symbols=important_symbols,
+                    pin_symbols=pin,
+                )
+            return None
         await self._fill_prior_session(rule, quote)
         # Persist the trigger move for later history; show prior-session on the live top line.
         stored_message = render_message(rule, quote, extra, headline="trigger")
@@ -3918,8 +3979,6 @@ class MonitorEngine:
             change_pct=quote.change_pct,
         )
         alert.url = quote_url(quote.symbol)
-        moment = now_et()
-        session = et_session_name(moment)
         prior = (
             self.store.symbol_alerts_in_session(quote.symbol, session, moment.date())
             if session
@@ -3940,7 +3999,7 @@ class MonitorEngine:
         if apply_cooldown:
             self.store.mark_fired(state, key, alert.fired_at)
         logger.info("ALERT %s | %s", rule.id, alert.message)
-        important_symbols: list[str] = [] if skip_important else [quote.symbol]
+        important_symbols = [] if skip_important else [quote.symbol]
         pin = [quote.symbol]
         if _sorts_ths_by_peak_fade(rule):
             self._add_to_tonghuashun(
@@ -4180,7 +4239,16 @@ class MonitorEngine:
                         await self._arrange_important_by_afterhours()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 update failed for %s: %s", group, exc)
-                await self._note_problem(f"Tonghuashun add failed: {exc}")
+                failed = [
+                    symbol.strip().upper()
+                    for symbol in (pin or symbols)
+                    if symbol and str(symbol).strip()
+                ]
+                if failed:
+                    joined = ", ".join(dict.fromkeys(failed))
+                    await self._note_problem(f"Tonghuashun add failed for {joined}: {exc}")
+                else:
+                    await self._note_problem(f"Tonghuashun add failed: {exc}")
 
     async def _arrange_important_by_afterhours(self) -> None:
         """Reorder 我的自选 by after-hours gain, highest first."""

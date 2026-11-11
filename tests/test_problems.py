@@ -56,3 +56,11 @@ def test_state_json_corrupt_is_a_clear_pause_notice():
     assert notice[0] == "error:state-corrupt"
     assert notice[1] == "监控已暂停"
     assert "state.json" in notice[2]
+
+
+def test_tonghuashun_add_failure_includes_symbols():
+    notice = problem_notice("Tonghuashun add failed for pepg: timeout")
+    assert notice is not None
+    assert notice[0] == "error:tonghuashun:PEPG"
+    assert notice[1] == "加自选失败 PEPG"
+    assert notice[2] == "同花顺加自选失败：PEPG。"

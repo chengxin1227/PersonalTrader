@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 from monitor.engine import (
     MonitorEngine,
+    _day_gain_include_today,
     _is_day_pool_board,
     _is_day_spike_rule,
     _is_day_spike_singles_rule,
@@ -47,6 +48,9 @@ def test_day_pool_board_classifier():
     assert not _is_day_spike_singles_rule(board)
     assert not _is_touched_leaderboard(board)
     assert not _is_peak_top_board(board)
+    # 「过去5日」never includes today, even in after-hours.
+    assert not _day_gain_include_today(board, session_allows=True)
+    assert not _day_gain_include_today(board, session_allows=False)
 
     top5 = Rule(
         id="afterhours-top5",

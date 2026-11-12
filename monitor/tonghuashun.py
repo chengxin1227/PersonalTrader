@@ -56,10 +56,10 @@ def previous_watchlist_session(session: str) -> str | None:
 def summary_group_order(
     existing: list[str], symbols: list[str], *, bump: bool
 ) -> list[str]:
-    """Order for 盘x分组 / 我的自选 after adding ``symbols``.
+    """Order for 我的自选 after adding ``symbols``.
 
-    ``bump=True``: move ``symbols`` (deduped) to the top, keep the rest in place.
-    ``bump=False``: append only names that are not already present; do not reorder.
+    ``bump=True``: alert order — put ``symbols`` (deduped, including repeats) at the
+    front and keep the rest in place. ``bump=False``: append only missing names.
     """
     leading: list[str] = []
     seen: set[str] = set()

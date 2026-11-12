@@ -923,3 +923,49 @@ def test_halt_or_day_singles_skip_ths_rule_group():
         ),
     )
     assert not _skips_ths_rule_group(board)
+
+
+def test_session50_singles_skip_ths_rule_group_and_live_yaml():
+    from pathlib import Path
+
+    from monitor.engine import _skips_ths_rule_group
+    from monitor.rules import load_rules
+
+    plain = Rule(
+        id="afterhours-session50",
+        name="盘后涨超50%的股票",
+        symbol="*",
+        skip_ths_group=True,
+        once_per_session=True,
+        condition=Condition(
+            type=ConditionType.AFTERHOURS_GAIN,
+            value=50,
+            min_market_cap=1_000_000,
+            max_market_cap=1_000_000_000,
+            min_volume=10_000,
+        ),
+    )
+    assert _skips_ths_rule_group(plain)
+
+    without_flag = Rule(
+        id="afterhours-plain",
+        name="plain",
+        symbol="*",
+        condition=Condition(type=ConditionType.AFTERHOURS_GAIN, value=50),
+    )
+    assert not _skips_ths_rule_group(without_flag)
+
+    root = Path(__file__).resolve().parent.parent
+    config = load_rules(root / "config" / "rules.yaml")
+    session50 = [rule for rule in config.rules if rule.id.endswith("-session50")]
+    assert {rule.id for rule in session50} == {
+        "afterhours-session50",
+        "premarket-session50",
+    }
+    for rule in session50:
+        assert rule.skip_ths_group
+        assert rule.once_per_session
+        assert rule.notify == "Session-50"
+        assert rule.condition.value == 50
+        assert rule.condition.min_volume == 10_000
+        assert _skips_ths_rule_group(rule)

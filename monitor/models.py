@@ -85,6 +85,8 @@ class Rule(BaseModel):
     confirm_value: Optional[float] = None
     # After the first delivered alert for this rule+symbol in the session day, do not re-alert.
     once_per_session: bool = False
+    # When true, alerted names go to 我的自选 only — no dedicated Tonghuashun rule group.
+    skip_ths_group: bool = False
     # top_n boards: when false, refresh/record (同花顺) only — no Slack/Pushover digest.
     board_notify: bool = True
     condition: Condition

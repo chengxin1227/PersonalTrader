@@ -300,6 +300,20 @@ def _day_gain_floors(rule: Rule) -> list[float]:
     return []
 
 
+def _day_gain_include_today(rule: Rule, *, session_allows: bool) -> bool:
+    """Whether the day-gain lookback may include the current ET date.
+
+    「过去N日」(N>1 or day_gain_tiers) always means completed sessions only — today
+    is covered by today-touch / halt rules instead. Single-day floors (day25) may
+    include today after the regular close (after-hours only).
+    """
+    if not session_allows:
+        return False
+    if rule.condition.day_gain_tiers:
+        return False
+    return rule.condition.recent_day_count <= 1
+
+
 def _is_halt_or_day_rule(rule: Rule) -> bool:
     # Leaderboard variants are digest boards, not single-name pool alerts.
     return (
@@ -329,6 +343,8 @@ def _skips_ths_rule_group(rule: Rule) -> bool:
     """Singles that alert into 我的自选 only — no dedicated Tonghuashun rule group."""
     if _is_leaderboard_rule(rule):
         return False
+    if rule.skip_ths_group:
+        return True
     # halt-or-day50 / 5d-boost
     return _is_halt_or_day_rule(rule) or bool(rule.condition.day_gain_tiers)
 
@@ -1640,11 +1656,11 @@ class MonitorEngine:
         regular = kind is ConditionType.REGULAR_GAIN
         if not (afterhours or premarket or regular):
             return []
-        # After-hours can use today's intraday pool; premarket/regular use prior days.
+        # Multi-day windows skip today; single-day (day25) may use today in after-hours.
         days = recent_trading_days(
             now_et().date(),
             rule.condition.recent_day_count,
-            include_end=afterhours,
+            include_end=_day_gain_include_today(rule, session_allows=afterhours),
         )
         floors_by_symbol: dict[str, list[float]] = {}
         for minimum in floors:
@@ -1851,7 +1867,6 @@ class MonitorEngine:
             try:
                 # Reminder sync replaces 我的自选 with current rule-group leaders.
                 await self.ths.replace_important(symbols, session)
-                await self._arrange_important_by_afterhours()
                 logger.info(
                     "同花顺 %s reminder sync: %s",
                     config.important.ths_group,
@@ -1970,7 +1985,6 @@ class MonitorEngine:
         async with self._ths_lock:
             try:
                 await self.ths.add_important([symbol], session)
-                await self._arrange_important_by_afterhours()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 watched symbol failed for %s: %s", symbol, exc)
 
@@ -3409,9 +3423,11 @@ class MonitorEngine:
         days = recent_trading_days(
             now_et().date(),
             rule.condition.recent_day_count,
-            include_end=afterhours,
+            include_end=_day_gain_include_today(rule, session_allows=afterhours),
         )
         symbols: set[str] = set()
+        # Today's halts always count for halt-or-day matching.
+        symbols.update(self.store.session_symbols(today, "upward_halt"))
         for day in days:
             symbols.update(self.store.session_symbols(day, "upward_halt"))
         for minimum in floors:
@@ -3643,11 +3659,10 @@ class MonitorEngine:
         floors = _day_gain_floors(rule)
         if not floors:
             return []
-        afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
         days = recent_trading_days(
             now_et().date(),
             rule.condition.recent_day_count,
-            include_end=afterhours,
+            include_end=_day_gain_include_today(rule, session_allows=False),
         )
         symbols: set[str] = set()
         for minimum in floors:
@@ -3693,10 +3708,11 @@ class MonitorEngine:
             symbols.update(self.store.day_gain_symbols(regular_touch, [day]))
         floors = _day_gain_floors(rule)
         if floors:
+            # Today already added via min_regular_touch above; multi-day legs skip today.
             days = recent_trading_days(
                 now_et().date(),
                 rule.condition.recent_day_count,
-                include_end=True,
+                include_end=_day_gain_include_today(rule, session_allows=True),
             )
             for minimum in floors:
                 symbols.update(self.store.day_gain_symbols(minimum, days))
@@ -4530,7 +4546,6 @@ class MonitorEngine:
             async with self._ths_lock:
                 try:
                     await self.ths.add_important(target, session)
-                    await self._arrange_important_by_afterhours()
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("同花顺 update failed for 我的自选 (%s): %s", rule.id, exc)
                     await self._note_problem(
@@ -4642,7 +4657,6 @@ class MonitorEngine:
                     ]
                     if target:
                         await self.ths.add_important(target, session)
-                        await self._arrange_important_by_afterhours()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 update failed for %s: %s", group, exc)
                 failed = [
@@ -4655,30 +4669,6 @@ class MonitorEngine:
                     await self._note_problem(f"Tonghuashun add failed for {joined}: {exc}")
                 else:
                     await self._note_problem(f"Tonghuashun add failed: {exc}")
-
-    async def _arrange_important_by_afterhours(self) -> None:
-        """Reorder 我的自选 by after-hours gain, highest first."""
-        client = self._trend_moomoo or self.moomoo
-        if client is None or not self.ths.configured:
-            return
-        group = self.ths.important_group
-        members = await self.ths.group_symbols(group)
-        if not members:
-            return
-        found = await client.after_hours_quotes(members)
-        changes = {
-            symbol: quote.change_pct
-            for symbol, quote in (found or {}).items()
-            if quote.change_pct is not None
-        }
-        ordered = sorted(
-            members,
-            key=lambda symbol: changes.get(symbol, float("-inf")),
-            reverse=True,
-        )
-        if ordered == members:
-            return
-        await self.ths.arrange(group, ordered)
 
     async def _session_changes(self, rule: Rule, symbols: list[str]) -> dict[str, float | None]:
         """Current gain for the rule's session, so the group sorts high to low."""

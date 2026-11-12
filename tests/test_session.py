@@ -287,3 +287,22 @@ def test_trading_day_uses_next_open():
         next_open=datetime(2026, 9, 28, 9, 30, tzinfo=ET),
     )
     assert not is_trading_day(weekend, datetime(2026, 9, 26, 10, 0, tzinfo=ET))
+
+
+def test_session_board_slot_five_minute_interval():
+    assert session_board_slot(
+        "regular", datetime(2026, 10, 6, 9, 30, tzinfo=ET), interval_minutes=5
+    ) == datetime(2026, 10, 6, 9, 30, tzinfo=ET)
+    assert session_board_slot(
+        "regular", datetime(2026, 10, 6, 9, 34, tzinfo=ET), interval_minutes=5
+    ) == datetime(2026, 10, 6, 9, 30, tzinfo=ET)
+    assert session_board_slot(
+        "regular", datetime(2026, 10, 6, 9, 35, tzinfo=ET), interval_minutes=5
+    ) == datetime(2026, 10, 6, 9, 35, tzinfo=ET)
+    assert session_board_slot(
+        "regular", datetime(2026, 10, 6, 11, 7, tzinfo=ET), interval_minutes=5
+    ) == datetime(2026, 10, 6, 11, 5, tzinfo=ET)
+    # Default half-hour path unchanged.
+    assert session_board_slot("regular", datetime(2026, 10, 6, 11, 7, tzinfo=ET)) == datetime(
+        2026, 10, 6, 11, 0, tzinfo=ET
+    )

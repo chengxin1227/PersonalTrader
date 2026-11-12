@@ -203,6 +203,19 @@ def _half_hour_slot(current: datetime) -> datetime:
     return current.replace(minute=minute, second=0, microsecond=0)
 
 
+def _interval_slot(current: datetime, interval_minutes: int) -> datetime:
+    """Floor ``current`` to the start of its ``interval_minutes`` bucket."""
+    if interval_minutes <= 0:
+        raise ValueError("interval_minutes must be positive")
+    if interval_minutes == 30:
+        return _half_hour_slot(current)
+    if 60 % interval_minutes != 0:
+        # Still floor within the hour for odd intervals (e.g. 5, 10, 15, 20).
+        pass
+    minute = (current.minute // interval_minutes) * interval_minutes
+    return current.replace(minute=minute, second=0, microsecond=0)
+
+
 def afterhours_board_slot(moment: datetime | None = None) -> datetime | None:
     """After-hours board marks: first at 16:05 ET, then each half hour.
 
@@ -212,30 +225,36 @@ def afterhours_board_slot(moment: datetime | None = None) -> datetime | None:
 
 
 def session_board_slot(
-    session: str, moment: datetime | None = None
+    session: str,
+    moment: datetime | None = None,
+    interval_minutes: int = 30,
 ) -> datetime | None:
-    """Half-hour board marks for premarket / regular / afterhours.
+    """Board marks for premarket / regular / afterhours.
 
-    After-hours starts at 16:05 ET (≈10:05 NZ), then :30 / :00.
+    Default is half-hour. After-hours half-hour boards start at 16:05 ET
+    (≈10:05 NZ), then :30 / :00. Custom intervals floor within the hour.
     """
     current = now_et(moment)
+    interval = max(1, int(interval_minutes))
     if session == "premarket":
         if not is_premarket(current):
             return None
-        return _half_hour_slot(current)
+        return _interval_slot(current, interval)
     if session == "regular":
         if not is_regular_session(current):
             return None
-        return _half_hour_slot(current)
+        return _interval_slot(current, interval)
     if session == "afterhours":
         if not is_afterhours(current):
             return None
-        # Wait until 16:05 for the first board (≈10:05 NZ).
-        if current.hour == 16 and current.minute < 5:
-            return None
-        if current.hour == 16 and 5 <= current.minute < 30:
-            return current.replace(minute=5, second=0, microsecond=0)
-        return _half_hour_slot(current)
+        if interval == 30:
+            # Wait until 16:05 for the first board (≈10:05 NZ).
+            if current.hour == 16 and current.minute < 5:
+                return None
+            if current.hour == 16 and 5 <= current.minute < 30:
+                return current.replace(minute=5, second=0, microsecond=0)
+            return _half_hour_slot(current)
+        return _interval_slot(current, interval)
     return None
 
 

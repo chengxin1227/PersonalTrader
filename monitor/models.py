@@ -48,6 +48,8 @@ class Condition(BaseModel):
     include_circuit_breaker: bool = False
     skip_market_cap: bool = False
     top_n: Optional[int] = Field(default=None, ge=1)
+    # Digest cadence for top_n boards; default half-hour when omitted.
+    board_interval_minutes: Optional[int] = Field(default=None, ge=1)
     min_afterhours_touch: Optional[float] = None
     min_regular_touch: Optional[float] = None
     min_recent_day_change: Optional[float] = None
@@ -81,6 +83,10 @@ class Rule(BaseModel):
     # First match (condition.value) is silent; after this delay, alert when gain > confirm_value.
     confirm_delay_minutes: int = Field(default=0, ge=0)
     confirm_value: Optional[float] = None
+    # After the first delivered alert for this rule+symbol in the session day, do not re-alert.
+    once_per_session: bool = False
+    # top_n boards: when false, refresh/record (同花顺) only — no Slack/Pushover digest.
+    board_notify: bool = True
     condition: Condition
     slack_message: Optional[str] = None
 

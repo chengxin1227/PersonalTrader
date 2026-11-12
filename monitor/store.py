@@ -108,10 +108,10 @@ class Store:
         window_seconds: int = 5,
         now: datetime | None = None,
     ) -> str | None:
-        """Collapse near-simultaneous multi-rule hits for one symbol into one notify.
+        """Collapse near-simultaneous hits for one symbol into one notify.
 
-        If another rule already notified this symbol within ``window_seconds``, return
-        that rule id (caller should skip deliver). Same ``rule_id`` may notify again.
+        If this symbol was already notified within ``window_seconds``, return that
+        claim's rule id (caller should skip deliver). Includes same rule/notify.
         """
         current = now or _now()
         if current.tzinfo is None:
@@ -142,7 +142,7 @@ class Store:
         claim_key = symbol.strip().upper()
         existing = claims.get(claim_key)
         if isinstance(existing, dict):
-            other = str(existing.get("rule_id") or "")
+            other = str(existing.get("rule_id") or "") or rule_id
             raw = existing.get("at")
             stamped = None
             if raw:
@@ -152,15 +152,8 @@ class Store:
                     stamped = None
             if stamped is not None and stamped.tzinfo is None:
                 stamped = stamped.replace(tzinfo=timezone.utc)
-            if (
-                other
-                and stamped is not None
-                and (current - stamped).total_seconds() < window_seconds
-            ):
-                if other != rule_id:
-                    return other
-                # Same rule: allow notify, keep the original coalesce window.
-                return None
+            if stamped is not None and (current - stamped).total_seconds() < window_seconds:
+                return other
         claims[claim_key] = {"rule_id": rule_id, "at": current.isoformat()}
         return None
 

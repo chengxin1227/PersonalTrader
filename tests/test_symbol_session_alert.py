@@ -82,7 +82,7 @@ def test_claim_symbol_coalesce_alert_blocks_other_rules_briefly(tmp_path):
         )
         == "premarket-day25-10"
     )
-    # Same rule inside the window may still notify (repeat / stage-2).
+    # Same rule inside the window is also suppressed.
     assert (
         store.claim_symbol_coalesce_alert(
             state,
@@ -90,7 +90,7 @@ def test_claim_symbol_coalesce_alert_blocks_other_rules_briefly(tmp_path):
             rule_id="premarket-day25-10",
             now=now + timedelta(seconds=3),
         )
-        is None
+        == "premarket-day25-10"
     )
     # After the coalesce window from the original hit, another rule may notify.
     assert (
@@ -120,6 +120,7 @@ def test_same_symbol_simultaneous_multi_rule_sends_one_notify(tmp_path):
         with (
             patch("monitor.engine.now_et", return_value=moment),
             patch("monitor.engine.et_session_name", return_value="盘前"),
+            patch("monitor.store._now", return_value=moment),
         ):
             state = store.load_state()
             first = await engine._fire_alert(
@@ -154,7 +155,12 @@ def test_same_symbol_simultaneous_multi_rule_sends_one_notify(tmp_path):
             assert "premarket-halt-or-day50:NFT" in state["last_fired"]
             assert "premarket-5d-boost:NFT" in state["last_fired"]
 
-            # Same rule may still repeat after its own cooldown clears.
+        # After the coalesce window, the same rule may notify again.
+        with (
+            patch("monitor.engine.now_et", return_value=moment + timedelta(seconds=6)),
+            patch("monitor.engine.et_session_name", return_value="盘前"),
+            patch("monitor.store._now", return_value=moment + timedelta(seconds=6)),
+        ):
             state["last_fired"].pop("premarket-day25-10:NFT", None)
             again = await engine._fire_alert(
                 _rule("premarket-day25-10", "Day-25-boost"),
@@ -164,8 +170,8 @@ def test_same_symbol_simultaneous_multi_rule_sends_one_notify(tmp_path):
                 cooldown_key="premarket-day25-10:NFT",
                 skip_confirm=True,
             )
-            assert again is not None
-            assert delivered == ["premarket-day25-10:NFT", "premarket-day25-10:NFT"]
+        assert again is not None
+        assert delivered == ["premarket-day25-10:NFT", "premarket-day25-10:NFT"]
 
     asyncio.run(run())
 
@@ -238,6 +244,7 @@ def test_pool_entry_does_not_claim_symbol_coalesce(tmp_path):
         with (
             patch("monitor.engine.now_et", return_value=moment),
             patch("monitor.engine.et_session_name", return_value="盘中"),
+            patch("monitor.store._now", return_value=moment),
         ):
             state = store.load_state()
             pool = await engine._fire_alert(
@@ -245,22 +252,27 @@ def test_pool_entry_does_not_claim_symbol_coalesce(tmp_path):
                 quote,
                 state,
                 extra=None,
-                cooldown_key="afterhours-halt-or-day50:pool:AIOK",
+                cooldown_key="Halt-boost:pool:AIOK",
                 skip_confirm=True,
             )
+        with (
+            patch("monitor.engine.now_et", return_value=moment + timedelta(seconds=6)),
+            patch("monitor.engine.et_session_name", return_value="盘中"),
+            patch("monitor.store._now", return_value=moment + timedelta(seconds=6)),
+        ):
             single = await engine._fire_alert(
                 _rule("afterhours-halt-or-day50", "Halt-boost"),
                 quote,
                 state,
                 extra=None,
-                cooldown_key="afterhours-halt-or-day50:AIOK",
+                cooldown_key="Halt-boost:AIOK",
                 skip_confirm=True,
             )
-            assert pool is not None
-            assert single is not None
-            assert delivered == [
-                "afterhours-halt-or-day50:AIOK",
-                "afterhours-halt-or-day50:AIOK",
-            ]
+        assert pool is not None
+        assert single is not None
+        assert delivered == [
+            "afterhours-halt-or-day50:AIOK",
+            "afterhours-halt-or-day50:AIOK",
+        ]
 
     asyncio.run(run())

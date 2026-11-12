@@ -42,6 +42,7 @@ from monitor.rules import (
     evaluate_stable_afterhours,
     evaluate_rule,
     hour_change_pct,
+    fade_leaderboard_line,
     leaderboard_line,
     load_rules,
     matched_day_gain_tier,
@@ -109,11 +110,26 @@ def _is_spike_rule(rule: Rule) -> bool:
 
 
 def _is_peak_fade_rule(rule: Rule) -> bool:
-    return rule.condition.min_fade_from_high is not None and rule.condition.type in {
-        ConditionType.AFTERHOURS_GAIN,
-        ConditionType.PREMARKET_GAIN,
-        ConditionType.REGULAR_GAIN,
-    }
+    # Digests with top_n use the leaderboard path; do not treat them as singles.
+    return (
+        rule.condition.min_fade_from_high is not None
+        and not _is_leaderboard_rule(rule)
+        and rule.condition.type
+        in {
+            ConditionType.AFTERHOURS_GAIN,
+            ConditionType.PREMARKET_GAIN,
+            ConditionType.REGULAR_GAIN,
+        }
+    )
+
+
+def _is_peak_fade_board(rule: Rule) -> bool:
+    """Touched-pool digest ranked by peak − current (highest giveback first)."""
+    return (
+        _is_leaderboard_rule(rule)
+        and _is_touched_leaderboard(rule)
+        and rule.condition.min_fade_from_high is not None
+    )
 
 
 def _is_new_high_rule(rule: Rule) -> bool:
@@ -131,6 +147,45 @@ def _is_close_rule(rule: Rule) -> bool:
 def _is_symbol_close_rule(rule: Rule) -> bool:
     """Named-symbol close check (e.g. IXIC ±2%), not a scanner pool."""
     return _is_close_rule(rule) and rule.symbol not in {"*", "ALL"}
+
+
+def _rule_notify_key(rule: Rule) -> str:
+    return (rule.notify or rule.id).strip() or rule.id
+
+
+def _alert_cooldown_key(rule: Rule, symbol: str, *, pool: bool = False) -> str:
+    """Cooldown / once-per-session key for a rule+symbol.
+
+    Default: share across 盘前/盘中/盘后 copies via notify.
+    once_per_session: scope to this rule id + session day (same rule once per 时段).
+    """
+    notify = _rule_notify_key(rule)
+    symbol = symbol.strip().upper()
+    if pool:
+        return f"{notify}:pool:{symbol}"
+    if rule.once_per_session:
+        session = rule.condition_session or rule.group or ""
+        day = now_et().date().isoformat()
+        return f"{rule.id}:{session}:{day}:{symbol}"
+    return f"{notify}:{symbol}"
+
+
+def _active_session_condition_type() -> ConditionType | None:
+    if is_afterhours():
+        return ConditionType.AFTERHOURS_GAIN
+    if is_premarket():
+        return ConditionType.PREMARKET_GAIN
+    if is_regular_session():
+        return ConditionType.REGULAR_GAIN
+    return None
+
+
+def _rules_for_active_session(rules: list[Rule]) -> list[Rule]:
+    """Keep only rules whose condition matches the open US session."""
+    want = _active_session_condition_type()
+    if want is None:
+        return []
+    return [rule for rule in rules if rule.condition.type is want]
 
 
 def _is_regular_gain_rule(rule: Rule) -> bool:
@@ -183,7 +238,8 @@ def _board_slot_for_rule(rule: Rule) -> datetime | None:
     session = _board_session_key(rule)
     if session is None:
         return None
-    return session_board_slot(session)
+    interval = rule.condition.board_interval_minutes or 30
+    return session_board_slot(session, interval_minutes=interval)
 
 
 def _board_min_volume(rule: Rule, slot: datetime) -> int | None:
@@ -236,7 +292,9 @@ def _is_halt_or_day_rule(rule: Rule) -> bool:
 
 
 def _sorts_ths_by_peak_fade(rule: Rule) -> bool:
-    """Halt/50% 同花顺: sort by (intraday peak % − regular close %), larger fade first."""
+    """Halt/50% 同花顺 / fade boards: sort by peak % − current %, larger giveback first."""
+    if _is_peak_fade_board(rule):
+        return True
     if _is_pool_gain_board(rule):
         return False
     return _is_halt_or_day_rule(rule) or (
@@ -670,6 +728,13 @@ class MonitorEngine:
                     or _is_leaderboard_rule(rule)
                     or _is_day_spike_rule(rule)
                     or _is_regular_gain_rule(rule)
+                    # Sudden / last-hour have dedicated loops; never treat as session-gain screens.
+                    or _is_sudden_rule(rule)
+                    or _is_last_hour_rule(rule)
+                    or _is_halt_or_day_rule(rule)
+                    or _is_ah_touch_singles_rule(rule)
+                    or _is_stable_rule(rule)
+                    or _is_trend_rule(rule)
                 ):
                     continue
                 scanned, scan_error = await self._run_scanner(rule, config, state)
@@ -1040,13 +1105,22 @@ class MonitorEngine:
                             state = self.store.load_state()
                             await self._emit_trend_matches(rule, matched, state)
                             self.store.save_state(state)
-                    touch_rules = [rule for rule in day_gain_rules if rule.condition.intraday_touch]
+                    # day25 / 5d / halt: only 盘中 copies feed RTH day-gain + pool alerts.
+                    active_day = _rules_for_active_session(day_gain_rules)
+                    active_halt = _rules_for_active_session(halt_or_day_rules)
+                    touch_rules = [
+                        rule for rule in active_day if rule.condition.intraday_touch
+                    ]
                     touch_rules.extend(
                         rule
-                        for rule in config.rules
-                        if rule.enabled
-                        and _is_leaderboard_rule(rule)
-                        and rule.condition.min_regular_touch is not None
+                        for rule in _rules_for_active_session(
+                            [
+                                item
+                                for item in config.rules
+                                if item.enabled and _is_leaderboard_rule(item)
+                            ]
+                        )
+                        if rule.condition.min_regular_touch is not None
                     )
                     if touch_rules:
                         await self._record_day_gains(touch_rules)
@@ -1066,7 +1140,7 @@ class MonitorEngine:
                             await self._capture_trend_watch(rule)
                             self._note_opend_ok()
                     halt_record_rules = rules + [
-                        rule for rule in halt_or_day_rules if not _is_close_rule(rule)
+                        rule for rule in active_halt if not _is_close_rule(rule)
                     ]
                     if halt_record_rules and self._breaker_due():
                         newly_halted: list[Quote] = []
@@ -1078,7 +1152,7 @@ class MonitorEngine:
                                 seen_halt.add(quote.symbol)
                                 newly_halted.append(quote)
                             self._note_opend_ok()
-                        for rule in halt_or_day_rules:
+                        for rule in active_halt:
                             if _is_close_rule(rule):
                                 continue
                             await self._emit_halt_or_day_pool_entries(rule, newly_halted)
@@ -1114,7 +1188,7 @@ class MonitorEngine:
                         rule
                         for rule in config.rules
                         if rule.enabled
-                        and _is_peak_top_board(rule)
+                        and _is_leaderboard_rule(rule)
                         and rule.condition.type is ConditionType.REGULAR_GAIN
                     ]
                     if regular_boards:
@@ -1129,15 +1203,21 @@ class MonitorEngine:
                         self._closing_gains_day = now_et().date().isoformat()
                         self._note_opend_ok()
                     # Catch names that spiked above the touch then faded before the live screen saw them.
+                    # Only 盘后 copies of day25 / 5d / halt — not 盘前/盘中 variants.
+                    active_day = _rules_for_active_session(day_gain_rules)
                     afterhours_touch_day = [
-                        rule for rule in day_gain_rules if rule.condition.intraday_touch
+                        rule for rule in active_day if rule.condition.intraday_touch
                     ]
                     afterhours_touch_day.extend(
                         rule
-                        for rule in config.rules
-                        if rule.enabled
-                        and _is_leaderboard_rule(rule)
-                        and rule.condition.min_regular_touch is not None
+                        for rule in _rules_for_active_session(
+                            [
+                                item
+                                for item in config.rules
+                                if item.enabled and _is_leaderboard_rule(item)
+                            ]
+                        )
+                        if rule.condition.min_regular_touch is not None
                     )
                     if afterhours_touch_day:
                         await self._record_day_gains(afterhours_touch_day)
@@ -1326,7 +1406,7 @@ class MonitorEngine:
                 logger.info("Recorded day gain > %.0f%%: %s", minimum, _symbols_text(added))
                 by_symbol = {quote.symbol.upper(): quote for quote in touched}
                 fresh = [by_symbol[symbol] for symbol in added if symbol in by_symbol]
-                for alert_rule in rules:
+                for alert_rule in _rules_for_active_session(rules):
                     if not _is_halt_or_day_rule(alert_rule):
                         continue
                     threshold = alert_rule.condition.min_recent_day_change
@@ -1341,8 +1421,14 @@ class MonitorEngine:
                     await self._emit_halt_or_day_pool_entries(alert_rule, fresh)
 
     async def _emit_halt_or_day_pool_entries(self, rule: Rule, quotes: list[Quote]) -> None:
-        """Push once when a name first joins the halt/50% pool; AH alerts use a separate key."""
+        """Push once when a name first joins the halt/50% pool (盘前/盘后 only).
+
+        盘中 halt-or-day50 only alerts on the later session +5% path — pool membership
+        is still recorded for the fade board / later sessions.
+        """
         if not quotes or not _is_halt_or_day_rule(rule):
+            return
+        if rule.condition.type is ConditionType.REGULAR_GAIN:
             return
         async with self._lock:
             state = self.store.load_state()
@@ -1352,7 +1438,7 @@ class MonitorEngine:
                     quote,
                     state,
                     extra=None,
-                    cooldown_key=f"{rule.id}:pool:{quote.symbol}",
+                    cooldown_key=_alert_cooldown_key(rule, quote.symbol, pool=True),
                 )
             self.store.save_state(state)
 
@@ -2091,7 +2177,7 @@ class MonitorEngine:
             quote,
             state,
             extra=extra,
-            cooldown_key=f"{rule.id}:{quote.symbol}",
+            cooldown_key=_alert_cooldown_key(rule, quote.symbol),
         )
         return alert is not None
 
@@ -2111,10 +2197,27 @@ class MonitorEngine:
     def _rule_session_open(self, rule: Rule) -> bool:
         if not is_trading_day(self.market):
             return False
-        if rule.condition.type is ConditionType.AFTERHOURS_GAIN:
+        kind = rule.condition.type
+        if kind is ConditionType.AFTERHOURS_GAIN:
             return is_afterhours()
-        if rule.condition.type is ConditionType.PREMARKET_GAIN:
+        if kind is ConditionType.PREMARKET_GAIN:
             return is_premarket()
+        if kind in {ConditionType.REGULAR_GAIN, ConditionType.REGULAR_CLOSE}:
+            return is_regular_session()
+        if kind is ConditionType.SUDDEN_GAIN:
+            late = rule.condition.late_session
+            if late == "afterhours":
+                return is_afterhours()
+            if late == "premarket":
+                return is_premarket()
+            return is_regular_session()
+        if kind is ConditionType.LATE_SESSION_GAIN:
+            late = rule.condition.late_session
+            if late == "afterhours":
+                return is_afterhours()
+            if late == "premarket":
+                return is_premarket()
+            return is_regular_session()
         return False
 
     def _should_scan(self, config: RulesConfig) -> bool:
@@ -2195,7 +2298,7 @@ class MonitorEngine:
                 quote,
                 state,
                 extra=extra,
-                cooldown_key=f"{rule.id}:{quote.symbol}",
+                cooldown_key=_alert_cooldown_key(rule, quote.symbol),
             )
             if alert is None:
                 continue
@@ -2266,7 +2369,7 @@ class MonitorEngine:
                     quote,
                     state,
                     extra=extra,
-                    cooldown_key=f"{rule.id}:{quote.symbol}",
+                    cooldown_key=_alert_cooldown_key(rule, quote.symbol),
                 )
                 if alert is not None:
                     fired.append(alert)
@@ -2746,7 +2849,7 @@ class MonitorEngine:
             arm_key = f"confirm:{notify}:{quote.symbol.upper()}"
             if self.store.confirm_armed_at(state, arm_key) is not None:
                 continue
-            cooldown_key = f"{rule.id}:{quote.symbol}"
+            cooldown_key = _alert_cooldown_key(rule, quote.symbol)
             if self.store.in_cooldown(state, cooldown_key, rule.cooldown_minutes):
                 continue
             self.store.note_confirm_arm(state, arm_key)
@@ -2807,7 +2910,7 @@ class MonitorEngine:
                 quote,
                 state,
                 extra=None,
-                cooldown_key=f"{rule.id}:{symbol}",
+                cooldown_key=_alert_cooldown_key(rule, symbol),
                 skip_confirm=True,
             )
 
@@ -3369,10 +3472,14 @@ class MonitorEngine:
             return
         min_volume = _board_min_volume(rule, slot)
         peak_board = _is_peak_top_board(rule)
+        fade_board = _is_peak_fade_board(rule)
         kind = rule.condition.type
         try:
             if _is_touched_leaderboard(rule):
-                leaders = await self._touched_afterhours_leaders(rule, min_volume)
+                if kind is ConditionType.REGULAR_GAIN:
+                    leaders = await self._touched_regular_fade_leaders(rule, min_volume)
+                else:
+                    leaders = await self._touched_afterhours_leaders(rule, min_volume)
             elif kind is ConditionType.AFTERHOURS_GAIN:
                 leaders = await self._top_afterhours_by_peak(rule, min_volume)
             elif kind is ConditionType.PREMARKET_GAIN:
@@ -3399,34 +3506,48 @@ class MonitorEngine:
             )
             self._board_retry_at = now + timedelta(seconds=30)
             return
-        line = peak_leaderboard_line if peak_board else leaderboard_line
-        rows = [(quote.symbol, line(quote)) for quote in leaders]
-        title = f"{format_nz_clock(slot)} {rule.name}"
-        reason = rule.board_summary
-        delivered = await self._deliver_digest(
-            rule.id, title, rows, rule.notify, reason=reason
-        )
-        if not delivered:
-            self._board_retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
-            return
-        # Digest keeps tickers; persist company names so repeat-history bodies stay consistent.
-        message = "\n".join(line(quote, company=True) for quote in leaders)
-        if reason and reason not in message:
-            message = f"{message}\n{reason}"
-        alert = self.store.new_alert(
-            rule_id=rule.id,
-            rule_name=rule.board_summary,
-            label=rule.name,
-            notify=rule.notify,
-            symbol=leaders[0].symbol,
-            message=message,
-            price=leaders[0].price,
-            change_pct=leaders[0].change_pct,
-        )
-        self.store.append_alert(alert)
-        self.store.mark_fired(state, slot_key, alert.fired_at)
-        logger.info("ALERT %s | %s", rule.id, message.replace("\n", " | "))
         pin = [quote.symbol for quote in leaders]
+        if rule.board_notify:
+            if fade_board:
+                line = fade_leaderboard_line
+            elif peak_board:
+                line = peak_leaderboard_line
+            else:
+                line = leaderboard_line
+            rows = [(quote.symbol, line(quote)) for quote in leaders]
+            title = f"{format_nz_clock(slot)} {rule.name}"
+            reason = rule.board_summary
+            delivered = await self._deliver_digest(
+                rule.id, title, rows, rule.notify, reason=reason
+            )
+            if not delivered:
+                self._board_retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+                return
+            # Digest keeps tickers; persist company names so repeat-history bodies stay consistent.
+            message = "\n".join(line(quote, company=True) for quote in leaders)
+            if reason and reason not in message:
+                message = f"{message}\n{reason}"
+            alert = self.store.new_alert(
+                rule_id=rule.id,
+                rule_name=rule.board_summary,
+                label=rule.name,
+                notify=rule.notify,
+                symbol=leaders[0].symbol,
+                message=message,
+                price=leaders[0].price,
+                change_pct=leaders[0].change_pct,
+            )
+            self.store.append_alert(alert)
+            self.store.mark_fired(state, slot_key, alert.fired_at)
+            logger.info("ALERT %s | %s", rule.id, message.replace("\n", " | "))
+        else:
+            self.store.mark_fired(state, slot_key, datetime.now(timezone.utc))
+            logger.info(
+                "Board %s %s recorded %s names (no digest)",
+                rule.id,
+                slot.strftime("%H:%M"),
+                len(leaders),
+            )
         if _sorts_ths_by_peak_fade(rule):
             # Halt/50%: keep the full pool, sort by peak−close fade (no clear/replace).
             self._add_to_tonghuashun(
@@ -3500,12 +3621,93 @@ class MonitorEngine:
         if not marks:
             return []
         volume = int(min_volume) if min_volume is not None else None
+        if _is_peak_fade_board(rule):
+            # Pool membership is halt/touch; do not re-filter by current session gain.
+            return self._fade_leaders(
+                list(marks.values()),
+                rule.condition.top_n or 5,
+                volume,
+                min_fade=rule.condition.min_fade_from_high,
+            )
         return afterhours_leaders(
             list(marks.values()),
             rule.condition.top_n or 5,
             volume,
             min_change=rule.condition.value,
         )
+
+    async def _touched_regular_fade_leaders(
+        self, rule: Rule, min_volume: float | None
+    ) -> list[Quote]:
+        """Top N by peak−current among halt / day-touch names in the regular session."""
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return []
+        symbols = self._halt_or_day_pool_symbols(rule)
+        if not symbols:
+            return []
+        day = now_et().date().isoformat()
+        peaks = self.store.peak_gains(day)
+        snaps = await self._moomoo_snapshots(client, sorted(symbols))
+        by_symbol: dict[str, Quote] = {}
+        for symbol in symbols:
+            key = symbol.upper()
+            quote = (snaps or {}).get(key) or (snaps or {}).get(symbol)
+            if quote is None:
+                quote = Quote(symbol=key)
+            peak = regular_touch_change_pct(
+                change_pct=quote.change_pct,
+                high=quote.daily_high,
+                prev_close=quote.prev_close,
+                pre_high=quote.premarket_high,
+            )
+            stored = peaks.get(key)
+            candidates = [
+                value
+                for value in (peak, stored, quote.session_high_pct, quote.change_pct)
+                if value is not None
+            ]
+            if candidates:
+                best = max(candidates)
+                quote.session_high_pct = best
+                self.store.note_peak_gain(day, key, best)
+            by_symbol[key] = quote
+        volume = int(min_volume) if min_volume is not None else None
+        return self._fade_leaders(
+            list(by_symbol.values()),
+            rule.condition.top_n or 5,
+            volume,
+            min_fade=rule.condition.min_fade_from_high,
+        )
+
+    @staticmethod
+    def _fade_leaders(
+        quotes: list[Quote],
+        limit: int,
+        min_volume: int | None = None,
+        min_change: float | None = None,
+        min_fade: float | None = None,
+    ) -> list[Quote]:
+        """Rank by peak − current giveback, largest first."""
+        ready: list[Quote] = []
+        for quote in quotes:
+            if quote.price is None or quote.price <= 0:
+                continue
+            if quote.change_pct is None or quote.session_high_pct is None:
+                continue
+            if min_change is not None and quote.change_pct <= min_change:
+                continue
+            fade = peak_fade_score(quote.session_high_pct, quote.change_pct)
+            if min_fade is not None and fade < min_fade:
+                continue
+            if min_volume is not None and (quote.volume is None or quote.volume <= min_volume):
+                continue
+            ready.append(quote)
+        ready.sort(
+            key=lambda item: peak_fade_score(item.session_high_pct, item.change_pct),
+            reverse=True,
+        )
+        return ready[:limit]
 
     async def _top_afterhours_by_peak(
         self, rule: Rule, min_volume: float | None
@@ -3687,7 +3889,7 @@ class MonitorEngine:
                 quote,
                 state,
                 extra=None,
-                cooldown_key=f"{rule.id}:{quote.symbol}",
+                cooldown_key=_alert_cooldown_key(rule, quote.symbol),
             )
             if alert is not None:
                 fired.append(alert)
@@ -3734,6 +3936,17 @@ class MonitorEngine:
         state: dict,
     ) -> tuple[list[Alert], str | None]:
         if self.moomoo is None:
+            return [], None
+        # Sudden / last-hour must not fall through to session-gain rank screens.
+        if rule.condition.type in {
+            ConditionType.SUDDEN_GAIN,
+            ConditionType.LATE_SESSION_GAIN,
+        }:
+            logger.warning(
+                "Skipping Moomoo session-gain scanner for %s (%s); use dedicated path",
+                rule.id,
+                rule.condition.type.value,
+            )
             return [], None
         afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
         max_cap = rule.condition.max_market_cap or 100_000_000
@@ -3784,7 +3997,7 @@ class MonitorEngine:
                 quote,
                 state,
                 extra=extra,
-                cooldown_key=f"{rule.id}:{quote.symbol}",
+                cooldown_key=_alert_cooldown_key(rule, quote.symbol),
             )
             if alert is None:
                 continue
@@ -3940,32 +4153,39 @@ class MonitorEngine:
         key = cooldown_key or rule.id
         if not skip_confirm and self._blocked_by_confirm_delay(rule, quote, state, key):
             return None
-        if self.store.in_cooldown(state, key, rule.cooldown_minutes):
+        if rule.once_per_session:
+            if self.store.last_fired_at(state, key) is not None:
+                logger.info(
+                    "Rule %s matched %s but already alerted this session",
+                    rule.id,
+                    quote.symbol,
+                )
+                return None
+        elif self.store.in_cooldown(state, key, rule.cooldown_minutes):
             logger.info("Rule %s matched %s but is in cooldown", rule.id, quote.symbol)
             return None
         moment = now_et()
         session = et_session_name(moment)
         # Same symbol hitting several rules at once → one Slack/Pushover ping.
-        # Short coalesce window only; later separate hits still notify. Pool keys skipped.
+        # Short coalesce window only; later separate hits still notify.
         suppress_deliver = False
         blocked_by: str | None = None
-        if ":pool:" not in key:
-            lock = getattr(self, "_symbol_alert_lock", None)
-            if lock is None:
-                self._symbol_alert_lock = asyncio.Lock()
-                lock = self._symbol_alert_lock
-            async with lock:
-                live = self.store.load_state()
-                blocked_by = self.store.claim_symbol_coalesce_alert(
-                    live,
-                    symbol=quote.symbol,
-                    rule_id=rule.id,
-                )
-                state.setdefault("symbol_coalesce_alerts", {}).update(
-                    live.get("symbol_coalesce_alerts", {})
-                )
-                self.store.save_state(live)
-                suppress_deliver = blocked_by is not None
+        lock = getattr(self, "_symbol_alert_lock", None)
+        if lock is None:
+            self._symbol_alert_lock = asyncio.Lock()
+            lock = self._symbol_alert_lock
+        async with lock:
+            live = self.store.load_state()
+            blocked_by = self.store.claim_symbol_coalesce_alert(
+                live,
+                symbol=quote.symbol,
+                rule_id=_rule_notify_key(rule),
+            )
+            state.setdefault("symbol_coalesce_alerts", {}).update(
+                live.get("symbol_coalesce_alerts", {})
+            )
+            self.store.save_state(live)
+            suppress_deliver = blocked_by is not None
         if suppress_deliver:
             logger.info(
                 "Rule %s matched %s but skipped notify — simultaneous hit already sent via %s",

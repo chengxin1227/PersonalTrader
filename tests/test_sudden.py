@@ -317,15 +317,20 @@ def test_sudden_first_alerts_skip_important_hold_adds(tmp_path):
     )
 
     async def run() -> None:
+        from unittest.mock import patch
+
+        t0 = datetime(2026, 11, 11, 18, 0, tzinfo=timezone.utc)
         state = store.load_state()
-        await engine._emit_sudden_first_alerts(rule, [spike], state)
+        with patch("monitor.store._now", return_value=t0):
+            await engine._emit_sudden_first_alerts(rule, [spike], state)
         assert delivered == ["SPIK"]
         assert ths_calls[-1]["important_symbols"] == []
         assert "confirm:Sudden-10:SPIK" in state["confirm_armed"]
-        assert f"{rule.id}:SPIK" not in state.get("last_fired", {})
+        assert "Sudden-10:SPIK" not in state.get("last_fired", {})
 
         # Second spike while armed: no duplicate first alert.
-        await engine._emit_sudden_first_alerts(rule, [spike], state)
+        with patch("monitor.store._now", return_value=t0 + timedelta(seconds=1)):
+            await engine._emit_sudden_first_alerts(rule, [spike], state)
         assert delivered == ["SPIK"]
 
         # Hold before delay: nothing.
@@ -333,7 +338,8 @@ def test_sudden_first_alerts_skip_important_hold_adds(tmp_path):
             return_value={"SPIK": spike}
         )
         engine._trend_moomoo = object()
-        await engine._emit_sudden_hold_alerts(rule, state)
+        with patch("monitor.store._now", return_value=t0 + timedelta(minutes=1)):
+            await engine._emit_sudden_hold_alerts(rule, state)
         assert delivered == ["SPIK"]
 
         armed = datetime.fromisoformat(state["confirm_armed"]["confirm:Sudden-10:SPIK"])
@@ -349,9 +355,27 @@ def test_sudden_first_alerts_skip_important_hold_adds(tmp_path):
             updated_at=datetime.now(timezone.utc),
         )
         engine._sudden_session_quotes = AsyncMock(return_value={"SPIK": held})  # type: ignore[method-assign]
-        await engine._emit_sudden_hold_alerts(rule, state)
+        with patch("monitor.store._now", return_value=t0 + timedelta(minutes=11)):
+            await engine._emit_sudden_hold_alerts(rule, state)
         assert delivered == ["SPIK", "SPIK"]
         assert ths_calls[-1]["important_symbols"] == ["SPIK"]
-        assert f"{rule.id}:SPIK" in state["last_fired"]
+        assert "Sudden-10:SPIK" in state["last_fired"]
+
+    asyncio.run(run())
+
+
+def test_moomoo_scanner_skips_sudden_gain():
+    """Sudden must not be treated as a premarket/afterhours session-gain screen."""
+    async def run():
+        engine = MonitorEngine.__new__(MonitorEngine)
+        client = AsyncMock()
+        client.scan_premarket = AsyncMock(return_value=[])
+        client.scan_afterhours = AsyncMock(return_value=[])
+        engine.moomoo = client
+        fired, err = await engine._run_moomoo_scanner(_sudden_rule("afterhours"), {})
+        assert fired == []
+        assert err is None
+        client.scan_premarket.assert_not_called()
+        client.scan_afterhours.assert_not_called()
 
     asyncio.run(run())

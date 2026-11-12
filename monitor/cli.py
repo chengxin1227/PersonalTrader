@@ -200,10 +200,16 @@ def print_startup(settings: Settings, verbose: bool, source: str) -> None:
                             "premarket_gain": "premarket",
                             "regular_gain": "regular-session",
                         }.get(rule.condition.type.value, "session")
+                        interval = rule.condition.board_interval_minutes or 30
+                        if rule.condition.min_fade_from_high is not None:
+                            rank = "peak−current fade"
+                        else:
+                            rank = "current gain"
+                        digest = "" if rule.board_notify else " (record only, no digest)"
                         print(
                             f"    - {rule.name}: top {rule.condition.top_n} "
-                            f"{session} names by current gain{pool} every 30m{singles}, "
-                            f"{_cap_text(rule)}{volume}"
+                            f"{session} names by {rank}{pool} every {interval}m{singles}"
+                            f"{digest}, {_cap_text(rule)}{volume}"
                         )
                         continue
                     if (

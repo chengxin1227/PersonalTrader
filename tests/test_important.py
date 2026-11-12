@@ -24,20 +24,11 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_rules_yaml_loads_important_block():
     config = load_rules(ROOT / "config" / "rules.yaml")
     assert config.important.ths_group == "我的自选"
-    assert set(config.important.high_priority_rule_ids) == {
-        "afterhours-day25-10",
-        "premarket-day25-10",
-        "regular-day25-10",
-        "afterhours-halt-or-day50",
-        "premarket-halt-or-day50",
-        "regular-halt-or-day50",
-        "afterhours-5d-boost",
-        "premarket-5d-boost",
-        "regular-5d-boost",
-        "afterhours-sudden-10",
-        "regular-sudden-10",
-        "premarket-sudden-10",
-        "regular-nasdaq-2",
+    assert config.important.high_priority_rule_ids == []
+    # 12:30 / 13:00 NZ check reminders stay high-priority in _deliver_check_reminder.
+    assert {item.key for item in config.important.reminders} == {
+        "afterhours-2h30",
+        "afterhours-3h",
     }
     assert set(config.important.watchlist.always) == {
         "afterhours-day25-10",
@@ -79,6 +70,15 @@ def test_rules_yaml_loads_important_block():
     assert board.condition.min_recent_day_change == 50
     assert board.condition.recent_day_count == 5
     assert board.condition.include_circuit_breaker is True
+    fade = next(rule for rule in config.rules if rule.id == "regular-halt50-fade-board")
+    assert fade.board_notify is False
+    assert fade.notify is None
+    assert fade.condition.top_n == 50
+    assert fade.condition.board_interval_minutes == 5
+    assert fade.condition.min_regular_touch == 50
+    assert fade.condition.include_circuit_breaker is True
+    assert fade.condition.min_fade_from_high == 0
+
     day25 = [rule for rule in config.rules if rule.id.endswith("-day25-10")]
     assert len(day25) == 3
     assert {rule.name for rule in day25} == {"盘中曾涨超25%后续涨超10%的股票"}

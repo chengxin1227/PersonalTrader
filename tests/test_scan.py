@@ -823,3 +823,46 @@ def test_day_gain_tiers_or_across_50_and_100():
     assert not evaluate_premarket_scan(
         premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
     ).matched
+
+
+def test_fade_leaders_rank_by_giveback():
+    from monitor.engine import MonitorEngine
+
+    quotes = [
+        _quote(symbol="SMALL", price=1.5, prev_close=1.0, volume=100_001),
+        _quote(symbol="BIG", price=1.4, prev_close=1.0, volume=100_001),
+        _quote(symbol="MID", price=1.45, prev_close=1.0, volume=100_001),
+        _quote(symbol="THIN", price=1.2, prev_close=1.0, volume=100),
+    ]
+    quotes[0].change_pct = 50.0
+    quotes[0].session_high_pct = 60.0
+    quotes[1].change_pct = 40.0
+    quotes[1].session_high_pct = 80.0
+    quotes[2].change_pct = 45.0
+    quotes[2].session_high_pct = 70.0
+    quotes[3].change_pct = 10.0
+    quotes[3].session_high_pct = 90.0
+    ordered = MonitorEngine._fade_leaders(quotes, limit=10, min_volume=10_000, min_fade=0)
+    assert [quote.symbol for quote in ordered] == ["BIG", "MID", "SMALL"]
+
+
+def test_peak_fade_board_is_not_a_single_fade_rule():
+    from monitor.engine import _is_peak_fade_board, _is_peak_fade_rule, _sorts_ths_by_peak_fade
+
+    rule = Rule(
+        id="regular-halt50-fade-board",
+        name="盘中熔断或涨超50%回落的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.REGULAR_GAIN,
+            value=0,
+            top_n=50,
+            board_interval_minutes=5,
+            min_regular_touch=50,
+            include_circuit_breaker=True,
+            min_fade_from_high=0,
+        ),
+    )
+    assert _is_peak_fade_board(rule)
+    assert not _is_peak_fade_rule(rule)
+    assert _sorts_ths_by_peak_fade(rule)

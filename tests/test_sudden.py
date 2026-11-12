@@ -259,9 +259,12 @@ def test_sudden_match_without_prior_session_floor():
 
 def test_sudden_first_alerts_skip_important_hold_adds(tmp_path):
     from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
+    from zoneinfo import ZoneInfo
 
     from monitor.store import Store
 
+    ET = ZoneInfo("America/New_York")
     store = Store(tmp_path)
     engine = MonitorEngine.__new__(MonitorEngine)
     engine.store = store
@@ -307,25 +310,28 @@ def test_sudden_first_alerts_skip_important_hold_adds(tmp_path):
     engine._add_to_tonghuashun = _ths  # type: ignore[method-assign]
 
     rule = _sudden_rule("afterhours")
+    # 19:00 ET Wed — inside afterhours late window (18:00–20:00).
+    t0 = datetime(2026, 11, 11, 19, 0, tzinfo=ET).astimezone(timezone.utc)
+    arm_key = "confirm:afterhours-sudden-10:SPIK"
     spike = Quote(
         symbol="SPIK",
         company="Spike Co",
         price=1.2,
         change_pct=5.0,
         volume=200_000,
-        updated_at=datetime.now(timezone.utc),
+        updated_at=t0,
     )
 
     async def run() -> None:
-        from unittest.mock import patch
-
-        t0 = datetime(2026, 11, 11, 18, 0, tzinfo=timezone.utc)
         state = store.load_state()
+        # Legacy shared Sudden-10 arm must be cleared, not held.
+        state["confirm_armed"]["confirm:Sudden-10:OLD"] = t0.isoformat()
         with patch("monitor.store._now", return_value=t0):
             await engine._emit_sudden_first_alerts(rule, [spike], state)
         assert delivered == ["SPIK"]
         assert ths_calls[-1]["important_symbols"] == []
-        assert "confirm:Sudden-10:SPIK" in state["confirm_armed"]
+        assert arm_key in state["confirm_armed"]
+        assert "confirm:Sudden-10:OLD" not in state["confirm_armed"]
         assert "Sudden-10:SPIK" not in state.get("last_fired", {})
 
         # Second spike while armed: no duplicate first alert.
@@ -341,18 +347,15 @@ def test_sudden_first_alerts_skip_important_hold_adds(tmp_path):
         with patch("monitor.store._now", return_value=t0 + timedelta(minutes=1)):
             await engine._emit_sudden_hold_alerts(rule, state)
         assert delivered == ["SPIK"]
+        assert arm_key in state["confirm_armed"]
 
-        armed = datetime.fromisoformat(state["confirm_armed"]["confirm:Sudden-10:SPIK"])
-        state["confirm_armed"]["confirm:Sudden-10:SPIK"] = (
-            armed - timedelta(minutes=10)
-        ).isoformat()
         held = Quote(
             symbol="SPIK",
             company="Spike Co",
             price=1.3,
             change_pct=12.0,
             volume=200_000,
-            updated_at=datetime.now(timezone.utc),
+            updated_at=t0 + timedelta(minutes=11),
         )
         engine._sudden_session_quotes = AsyncMock(return_value={"SPIK": held})  # type: ignore[method-assign]
         with patch("monitor.store._now", return_value=t0 + timedelta(minutes=11)):
@@ -360,6 +363,16 @@ def test_sudden_first_alerts_skip_important_hold_adds(tmp_path):
         assert delivered == ["SPIK", "SPIK"]
         assert ths_calls[-1]["important_symbols"] == ["SPIK"]
         assert "Sudden-10:SPIK" in state["last_fired"]
+        # Hold is one-shot — arm cleared so it cannot re-fire on reopen.
+        assert arm_key not in state["confirm_armed"]
+
+        # Regular rule must not consume afterhours arms (keys are rule-scoped).
+        reg = _sudden_rule("regular")
+        state["confirm_armed"][arm_key] = t0.isoformat()
+        with patch("monitor.store._now", return_value=t0 + timedelta(minutes=20)):
+            await engine._emit_sudden_hold_alerts(reg, state)
+        assert delivered == ["SPIK", "SPIK"]
+        assert arm_key in state["confirm_armed"]
 
     asyncio.run(run())
 

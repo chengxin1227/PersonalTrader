@@ -54,6 +54,7 @@ from monitor.rules import (
 )
 from monitor.session import (
     AFTERHOURS_START,
+    ET,
     PREMARKET_START,
     REGULAR_START,
     CHECK_REMINDER_NOTIFY,
@@ -84,6 +85,7 @@ from monitor.session import (
 from monitor.slack import SlackClient
 from monitor.quote_link import quote_url
 from monitor.repeat_alerts import with_repeat_history
+from monitor import store as store_mod
 from monitor.store import Store
 from monitor.stream import AlpacaStream, StreamEvent
 from monitor.tonghuashun import TonghuashunClient
@@ -219,6 +221,17 @@ def _is_peak_top_board(rule: Rule) -> bool:
     return (
         _is_leaderboard_rule(rule)
         and not _is_touched_leaderboard(rule)
+        and not _is_day_spike_rule(rule)
+        and rule.condition.min_fade_from_high is None
+    )
+
+
+def _is_day_pool_board(rule: Rule) -> bool:
+    """Half-hour board: prior-day gain pool ranked by current session gain."""
+    return (
+        _is_leaderboard_rule(rule)
+        and _is_day_spike_rule(rule)
+        and not _is_touched_leaderboard(rule)
         and rule.condition.min_fade_from_high is None
     )
 
@@ -263,6 +276,11 @@ def _is_day_spike_rule(rule: Rule) -> bool:
         rule.condition.min_recent_day_change is not None
         or bool(rule.condition.day_gain_tiers)
     )
+
+
+def _is_day_spike_singles_rule(rule: Rule) -> bool:
+    """day25 / 5d-boost singles — not half-hour boards that also carry day-gain floors."""
+    return _is_day_spike_rule(rule) and not _is_leaderboard_rule(rule)
 
 
 def _day_gain_floors(rule: Rule) -> list[float]:
@@ -691,7 +709,7 @@ class MonitorEngine:
             day_spike_rules = [
                 rule
                 for rule in open_rules
-                if _is_day_spike_rule(rule) and not _is_breaker_rule(rule)
+                if _is_day_spike_singles_rule(rule) and not _is_breaker_rule(rule)
             ]
             if day_spike_rules and not self._day_spike_loop_running:
                 for rule in day_spike_rules:
@@ -755,7 +773,10 @@ class MonitorEngine:
                 for rule in config.rules:
                     if (
                         rule.enabled
-                        and _is_peak_top_board(rule)
+                        and (
+                            _is_peak_top_board(rule)
+                            or _is_day_pool_board(rule)
+                        )
                         and rule.condition.type is ConditionType.PREMARKET_GAIN
                     ):
                         await self._maybe_send_leaderboard(rule, state)
@@ -947,7 +968,7 @@ class MonitorEngine:
                     if rule.enabled
                     and self._rule_session_open(rule)
                     and (
-                        (_is_day_spike_rule(rule) and not _is_breaker_rule(rule))
+                        (_is_day_spike_singles_rule(rule) and not _is_breaker_rule(rule))
                         or (
                             _is_halt_or_day_rule(rule)
                             and rule.condition.type is ConditionType.PREMARKET_GAIN
@@ -1002,7 +1023,9 @@ class MonitorEngine:
                     rule for rule in config.rules if rule.enabled and _is_stable_rule(rule)
                 ]
                 day_gain_rules = [
-                    rule for rule in config.rules if rule.enabled and _is_day_spike_rule(rule)
+                    rule
+                    for rule in config.rules
+                    if rule.enabled and _is_day_spike_singles_rule(rule)
                 ]
                 closing_rules = [
                     rule
@@ -1169,7 +1192,7 @@ class MonitorEngine:
                                 matched = await self._match_symbol_close(rule)
                             elif _is_breaker_rule(rule) and not _is_day_spike_rule(rule):
                                 matched = await self._match_breaker_close(rule)
-                            elif _is_day_spike_rule(rule) and not _is_breaker_rule(rule):
+                            elif _is_day_spike_singles_rule(rule) and not _is_breaker_rule(rule):
                                 matched = await self._match_day_gain_close(rule)
                             else:
                                 continue
@@ -2840,13 +2863,27 @@ class MonitorEngine:
                 await self._emit_sudden_hold_alerts(rule, state)
                 self.store.save_state(state)
 
+    @staticmethod
+    def _sudden_confirm_key(rule: Rule, symbol: str) -> str:
+        """Arm key scoped to rule id so 盘前/盘中/盘后 sudden do not share holds."""
+        return f"confirm:{rule.id}:{symbol.strip().upper()}"
+
+    def _clear_legacy_sudden_confirm(self, state: dict, rule: Rule) -> None:
+        """Drop old shared confirm:Sudden-10:* arms that caused cross-session hold floods."""
+        notify = (rule.notify or rule.id).strip() or rule.id
+        legacy = f"confirm:{notify}:"
+        armed = state.get("confirm_armed", {})
+        for key in list(armed):
+            if key.startswith(legacy):
+                armed.pop(key, None)
+
     async def _emit_sudden_first_alerts(
         self, rule: Rule, quotes: list[Quote], state: dict
     ) -> None:
         """First 1-minute spike: alert + rule group, arm confirm, skip 我的自选/cooldown."""
-        notify = (rule.notify or rule.id).strip() or rule.id
+        self._clear_legacy_sudden_confirm(state, rule)
         for quote in quotes:
-            arm_key = f"confirm:{notify}:{quote.symbol.upper()}"
+            arm_key = self._sudden_confirm_key(rule, quote.symbol)
             if self.store.confirm_armed_at(state, arm_key) is not None:
                 continue
             cooldown_key = _alert_cooldown_key(rule, quote.symbol)
@@ -2876,32 +2913,47 @@ class MonitorEngine:
         client = self._trend_moomoo or self.moomoo
         if client is None:
             return
-        notify = (rule.notify or rule.id).strip() or rule.id
-        prefix = f"confirm:{notify}:"
-        now = datetime.now(timezone.utc)
+        self._clear_legacy_sudden_confirm(state, rule)
+        prefix = f"confirm:{rule.id}:"
+        hours = rule.condition.late_session_hours or 2
+        session = rule.condition.late_session or "regular"
+        now = store_mod._now()
+        today = now_et(now).date()
         ready: list[str] = []
-        for key in list(state.get("confirm_armed", {})):
+        armed = state.setdefault("confirm_armed", {})
+        for key in list(armed):
             if not key.startswith(prefix):
                 continue
             armed_at = self.store.confirm_armed_at(state, key)
             if armed_at is None:
+                armed.pop(key, None)
+                continue
+            # Only holds armed today during this session's late window.
+            if armed_at.tzinfo is None:
+                armed_at = armed_at.replace(tzinfo=timezone.utc)
+            if now_et(armed_at).date() != today or not session_late_window(
+                session, moment=armed_at, hours=hours
+            ):
+                armed.pop(key, None)
                 continue
             if (now - armed_at).total_seconds() < rule.confirm_delay_minutes * 60:
                 continue
             ready.append(key[len(prefix) :])
         if not ready:
             return
-        session = rule.condition.late_session or "regular"
         quotes = await self._sudden_session_quotes(client, ready, session)
         if not quotes:
             return
         floor = rule.confirm_value
         min_price = rule.condition.min_price
         for symbol in ready:
+            arm_key = self._sudden_confirm_key(rule, symbol)
             quote = quotes.get(symbol)
             if quote is None or quote.change_pct is None:
                 continue
             if quote.change_pct < floor:
+                # Spike faded before hold — allow a later spike to re-arm.
+                armed.pop(arm_key, None)
                 continue
             if min_price is not None and (quote.price is None or quote.price <= min_price):
                 continue
@@ -2913,6 +2965,8 @@ class MonitorEngine:
                 cooldown_key=_alert_cooldown_key(rule, symbol),
                 skip_confirm=True,
             )
+            # Hold is one-shot for this arm.
+            armed.pop(arm_key, None)
 
     async def _match_sudden_rule(self, rule: Rule) -> list[Quote]:
         """Watch discovered names; alert on ~1-minute spikes (no session-gain floor)."""
@@ -3473,6 +3527,7 @@ class MonitorEngine:
         min_volume = _board_min_volume(rule, slot)
         peak_board = _is_peak_top_board(rule)
         fade_board = _is_peak_fade_board(rule)
+        day_pool_board = _is_day_pool_board(rule)
         kind = rule.condition.type
         try:
             if _is_touched_leaderboard(rule):
@@ -3480,6 +3535,8 @@ class MonitorEngine:
                     leaders = await self._touched_regular_fade_leaders(rule, min_volume)
                 else:
                     leaders = await self._touched_afterhours_leaders(rule, min_volume)
+            elif day_pool_board:
+                leaders = await self._day_pool_session_leaders(rule, min_volume)
             elif kind is ConditionType.AFTERHOURS_GAIN:
                 leaders = await self._top_afterhours_by_peak(rule, min_volume)
             elif kind is ConditionType.PREMARKET_GAIN:
@@ -3496,7 +3553,11 @@ class MonitorEngine:
             return
         self._board_retry_at = None
         self._note_opend_ok()
-        need = 1 if _is_touched_leaderboard(rule) else (rule.condition.top_n or 1)
+        need = (
+            1
+            if _is_touched_leaderboard(rule) or day_pool_board
+            else (rule.condition.top_n or 1)
+        )
         if len(leaders) < need:
             logger.info(
                 "Leaderboard %s %s has %s priced names, waiting",
@@ -3564,8 +3625,54 @@ class MonitorEngine:
                 pin_symbols=pin,
             )
         else:
-            # Plain *-top5 boards replace the group with current leaders only.
+            # Plain *-top5 / 5d50 boards replace the group with current leaders only.
             self._add_to_tonghuashun(rule, leaders, board=True, pin_symbols=pin)
+
+    def _day_pool_symbols(self, rule: Rule) -> list[str]:
+        """Prior-day gain pool for day-pool boards (no halt / intraday-touch mix-in)."""
+        floors = _day_gain_floors(rule)
+        if not floors:
+            return []
+        afterhours = rule.condition.type is ConditionType.AFTERHOURS_GAIN
+        days = recent_trading_days(
+            now_et().date(),
+            rule.condition.recent_day_count,
+            include_end=afterhours,
+        )
+        symbols: set[str] = set()
+        for minimum in floors:
+            symbols.update(self.store.day_gain_symbols(minimum, days))
+        return sorted(symbols)
+
+    async def _day_pool_session_leaders(
+        self, rule: Rule, min_volume: float | None
+    ) -> list[Quote]:
+        """Rank day-gain pool by current session change, highest first."""
+        client = self._trend_moomoo or self.moomoo
+        if client is None:
+            return []
+        symbols = self._day_pool_symbols(rule)
+        if not symbols:
+            return []
+        kind = rule.condition.type
+        if kind is ConditionType.AFTERHOURS_GAIN:
+            marks = await self._saved_afterhours_quotes(client, symbols)
+        elif kind is ConditionType.PREMARKET_GAIN:
+            marks = await self._saved_premarket_quotes(client, symbols)
+        elif kind is ConditionType.REGULAR_GAIN:
+            marks = await self._moomoo_snapshots(client, symbols)
+        else:
+            return []
+        if not marks:
+            return []
+        volume = int(min_volume) if min_volume is not None else None
+        # Day-gain pool with live session % above the rule floor (default >0%).
+        return afterhours_leaders(
+            list(marks.values()),
+            rule.condition.top_n or 50,
+            volume,
+            min_change=rule.condition.value,
+        )
 
     def _halt_or_day_pool_symbols(self, rule: Rule) -> list[str]:
         """Symbols that hit halt or the regular touch / day-gain threshold."""
@@ -4398,7 +4505,9 @@ class MonitorEngine:
         self.ths.set_important_group(important.ths_group)
         want_important = _wants_important_watchlist(important, rule, board=board)
         replace_board = board and (
-            _is_peak_top_board(rule) or _is_pool_gain_board(rule)
+            _is_peak_top_board(rule)
+            or _is_pool_gain_board(rule)
+            or _is_day_pool_board(rule)
         )
         if replace_board:
             # Plain *-top5 groups keep only the current leaders.

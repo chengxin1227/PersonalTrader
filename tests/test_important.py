@@ -74,15 +74,35 @@ def test_rules_yaml_loads_important_block():
     assert fade.board_notify is False
     assert fade.notify is None
     assert fade.condition.top_n == 50
-    assert fade.condition.board_interval_minutes == 5
+    assert fade.condition.board_interval_minutes == 1
     assert fade.condition.min_regular_touch == 50
     assert fade.condition.include_circuit_breaker is True
     assert fade.condition.min_fade_from_high == 0
 
+    board5d = [
+        rule
+        for rule in config.rules
+        if rule.id
+        in {"afterhours-5d50-board", "regular-5d50-board", "premarket-5d50-board"}
+    ]
+    assert len(board5d) == 3
+    assert {rule.name for rule in board5d} == {"5日曾涨超50%的股票"}
+    assert all(rule.board_notify is False for rule in board5d)
+    assert all(rule.notify is None for rule in board5d)
+    assert all(rule.condition.top_n == 50 for rule in board5d)
+    assert all(rule.condition.min_recent_day_change == 50 for rule in board5d)
+    assert all(rule.condition.recent_day_count == 5 for rule in board5d)
+    assert all(rule.condition.board_interval_minutes == 1 for rule in board5d)
+    assert all(rule.condition.intraday_touch is False for rule in board5d)
+    assert all(rule.condition.min_volume == 10000 for rule in board5d)
+    assert all(rule.condition.min_market_cap == 1_000_000 for rule in board5d)
+    assert all(rule.condition.max_market_cap == 1_000_000_000 for rule in board5d)
+
     day25 = [rule for rule in config.rules if rule.id.endswith("-day25-10")]
     assert len(day25) == 3
-    assert {rule.name for rule in day25} == {"盘中曾涨超25%后续涨超10%的股票"}
+    assert {rule.name for rule in day25} == {"盘中收盘涨超25%后续涨超10%的股票"}
     assert {rule.notify for rule in day25} == {"Day-25-boost"}
+    assert all(rule.condition.intraday_touch is False for rule in day25)
     assert all(rule.cooldown_minutes == 240 for rule in day25)
     assert all(rule.confirm_delay_minutes == 10 for rule in day25)
     assert all(rule.confirm_value == 0 for rule in day25)

@@ -26,6 +26,9 @@ def test_shared_rule_group_names_from_live_rules():
     assert "后半段1分钟涨超10%的股票" in shared
     assert "盘中收盘涨超25%后续涨超10%的股票" in shared
     assert "5日曾涨超50%的股票" in shared
+    # Retired singles: 我的自选 only — not shared rule groups.
+    assert "5日曾涨超50%后续超5%或曾涨超100%后续超0%的股票" not in shared
+    assert "盘中熔断或涨超50%后续涨超5%的股票" not in shared
     assert "盘后涨幅最高前5的股票" not in shared
 
 

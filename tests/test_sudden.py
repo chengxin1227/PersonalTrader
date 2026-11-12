@@ -257,7 +257,7 @@ def test_sudden_match_without_prior_session_floor():
     asyncio.run(run())
 
 
-def test_sudden_first_alerts_skip_important_hold_adds(tmp_path):
+def test_sudden_first_and_hold_both_add_important(tmp_path):
     from datetime import datetime, timedelta, timezone
     from unittest.mock import patch
     from zoneinfo import ZoneInfo
@@ -329,7 +329,7 @@ def test_sudden_first_alerts_skip_important_hold_adds(tmp_path):
         with patch("monitor.store._now", return_value=t0):
             await engine._emit_sudden_first_alerts(rule, [spike], state)
         assert delivered == ["SPIK"]
-        assert ths_calls[-1]["important_symbols"] == []
+        assert ths_calls[-1]["important_symbols"] == ["SPIK"]
         assert arm_key in state["confirm_armed"]
         assert "confirm:Sudden-10:OLD" not in state["confirm_armed"]
         assert "Sudden-10:SPIK" not in state.get("last_fired", {})

@@ -315,11 +315,22 @@ def _sorts_ths_by_peak_fade(rule: Rule) -> bool:
         return True
     if _is_pool_gain_board(rule):
         return False
-    return _is_halt_or_day_rule(rule) or (
+    # halt-or-day50 singles skip a dedicated rule group (我的自选 only).
+    if _is_halt_or_day_rule(rule):
+        return False
+    return (
         _is_touched_leaderboard(rule)
         and rule.condition.min_regular_touch is not None
         and rule.condition.include_circuit_breaker
     )
+
+
+def _skips_ths_rule_group(rule: Rule) -> bool:
+    """Singles that alert into 我的自选 only — no dedicated Tonghuashun rule group."""
+    if _is_leaderboard_rule(rule):
+        return False
+    # halt-or-day50 / 5d-boost
+    return _is_halt_or_day_rule(rule) or bool(rule.condition.day_gain_tiers)
 
 
 def peak_fade_score(peak: float | None, close: float | None) -> float:
@@ -392,6 +403,8 @@ def _shared_rule_group_names(config: RulesConfig) -> list[str]:
     for rule in config.rules:
         if not rule.enabled or not rule.name:
             continue
+        if _skips_ths_rule_group(rule):
+            continue
         session = (rule.group or rule.condition_session or "").strip()
         if session not in {"盘前", "盘中", "盘后"}:
             continue
@@ -423,20 +436,19 @@ def _wants_important_watchlist(
     board: bool = False,
     moment: datetime | None = None,
 ) -> bool:
-    """Whether this alert's symbols should also land in 我的自选."""
+    """Whether this alert's symbols should also land in 我的自选.
+
+    All single-ticket alerts go to 我的自选. Half-hour boards only if listed in
+    ``watchlist.board`` (usually empty).
+    """
+    del moment  # kept for call-site compatibility
     watch = important.watchlist
     if board:
         return rule.id in watch.board
-    if rule.id in watch.always or rule.id in watch.event:
-        return True
-    if rule.id in watch.afterhours_open:
-        return afterhours_open_window(moment, minutes=watch.afterhours_open_minutes)
-    late_ids = {*watch.session_late, *watch.afterhours_late}
-    if rule.id in late_ids:
-        hours = watch.session_late_hours or watch.afterhours_late_hours
-        session = rule.group or rule.condition_session
-        return session_late_window(session, moment, hours=hours)
-    return False
+    # Digests use board=True; never treat a top_n rule as a single.
+    if rule.condition.top_n is not None:
+        return False
+    return True
 
 
 def _is_high_priority(
@@ -1957,7 +1969,6 @@ class MonitorEngine:
     ) -> None:
         async with self._ths_lock:
             try:
-                await self.ths.add_daily([symbol], session)
                 await self.ths.add_important([symbol], session)
                 await self._arrange_important_by_afterhours()
             except Exception as exc:  # noqa: BLE001
@@ -2891,7 +2902,7 @@ class MonitorEngine:
                 continue
             self.store.note_confirm_arm(state, arm_key)
             logger.info(
-                "Rule %s first spike for %s — alert + group, no 我的自选 yet",
+                "Rule %s first spike for %s — alert + group + 我的自选",
                 rule.id,
                 quote.symbol,
             )
@@ -2902,7 +2913,6 @@ class MonitorEngine:
                 extra=None,
                 cooldown_key=cooldown_key,
                 apply_cooldown=False,
-                skip_important=True,
                 skip_confirm=True,
             )
 
@@ -4404,7 +4414,7 @@ class MonitorEngine:
         return None
 
     async def _maybe_sync_tonghuashun_groups(self, config: RulesConfig) -> None:
-        """Create groups once; clear each session's rule/盘x groups on that session's next day.
+        """Create groups once; clear each session's rule groups on that session's next day.
 
         Shared rule groups and 我的自选 clear the previous session's names when the next
         session starts.
@@ -4416,7 +4426,10 @@ class MonitorEngine:
         names = [
             rule.name
             for rule in config.rules
-            if rule.enabled and rule.name and not _is_symbol_close_rule(rule)
+            if rule.enabled
+            and rule.name
+            and not _is_symbol_close_rule(rule)
+            and not _skips_ths_rule_group(rule)
         ]
         session = self._ths_active_session()
         need_structure = not self._ths_groups_synced
@@ -4441,6 +4454,7 @@ class MonitorEngine:
                         if rule.enabled
                         and rule.name
                         and (rule.group or rule.condition_session) == session
+                        and not _skips_ths_rule_group(rule)
                     ]
                     shared_names = _shared_rule_group_names(config)
                     cleared = await self.ths.clear_session_day(
@@ -4504,6 +4518,25 @@ class MonitorEngine:
         important = self.load_config().important
         self.ths.set_important_group(important.ths_group)
         want_important = _wants_important_watchlist(important, rule, board=board)
+        if not board and _skips_ths_rule_group(rule):
+            # halt-or-day50 / 5d-boost: alerted names → 我的自选 only.
+            target = [
+                symbol.strip().upper()
+                for symbol in (important_symbols if important_symbols is not None else pin)
+                if symbol and str(symbol).strip()
+            ]
+            if not (want_important and target):
+                return
+            async with self._ths_lock:
+                try:
+                    await self.ths.add_important(target, session)
+                    await self._arrange_important_by_afterhours()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("同花顺 update failed for 我的自选 (%s): %s", rule.id, exc)
+                    await self._note_problem(
+                        f"Tonghuashun add failed for {', '.join(dict.fromkeys(target))}: {exc}"
+                    )
+            return
         replace_board = board and (
             _is_peak_top_board(rule)
             or _is_pool_gain_board(rule)

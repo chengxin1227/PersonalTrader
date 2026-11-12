@@ -866,3 +866,60 @@ def test_peak_fade_board_is_not_a_single_fade_rule():
     assert _is_peak_fade_board(rule)
     assert not _is_peak_fade_rule(rule)
     assert _sorts_ths_by_peak_fade(rule)
+
+
+def test_halt_or_day_singles_skip_ths_rule_group():
+    from monitor.engine import (
+        _is_halt_or_day_rule,
+        _skips_ths_rule_group,
+        _sorts_ths_by_peak_fade,
+    )
+    from monitor.models import DayGainTier
+
+    rule = Rule(
+        id="regular-halt-or-day50",
+        name="盘中熔断或涨超50%后续涨超5%的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.REGULAR_GAIN,
+            value=5,
+            min_regular_touch=50,
+            include_circuit_breaker=True,
+            require_circuit_breaker=True,
+            min_recent_day_change=50,
+            recent_day_count=1,
+            intraday_touch=True,
+        ),
+    )
+    assert _is_halt_or_day_rule(rule)
+    assert _skips_ths_rule_group(rule)
+    assert not _sorts_ths_by_peak_fade(rule)
+
+    boost = Rule(
+        id="regular-5d-boost",
+        name="5日曾涨超50%后续超5%或曾涨超100%后续超0%的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.REGULAR_GAIN,
+            value=0,
+            day_gain_tiers=[
+                DayGainTier(min_recent_day_change=50, value=5),
+                DayGainTier(min_recent_day_change=100, value=0),
+            ],
+            recent_day_count=5,
+        ),
+    )
+    assert _skips_ths_rule_group(boost)
+    board = Rule(
+        id="afterhours-5d50-board",
+        name="5日曾涨超50%的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.AFTERHOURS_GAIN,
+            value=0,
+            top_n=50,
+            min_recent_day_change=50,
+            recent_day_count=5,
+        ),
+    )
+    assert not _skips_ths_rule_group(board)

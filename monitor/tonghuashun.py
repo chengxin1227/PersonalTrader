@@ -25,8 +25,8 @@ _LOGIN_AGENT = "同花顺/7.0.10 CFNetwork/1333.0.4 Darwin/21.5.0".encode("utf-8
 _API_AGENT = "hevo"
 _GROUP_AGENT = "Hexin_Gphone/11.28.03 (Royal Flush) okhttp/3.14.9"
 _SESSION_SECONDS = 12 * 60 * 60
-# Custom groups (not the default 自选股 list).
-# Alerted names land in the matching session group; important subset also in 我的自选.
+# Session keys still tag 我的自选 membership for per-session clear.
+# 盘前/盘中/盘后分组 are no longer written; singles go to 我的自选 only.
 _SESSION_WATCHLIST_GROUP = {
     "盘前": "盘前分组",
     "盘中": "盘中分组",
@@ -586,15 +586,25 @@ class TonghuashunClient:
         self._save_group_days()
         self._clear_rule_group_tags(name)
 
-    def _group(self, http: httpx.Client, name: str) -> tuple[str, list[tuple[str, str]]]:
-        """Group id and its (code, market) rows, newest first. Creates the group if needed."""
-        version, groups = self._groups(http)
+    def _find_group(
+        self, http: httpx.Client, name: str
+    ) -> tuple[str, list[tuple[str, str]]] | None:
+        """Group id and rows if the custom group already exists; otherwise None."""
+        _version, groups = self._groups(http)
         found = next(
             (g for g in groups if g.get("name") == name and str(g.get("id", "")).startswith("0_")),
             None,
         )
-        if found is not None:
-            return str(found["id"]), parse_selfstock(str(found.get("content") or ""))
+        if found is None:
+            return None
+        return str(found["id"]), parse_selfstock(str(found.get("content") or ""))
+
+    def _group(self, http: httpx.Client, name: str) -> tuple[str, list[tuple[str, str]]]:
+        """Group id and its (code, market) rows, newest first. Creates the group if needed."""
+        existing = self._find_group(http, name)
+        if existing is not None:
+            return existing
+        version, _groups = self._groups(http)
         created = self._group_call(
             http,
             "POST",
@@ -625,9 +635,8 @@ class TonghuashunClient:
         )
 
     def _sync_groups_sync(self, keep_names: list[str]) -> dict[str, list[str]]:
-        """Ensure rule groups + 盘前/盘中/盘后分组 + 我的自选 exist. Never delete user-created groups."""
+        """Ensure rule groups + 我的自选 exist. Never delete user-created groups."""
         keep = {
-            *_SESSION_WATCHLIST_GROUPS,
             self._important_group,
             *(name.strip() for name in keep_names if name.strip()),
         }
@@ -686,49 +695,20 @@ class TonghuashunClient:
             for code, market in rows:
                 known.setdefault(code.upper(), market)
             if replace:
+                # Peak top-N boards stay in the rule group only; skip 我的自选.
                 members = []
                 for symbol in symbols:
                     if not symbol or symbol in members:
                         continue
                     self._market(http, symbol)
                     members.append(symbol)
-            else:
-                members = [code.upper() for code, _ in rows]
-                for symbol in symbols:
-                    if symbol not in members:
-                        self._market(http, symbol)
-                        members.append(symbol)
-            session_key = session if session in _SESSION_WATCHLIST_GROUP else "盘中"
-            watch_name = _session_watchlist_group(session_key)
-            pin = (
-                [symbol.strip().upper() for symbol in bump_symbols if symbol.strip()]
-                if bump_symbols is not None
-                else list(symbols)
-            )
-            pin_set = {symbol for symbol in pin if symbol}
-            if replace:
-                # Peak top-N boards stay in the rule group only; skip 盘x分组 / 我的自选.
                 return members
-            if pin_set:
-                self._ensure_summary_group(
-                    http,
-                    watch_name,
-                    [symbol for symbol in pin if symbol in pin_set],
-                    session_key,
-                    important=False,
-                    bump=True,
-                )
-            # Pool refreshes may add many names; keep them in 盘x分组 without reordering.
-            others = [symbol for symbol in symbols if symbol and symbol not in pin_set]
-            if others:
-                self._ensure_summary_group(
-                    http,
-                    watch_name,
-                    others,
-                    session_key,
-                    important=False,
-                    bump=False,
-                )
+            members = [code.upper() for code, _ in rows]
+            for symbol in symbols:
+                if symbol not in members:
+                    self._market(http, symbol)
+                    members.append(symbol)
+            # Singles no longer mirror into 盘前/盘中/盘后分组.
             return members
 
         return self._with_session(work)
@@ -780,8 +760,19 @@ class TonghuashunClient:
         """Remove rule-group names tagged for ``session`` (previous period on shared groups)."""
 
         def work(http: httpx.Client) -> list[str]:
-            group_id, rows = self._group(http, group_name)
+            found = self._find_group(http, group_name)
             group_tags = self._rule_group_tags().setdefault(group_name, {})
+            if found is None:
+                # Do not recreate retired groups (e.g. halt-or-day50 / 5d-boost).
+                stale = [symbol for symbol, tagged in list(group_tags.items()) if tagged == session]
+                for symbol in stale:
+                    del group_tags[symbol]
+                if not group_tags:
+                    self._rule_group_tags().pop(group_name, None)
+                if stale:
+                    self._save_rule_group_tags()
+                return []
+            group_id, rows = found
             if not rows:
                 stale = [symbol for symbol, tagged in list(group_tags.items()) if tagged == session]
                 for symbol in stale:
@@ -891,11 +882,11 @@ class TonghuashunClient:
         return await asyncio.to_thread(self._clear_day_sync, names, day)
 
     async def add_daily(self, symbols: list[str], session: str) -> None:
-        """Keep names in 盘前/盘中/盘后分组 without touching a rule group."""
-        await asyncio.to_thread(self._add_summary_sync, symbols, session, important=False)
+        """Deprecated: 盘x分组 are unused; route to 我的自选 instead."""
+        await self.add_important(symbols, session)
 
     async def add_important(self, symbols: list[str], session: str) -> None:
-        """Also keep names in the important summary group (我的自选)."""
+        """Keep names in the important summary group (我的自选)."""
         await asyncio.to_thread(self._add_summary_sync, symbols, session, important=True)
 
     def _replace_summary_sync(
@@ -963,7 +954,7 @@ class TonghuashunClient:
         rule_names: list[str],
         shared_rule_names: list[str] | None = None,
     ) -> list[str]:
-        """Clear this session's rule groups + 盘x分组 for the new ET day.
+        """Clear this session's rule groups for the new ET day.
 
         Shared rule groups: drop the previous session's symbols when this session starts.
         我的自选: clear the previous session's names when this session starts, and drop
@@ -971,12 +962,9 @@ class TonghuashunClient:
         """
         session_key = session.strip()
         names = [name.strip() for name in rule_names if name.strip()]
-        watch_name = None
-        if session_key in _SESSION_WATCHLIST_GROUP:
-            watch_name = _session_watchlist_group(session_key)
-            names.append(watch_name)
         cleared = self._clear_day_sync(names, day)
-        if watch_name and watch_name in cleared:
+        # Drop leftover 盘x分组 tags if any remain from older builds.
+        if session_key in _SESSION_WATCHLIST_GROUP:
             self._clear_session_watchlist_tags(session_key)
         prev = previous_watchlist_session(session_key)
         shared = [

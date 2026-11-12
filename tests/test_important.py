@@ -15,7 +15,7 @@ from monitor.models import (
     ConditionType,
 )
 from monitor.rules import load_rules
-from monitor.session import due_check_reminders, session_late_window
+from monitor.session import due_check_reminders
 
 ET = ZoneInfo("America/New_York")
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,27 +30,12 @@ def test_rules_yaml_loads_important_block():
         "afterhours-2h30",
         "afterhours-3h",
     }
-    assert set(config.important.watchlist.always) == {
-        "afterhours-day25-10",
-        "premarket-day25-10",
-        "regular-day25-10",
-        "afterhours-halt-or-day50",
-        "premarket-halt-or-day50",
-        "regular-halt-or-day50",
-        "afterhours-5d-boost",
-        "premarket-5d-boost",
-        "regular-5d-boost",
-    }
+    # All singles → 我的自选; lists below are unused gates (kept empty).
+    assert config.important.watchlist.always == []
     assert config.important.watchlist.event == []
     assert config.important.watchlist.afterhours_open == []
-    # Top5 boards stay in the rule group only; 盘后分组 / 我的自选 are for single names.
     assert config.important.watchlist.board == []
-    assert set(config.important.watchlist.session_late) == {
-        "afterhours-sudden-10",
-        "regular-sudden-10",
-        "premarket-sudden-10",
-    }
-    assert config.important.watchlist.session_late_hours == 2
+    assert config.important.watchlist.session_late == []
     assert config.important.watchlist.reminder_sync == []
     assert config.important.watched_symbols.symbols == []
     keys = [item.key for item in config.important.reminders]
@@ -153,18 +138,10 @@ def test_wants_important_watchlist_gates():
     config = ImportantConfig(
         high_priority_rule_ids=["afterhours-sudden-10"],
         watchlist=ImportantWatchlistConfig(
-            board=["afterhours-top5", "regular-top5", "premarket-top5"],
-            session_late_hours=2,
-            session_late=[
-                "afterhours-sudden-10",
-                "regular-sudden-10",
-                "premarket-sudden-10",
-            ],
+            board=["afterhours-top5"],
         ),
     )
     sudden_ah = _sudden("afterhours", "afterhours-sudden-10")
-    sudden_reg = _sudden("regular", "regular-sudden-10")
-    sudden_pre = _sudden("premarket", "premarket-sudden-10")
     five = Rule(
         id="afterhours-5d-boost",
         name="f",
@@ -181,46 +158,20 @@ def test_wants_important_watchlist_gates():
         symbol="*",
         condition=Condition(type=ConditionType.AFTERHOURS_GAIN, value=0, top_n=5),
     )
-    ah50 = Rule(
-        id="afterhours-ah50",
-        name="a",
+    other_board = Rule(
+        id="afterhours-other-board",
+        name="o",
         description="d",
         group="盘后",
         symbol="*",
-        condition=Condition(
-            type=ConditionType.AFTERHOURS_GAIN, value=50, min_fade_from_high=20
-        ),
+        condition=Condition(type=ConditionType.AFTERHOURS_GAIN, value=0, top_n=5),
     )
-    assert session_late_window("afterhours", datetime(2026, 10, 15, 18, 0, tzinfo=ET), hours=2)
-    assert not session_late_window("afterhours", datetime(2026, 10, 15, 17, 0, tzinfo=ET), hours=2)
-    assert session_late_window("regular", datetime(2026, 10, 15, 14, 0, tzinfo=ET), hours=2)
-    assert not session_late_window("regular", datetime(2026, 10, 15, 13, 59, tzinfo=ET), hours=2)
-    assert session_late_window("premarket", datetime(2026, 10, 15, 7, 30, tzinfo=ET), hours=2)
-    assert not session_late_window("premarket", datetime(2026, 10, 15, 7, 29, tzinfo=ET), hours=2)
-
-    assert not _wants_important_watchlist(
-        config, sudden_ah, board=False, moment=datetime(2026, 10, 15, 17, 0, tzinfo=ET)
-    )
-    assert _wants_important_watchlist(
-        config, sudden_ah, board=False, moment=datetime(2026, 10, 15, 18, 0, tzinfo=ET)
-    )
-    assert _wants_important_watchlist(
-        config, sudden_reg, board=False, moment=datetime(2026, 10, 15, 14, 0, tzinfo=ET)
-    )
-    assert not _wants_important_watchlist(
-        config, sudden_reg, board=False, moment=datetime(2026, 10, 15, 13, 0, tzinfo=ET)
-    )
-    assert _wants_important_watchlist(
-        config, sudden_pre, board=False, moment=datetime(2026, 10, 15, 8, 0, tzinfo=ET)
-    )
-    assert not _wants_important_watchlist(
-        config, sudden_pre, board=False, moment=datetime(2026, 10, 15, 6, 0, tzinfo=ET)
-    )
-    assert not _wants_important_watchlist(config, ah50, board=False)
-    assert not _wants_important_watchlist(config, five, board=False)
+    # All singles → 我的自选; boards only if listed.
+    assert _wants_important_watchlist(config, sudden_ah, board=False)
+    assert _wants_important_watchlist(config, five, board=False)
     assert not _wants_important_watchlist(config, top5, board=False)
     assert _wants_important_watchlist(config, top5, board=True)
-    assert not _wants_important_watchlist(config, ah50, board=True)
+    assert not _wants_important_watchlist(config, other_board, board=True)
     assert _is_high_priority(config, sudden_ah)
 
 

@@ -139,6 +139,7 @@ rules:
         type: sudden_gain
         value: 10
         pool_min_change: 0
+        pool_max_change: 20
         sudden_window_seconds: 60
         late_session: afterhours
         min_price: 0.1
@@ -217,6 +218,7 @@ rules:
         type: sudden_gain
         value: 10
         pool_min_change: 0
+        pool_max_change: 20
         sudden_window_seconds: 60
         late_session: regular
         min_price: 0.1
@@ -276,6 +278,7 @@ rules:
         type: sudden_gain
         value: 10
         pool_min_change: 0
+        pool_max_change: 20
         sudden_window_seconds: 60
         late_session: premarket
         min_price: 0.1

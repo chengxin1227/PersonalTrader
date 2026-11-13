@@ -36,6 +36,7 @@ def test_live_rules_include_sudden_gain_for_each_session():
     for rule in sudden:
         assert rule.condition.value == 10
         assert rule.condition.pool_min_change == 0
+        assert rule.condition.pool_max_change == 20
         assert rule.condition.sudden_window_seconds == 60
         assert rule.condition.late_session_hours == 2
         assert rule.condition.min_volume is None
@@ -61,6 +62,7 @@ def _sudden_rule(session: str) -> Rule:
             type=ConditionType.SUDDEN_GAIN,
             value=10,
             pool_min_change=0,
+            pool_max_change=20,
             sudden_window_seconds=60,
             late_session=session,
             late_session_hours=2,
@@ -91,7 +93,8 @@ def test_sudden_discover_uses_afterhours_rank(caplog):
         return_value=[
             (Quote(symbol="DKI", price=2.0, change_pct=35.0, volume=200_000), None),
             (Quote(symbol="THIN", price=2.0, change_pct=20.0, volume=1_000), None),
-            (Quote(symbol="CHEAP", price=0.05, change_pct=40.0, volume=200_000), None),
+            (Quote(symbol="EARLY", price=2.0, change_pct=5.0, volume=50_000), None),
+            (Quote(symbol="CHEAP", price=0.05, change_pct=15.0, volume=200_000), None),
         ]
     )
     client.smallcap_page = AsyncMock()
@@ -105,9 +108,31 @@ def test_sudden_discover_uses_afterhours_rank(caplog):
         0, 1_000_000_000, min_market_cap=1_000_000
     )
     client.smallcap_page.assert_not_called()
-    # No volume floor: low-volume THIN is kept; CHEAP still fails min_price.
-    assert engine._sudden_pool["afterhours-sudden-10"] == {"DKI", "THIN"}
-    assert any("pool +2 DKI, THIN" in record.message for record in caplog.records)
+    # 0%–20% band: DKI +35% skipped; CHEAP fails min_price; THIN/EARLY kept.
+    assert engine._sudden_pool["afterhours-sudden-10"] == {"THIN", "EARLY"}
+    assert any("pool +2" in record.message for record in caplog.records)
+
+
+def test_sudden_discover_drops_names_that_leave_early_band():
+    engine = _engine()
+    rule = _sudden_rule("afterhours")
+    engine._sudden_pool[rule.id] = {"EARLY"}
+    engine._sudden_session[f"{rule.id}:EARLY"] = 12.0
+    engine._sudden_prices[rule.id] = {"EARLY": [(1.0, 1.0)]}
+    client = AsyncMock()
+    client.scan_afterhours = AsyncMock(
+        return_value=[
+            (Quote(symbol="EARLY", price=2.0, change_pct=25.0, volume=50_000), None),
+            (Quote(symbol="NEW", price=2.0, change_pct=8.0, volume=50_000), None),
+        ]
+    )
+
+    async def run() -> None:
+        await engine._discover_sudden_pool(rule, client, "afterhours")
+
+    asyncio.run(run())
+    assert engine._sudden_pool[rule.id] == {"NEW"}
+    assert f"{rule.id}:EARLY" not in engine._sudden_session
 
 
 def test_sudden_discover_uses_premarket_rank():
@@ -154,7 +179,7 @@ def test_sudden_discover_seeds_price_samples():
     engine = _engine()
     client = AsyncMock()
     client.scan_afterhours = AsyncMock(
-        return_value=[(Quote(symbol="CRIS", price=0.95, change_pct=40.0, volume=200_000), None)]
+        return_value=[(Quote(symbol="CRIS", price=0.95, change_pct=15.0, volume=200_000), None)]
     )
 
     async def run() -> None:

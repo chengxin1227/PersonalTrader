@@ -3082,7 +3082,7 @@ class MonitorEngine:
     async def _discover_sudden_pool(
         self, rule: Rule, client: MoomooClient, session: str
     ) -> None:
-        """Seed watch pool via session gain screens (pool_min_change is discover-only)."""
+        """Seed watch pool via session gain screens (pool min/max are discover-only)."""
         now = datetime.now(timezone.utc).timestamp()
         last = self._sudden_discovered_at.get(rule.id)
         # Stock-filter API: max 10 / 30s shared with newhigh / halt screens.
@@ -3094,24 +3094,29 @@ class MonitorEngine:
         max_cap = rule.condition.max_market_cap or 1_000_000_000
         min_volume = rule.condition.min_volume
         min_price = rule.condition.min_price
-        pool_floor = (
+        pool_min = (
             rule.condition.pool_min_change
             if rule.condition.pool_min_change is not None
             else 0.0
         )
+        pool_max = rule.condition.pool_max_change
         if last is None:
+            if pool_max is None:
+                band = f">= {pool_min:g}%"
+            else:
+                band = f"{pool_min:g}%..{pool_max:g}%"
             logger.info(
-                "Sudden %s discover via %s rank/screen, session gain > %g%%, cap <= %.0f",
+                "Sudden %s discover via %s rank/screen, session gain %s, cap <= %.0f",
                 rule.id,
                 session,
-                pool_floor,
+                band,
                 max_cap,
             )
         try:
             found = await self._sudden_session_gainers(
                 client,
                 session,
-                pool_floor,
+                pool_min,
                 max_cap,
                 min_volume,
                 min_price,
@@ -3132,7 +3137,11 @@ class MonitorEngine:
         )
         added: list[str] = []
         for quote in found:
-            if quote.change_pct is None or quote.change_pct <= pool_floor:
+            if quote.change_pct is None or quote.change_pct < pool_min:
+                continue
+            if pool_max is not None and quote.change_pct > pool_max:
+                # Still record gain so leave-band can drop prior early-move watches.
+                self._sudden_session[f"{rule.id}:{quote.symbol}"] = quote.change_pct
                 continue
             if min_volume is not None and (quote.volume is None or quote.volume <= min_volume):
                 continue
@@ -3148,6 +3157,24 @@ class MonitorEngine:
                 samples.append((now, quote.price))
                 prices[quote.symbol] = trim_price_samples(
                     samples, now=now, keep_seconds=keep_samples
+                )
+        # Drop names that left the early-move band (already extended).
+        if pool_max is not None:
+            left_band = [
+                symbol
+                for symbol in list(pool)
+                if self._sudden_session.get(f"{rule.id}:{symbol}", pool_min) > pool_max
+            ]
+            for symbol in left_band:
+                pool.discard(symbol)
+                prices.pop(symbol, None)
+                self._sudden_session.pop(f"{rule.id}:{symbol}", None)
+            if left_band:
+                logger.info(
+                    "Sudden %s pool leave-band %s (now %s)",
+                    rule.id,
+                    _symbols_text(sorted(left_band)),
+                    len(pool),
                 )
         if len(pool) > 200:
             ranked = sorted(

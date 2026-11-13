@@ -62,7 +62,9 @@ class Condition(BaseModel):
     late_session_hours: int = Field(default=1, ge=1)
     late_session: str = "regular"
     sudden_window_seconds: int = Field(default=60, ge=15)
+    # Sudden discover band: session gain in [pool_min_change, pool_max_change].
     pool_min_change: Optional[float] = None
+    pool_max_change: Optional[float] = None
     min_price: Optional[float] = None
     close_minutes: int = Field(default=5, ge=1)
     # When true with regular_close + a concrete symbol: match if abs(change) > value.

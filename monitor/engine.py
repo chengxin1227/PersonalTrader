@@ -45,6 +45,7 @@ from monitor.rules import (
     fade_leaderboard_line,
     leaderboard_line,
     load_rules,
+    halt_or_5d_trigger_label,
     matched_day_gain_tier,
     peak_leaderboard_line,
     price_age_seconds_ago,
@@ -329,7 +330,6 @@ def _sorts_ths_by_peak_fade(rule: Rule) -> bool:
         return True
     if _is_pool_gain_board(rule):
         return False
-    # halt-or-day50 singles skip a dedicated rule group (我的自选 only).
     if _is_halt_or_day_rule(rule):
         return False
     return (
@@ -343,10 +343,7 @@ def _skips_ths_rule_group(rule: Rule) -> bool:
     """Singles that alert into 我的自选 only — no dedicated Tonghuashun rule group."""
     if _is_leaderboard_rule(rule):
         return False
-    if rule.skip_ths_group:
-        return True
-    # halt-or-day50 / 5d-boost
-    return _is_halt_or_day_rule(rule) or bool(rule.condition.day_gain_tiers)
+    return bool(rule.skip_ths_group)
 
 
 def peak_fade_score(peak: float | None, close: float | None) -> float:
@@ -452,9 +449,9 @@ def _wants_important_watchlist(
     board: bool = False,
     moment: datetime | None = None,
 ) -> bool:
-    """Whether this alert's symbols should also land in 我的自选.
+    """Whether this alert's symbols should land in 今日自选.
 
-    All single-ticket alerts go to 我的自选. Half-hour boards only if listed in
+    All single-ticket alerts go to 今日自选. Half-hour boards only if listed in
     ``watchlist.board`` (usually empty).
     """
     del moment  # kept for call-site compatibility
@@ -465,6 +462,18 @@ def _wants_important_watchlist(
     if rule.condition.top_n is not None:
         return False
     return True
+
+
+def _wants_late_watchlist(
+    *,
+    session: str | None = None,
+    moment: datetime | None = None,
+) -> bool:
+    """True during the second half of 盘前 / 盘中 / 盘后 (for 我的自选)."""
+    key = (session or et_session_name(moment) or "").strip()
+    if not key:
+        return False
+    return session_late_window(key, moment=moment)
 
 
 def _is_high_priority(
@@ -1377,99 +1386,117 @@ class MonitorEngine:
         day = now_et().date().isoformat()
         seen: set[tuple[float, float | None, float | None]] = set()
         for rule in rules:
-            minimum = rule.condition.min_recent_day_change
-            if minimum is None:
-                minimum = rule.condition.min_regular_touch
-            if minimum is None:
-                continue
-            key = (minimum, rule.condition.max_market_cap, rule.condition.min_market_cap)
-            if key in seen:
-                continue
-            seen.add(key)
-            use_touch = any(
-                (
-                    item.condition.intraday_touch
-                    or item.condition.min_regular_touch is not None
-                )
-                and (
-                    (item.condition.min_recent_day_change or item.condition.min_regular_touch)
-                    == minimum
-                )
-                and item.condition.max_market_cap == rule.condition.max_market_cap
-                and item.condition.min_market_cap == rule.condition.min_market_cap
-                for item in rules
-            )
-            found = await client.regular_gainers(
-                minimum,
-                max_market_cap=rule.condition.max_market_cap,
-                min_market_cap=rule.condition.min_market_cap,
-            )
-            touched: list[Quote] = list(found)
-            for quote in found:
-                if quote.change_pct is not None:
-                    self.store.note_peak_gain(day, quote.symbol, quote.change_pct)
-            if use_touch:
-                floor = min(20.0, minimum)
-                if floor < minimum and self._day_high_check_due():
-                    wide = await client.regular_gainers(
-                        floor,
-                        max_market_cap=rule.condition.max_market_cap,
-                        min_market_cap=rule.condition.min_market_cap,
+            floors = _day_gain_floors(rule)
+            if not floors:
+                minimum = rule.condition.min_recent_day_change
+                if minimum is None:
+                    minimum = rule.condition.min_regular_touch
+                if minimum is None:
+                    continue
+                floors = [minimum]
+            for minimum in floors:
+                key = (minimum, rule.condition.max_market_cap, rule.condition.min_market_cap)
+                if key in seen:
+                    continue
+                seen.add(key)
+                use_touch = any(
+                    (
+                        item.condition.intraday_touch
+                        or item.condition.min_regular_touch is not None
                     )
-                    have = {
-                        symbol.upper()
-                        for symbol in self.store.day_gain_symbols(minimum, [day])
-                    }
-                    have.update(quote.symbol.upper() for quote in found)
-                    pending = [
-                        quote
-                        for quote in wide
-                        if quote.symbol.upper() not in have
-                    ]
-                    pending.sort(
-                        key=lambda quote: quote.change_pct or 0.0, reverse=True
-                    )
-                    start = self._day_high_cursor.get(key, 0)
-                    if start >= len(pending):
-                        start = 0
-                    batch = pending[start : start + 20]
-                    self._day_high_cursor[key] = start + len(batch)
-                    snaps = await self._moomoo_snapshots(
-                        client, [quote.symbol for quote in batch]
-                    )
-                    for snap in snaps.values():
-                        peak = regular_touch_change_pct(
-                            change_pct=snap.change_pct,
-                            high=snap.daily_high,
-                            prev_close=snap.prev_close,
-                            pre_high=snap.premarket_high,
+                    and (
+                        minimum in _day_gain_floors(item)
+                        or (
+                            item.condition.min_recent_day_change
+                            or item.condition.min_regular_touch
                         )
-                        if peak is None:
+                        == minimum
+                    )
+                    and item.condition.max_market_cap == rule.condition.max_market_cap
+                    and item.condition.min_market_cap == rule.condition.min_market_cap
+                    for item in rules
+                )
+                found = await client.regular_gainers(
+                    minimum,
+                    max_market_cap=rule.condition.max_market_cap,
+                    min_market_cap=rule.condition.min_market_cap,
+                )
+                touched: list[Quote] = list(found)
+                for quote in found:
+                    if quote.change_pct is not None:
+                        self.store.note_peak_gain(day, quote.symbol, quote.change_pct)
+                if use_touch:
+                    floor = min(20.0, minimum)
+                    if floor < minimum and self._day_high_check_due():
+                        wide = await client.regular_gainers(
+                            floor,
+                            max_market_cap=rule.condition.max_market_cap,
+                            min_market_cap=rule.condition.min_market_cap,
+                        )
+                        have = {
+                            symbol.upper()
+                            for symbol in self.store.day_gain_symbols(minimum, [day])
+                        }
+                        have.update(quote.symbol.upper() for quote in found)
+                        pending = [
+                            quote
+                            for quote in wide
+                            if quote.symbol.upper() not in have
+                        ]
+                        pending.sort(
+                            key=lambda quote: quote.change_pct or 0.0, reverse=True
+                        )
+                        start = self._day_high_cursor.get(key, 0)
+                        if start >= len(pending):
+                            start = 0
+                        batch = pending[start : start + 20]
+                        self._day_high_cursor[key] = start + len(batch)
+                        snaps = await self._moomoo_snapshots(
+                            client, [quote.symbol for quote in batch]
+                        )
+                        for snap in snaps.values():
+                            peak = regular_touch_change_pct(
+                                change_pct=snap.change_pct,
+                                high=snap.daily_high,
+                                prev_close=snap.prev_close,
+                                pre_high=snap.premarket_high,
+                            )
+                            if peak is None:
+                                continue
+                            self.store.note_peak_gain(day, snap.symbol, peak)
+                            if peak > minimum:
+                                snap.change_pct = peak
+                                touched.append(snap)
+                added = self.store.note_day_gains(
+                    day, minimum, [quote.symbol for quote in touched]
+                )
+                if added:
+                    logger.info(
+                        "Recorded day gain > %.0f%%: %s",
+                        minimum,
+                        _symbols_text(added),
+                    )
+                    by_symbol = {quote.symbol.upper(): quote for quote in touched}
+                    fresh = [by_symbol[symbol] for symbol in added if symbol in by_symbol]
+                    for alert_rule in _rules_for_active_session(rules):
+                        if not _is_halt_or_day_rule(alert_rule):
                             continue
-                        self.store.note_peak_gain(day, snap.symbol, peak)
-                        if peak > minimum:
-                            snap.change_pct = peak
-                            touched.append(snap)
-            added = self.store.note_day_gains(
-                day, minimum, [quote.symbol for quote in touched]
-            )
-            if added:
-                logger.info("Recorded day gain > %.0f%%: %s", minimum, _symbols_text(added))
-                by_symbol = {quote.symbol.upper(): quote for quote in touched}
-                fresh = [by_symbol[symbol] for symbol in added if symbol in by_symbol]
-                for alert_rule in _rules_for_active_session(rules):
-                    if not _is_halt_or_day_rule(alert_rule):
-                        continue
-                    threshold = alert_rule.condition.min_recent_day_change
-                    if threshold is None:
-                        threshold = alert_rule.condition.min_regular_touch
-                    if threshold != minimum:
-                        continue
-                    if alert_rule.condition.max_market_cap != rule.condition.max_market_cap:
-                        continue
-                    if alert_rule.condition.min_market_cap != rule.condition.min_market_cap:
-                        continue
-                    await self._emit_halt_or_day_pool_entries(alert_rule, fresh)
+                        threshold = alert_rule.condition.min_recent_day_change
+                        if threshold is None:
+                            threshold = alert_rule.condition.min_regular_touch
+                        if threshold != minimum:
+                            continue
+                        if (
+                            alert_rule.condition.max_market_cap
+                            != rule.condition.max_market_cap
+                        ):
+                            continue
+                        if (
+                            alert_rule.condition.min_market_cap
+                            != rule.condition.min_market_cap
+                        ):
+                            continue
+                        await self._emit_halt_or_day_pool_entries(alert_rule, fresh)
 
     async def _emit_halt_or_day_pool_entries(self, rule: Rule, quotes: list[Quote]) -> None:
         """Push once when a name first joins the halt/50% pool (盘前/盘后 only).
@@ -1973,6 +2000,7 @@ class MonitorEngine:
             logger.info("ALERT important-watched | %s", alert.message.replace("\n", " | "))
             if self.ths.configured:
                 self.ths.set_important_group(config.important.ths_group)
+                self.ths.set_late_group(config.important.late_ths_group)
                 task = asyncio.create_task(
                     self._watched_symbol_tonghuashun(symbol, session, config)
                 )
@@ -1985,6 +2013,8 @@ class MonitorEngine:
         async with self._ths_lock:
             try:
                 await self.ths.add_important([symbol], session)
+                if _wants_late_watchlist(session=session):
+                    await self.ths.add_late_watchlist([symbol], session)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 watched symbol failed for %s: %s", symbol, exc)
 
@@ -2779,7 +2809,7 @@ class MonitorEngine:
     async def _run_late_rules(self, rules: list[Rule]) -> None:
         for rule in rules:
             phase = last_hour_phase(
-                hours=rule.condition.late_session_hours,
+                hours=int(rule.condition.late_session_hours or 1),
                 session=rule.condition.late_session,
             )
             if phase is None:
@@ -2876,8 +2906,10 @@ class MonitorEngine:
 
     async def _run_sudden_rules(self, rules: list[Rule]) -> None:
         for rule in rules:
-            hours = rule.condition.late_session_hours or 2
-            if not session_late_window(rule.condition.late_session, hours=hours):
+            if not session_late_window(
+                rule.condition.late_session,
+                hours=rule.condition.late_session_hours,
+            ):
                 continue
             matched = await self._match_sudden_rule(rule)
             self._note_opend_ok()
@@ -2939,7 +2971,6 @@ class MonitorEngine:
             return
         self._clear_legacy_sudden_confirm(state, rule)
         prefix = f"confirm:{rule.id}:"
-        hours = rule.condition.late_session_hours or 2
         session = rule.condition.late_session or "regular"
         now = store_mod._now()
         today = now_et(now).date()
@@ -2956,7 +2987,9 @@ class MonitorEngine:
             if armed_at.tzinfo is None:
                 armed_at = armed_at.replace(tzinfo=timezone.utc)
             if now_et(armed_at).date() != today or not session_late_window(
-                session, moment=armed_at, hours=hours
+                session,
+                moment=armed_at,
+                hours=rule.condition.late_session_hours,
             ):
                 armed.pop(key, None)
                 continue
@@ -3459,6 +3492,8 @@ class MonitorEngine:
             symbols.update(self.store.session_symbols(day, "upward_halt"))
         for minimum in floors:
             symbols.update(self.store.day_gain_symbols(minimum, days))
+            # Today's intraday touch uses the same session thresholds as past-day floors.
+            symbols.update(self.store.day_gain_symbols(minimum, [today]))
         label = {
             ConditionType.AFTERHOURS_GAIN: "Halt-or-day after-hours",
             ConditionType.PREMARKET_GAIN: "Halt-or-day pre-market",
@@ -3488,13 +3523,15 @@ class MonitorEngine:
                 self.store.spike_seen_at(day, "upward_halt", symbol) is not None
                 for day in days
             ) or (self.store.spike_seen_at(today, "upward_halt", symbol) is not None)
-            quote.recent_day_spike = any(
-                self.store.saw_day_gain(symbol, minimum, days) for minimum in floors
-            )
-            if quote.recent_day_spike:
-                quote.recent_day_gain_floors = [
-                    minimum for minimum in floors if self.store.saw_day_gain(symbol, minimum, days)
-                ]
+            hit_floors = [
+                minimum
+                for minimum in floors
+                if self.store.saw_day_gain(symbol, minimum, days)
+                or self.store.saw_day_gain(symbol, minimum, [today])
+            ]
+            quote.recent_day_spike = bool(hit_floors)
+            if hit_floors:
+                quote.recent_day_gain_floors = hit_floors
             if afterhours:
                 evaluation = evaluate_afterhours_scan(
                     scan_rule,
@@ -3759,6 +3796,29 @@ class MonitorEngine:
         self, rule: Rule, min_volume: float | None
     ) -> list[Quote]:
         """Top N by current AH gain among names that once hit the touch thresholds."""
+        # halt-or-5d-boost style board: same match as singles, then rank by AH gain.
+        if (
+            rule.condition.require_circuit_breaker
+            and (
+                bool(rule.condition.day_gain_tiers)
+                or rule.condition.min_recent_day_change is not None
+            )
+            and rule.condition.min_fade_from_high is None
+        ):
+            board_rule = rule
+            if min_volume != rule.condition.min_volume:
+                board_rule = rule.model_copy(deep=True)
+                board_rule.condition.min_volume = (
+                    None if min_volume is None else float(min_volume)
+                )
+            matched = await self._match_halt_or_day(board_rule)
+            matched.sort(
+                key=lambda quote: quote.change_pct
+                if quote.change_pct is not None
+                else float("-inf"),
+                reverse=True,
+            )
+            return matched[: rule.condition.top_n or 5]
         if rule.condition.min_afterhours_touch is not None:
             await self._record_afterhours_touches([rule])
         day = now_et().date().isoformat()
@@ -4249,6 +4309,19 @@ class MonitorEngine:
             if snap.premarket_change_pct is not None:
                 quote.premarket_change_pct = snap.premarket_change_pct
 
+    @staticmethod
+    def _confirm_arm_key(rule: Rule, symbol: str) -> str:
+        """Arm key scoped to rule id so 盘前/盘中/盘后 copies do not share holds."""
+        return f"confirm:{rule.id}:{symbol.strip().upper()}"
+
+    def _clear_legacy_confirm_arm(self, state: dict, rule: Rule, symbol: str) -> None:
+        """Drop old shared confirm:{notify}:{symbol} arms that caused cross-session fires."""
+        notify = (rule.notify or rule.id).strip() or rule.id
+        legacy = f"confirm:{notify}:{symbol.strip().upper()}"
+        armed = state.get("confirm_armed", {})
+        if legacy in armed and legacy != self._confirm_arm_key(rule, symbol):
+            armed.pop(legacy, None)
+
     def _blocked_by_confirm_delay(
         self, rule: Rule, quote: Quote, state: dict, cooldown_key: str
     ) -> bool:
@@ -4257,10 +4330,15 @@ class MonitorEngine:
             return False
         if ":pool:" in cooldown_key:
             return False
-        notify = (rule.notify or rule.id).strip() or rule.id
-        arm_key = f"confirm:{notify}:{quote.symbol.upper()}"
+        symbol = quote.symbol.upper()
+        self._clear_legacy_confirm_arm(state, rule, symbol)
+        arm_key = self._confirm_arm_key(rule, symbol)
         now = datetime.now(timezone.utc)
         armed_at = self.store.confirm_armed_at(state, arm_key)
+        # Stale arm from a prior ET day must not fire at the next session open.
+        if armed_at is not None and now_et(armed_at).date() != now_et(now).date():
+            state.get("confirm_armed", {}).pop(arm_key, None)
+            armed_at = None
         change = quote.change_pct
         sudden = rule.condition.type is ConditionType.SUDDEN_GAIN
         if armed_at is None:
@@ -4268,7 +4346,16 @@ class MonitorEngine:
                 # 1-minute spike already matched; arm regardless of session gain.
                 arm_floor = rule.condition.value
             elif rule.condition.day_gain_tiers:
-                if matched_day_gain_tier(rule, quote) is None:
+                tier = matched_day_gain_tier(rule, quote)
+                has_breaker = (
+                    rule.condition.require_circuit_breaker
+                    and quote.session_circuit_breaker is True
+                )
+                if tier is None and not has_breaker:
+                    return True
+                if tier is None and (
+                    change is None or change <= rule.condition.value
+                ):
                     return True
                 arm_floor = rule.condition.value
             else:
@@ -4293,10 +4380,28 @@ class MonitorEngine:
                 rule.confirm_delay_minutes,
             )
             return True
-        if sudden and rule.confirm_value is not None:
+        if rule.confirm_value is not None:
             if change is None or change < rule.confirm_value:
                 return True
         return False
+
+    def _halt_or_5d_trigger_label(self, rule: Rule, quote: Quote) -> str | None:
+        """Which OR-leg fired for *-halt-or-5d-boost (Pushover title + reason)."""
+        if not rule.id.endswith("-halt-or-5d-boost"):
+            return None
+        today = now_et().date().isoformat()
+        floors = _day_gain_floors(rule)
+        symbol = quote.symbol.upper()
+        today_floors = {
+            minimum
+            for minimum in floors
+            if self.store.saw_day_gain(symbol, minimum, [today])
+        }
+        return halt_or_5d_trigger_label(
+            rule,
+            quote,
+            today_floors=today_floors,
+        )
 
     async def _fire_alert(
         self,
@@ -4384,13 +4489,25 @@ class MonitorEngine:
                     )
             return None
         await self._fill_prior_session(rule, quote)
+        trigger = self._halt_or_5d_trigger_label(rule, quote)
         # Persist the trigger move for later history; show prior-session on the live top line.
-        stored_message = render_message(rule, quote, extra, headline="trigger")
-        display_message = render_message(rule, quote, extra, headline="prior")
+        if trigger:
+            # Title + body headline = which OR-leg fired; stock line stays under it.
+            stock_stored = render_message(
+                rule, quote, extra, headline="trigger", reason=""
+            )
+            stock_display = render_message(
+                rule, quote, extra, headline="prior", reason=""
+            )
+            stored_message = f"{trigger}\n{stock_stored}"
+            display_message = f"{trigger}\n{stock_display}"
+        else:
+            stored_message = render_message(rule, quote, extra, headline="trigger")
+            display_message = render_message(rule, quote, extra, headline="prior")
         alert = self.store.new_alert(
             rule_id=rule.id,
             rule_name=rule.summary,
-            label=rule.name,
+            label=trigger or rule.name,
             notify=rule.notify,
             symbol=quote.symbol,
             message=stored_message,
@@ -4459,12 +4576,13 @@ class MonitorEngine:
     async def _maybe_sync_tonghuashun_groups(self, config: RulesConfig) -> None:
         """Create groups once; clear each session's rule groups on that session's next day.
 
-        Shared rule groups and 我的自选 clear the previous session's names when the next
-        session starts.
+        Shared rule groups and 今日自选/我的自选 clear the previous session's names when
+        the next session starts.
         """
         if not self.ths.configured:
             return
         self.ths.set_important_group(config.important.ths_group)
+        self.ths.set_late_group(config.important.late_ths_group)
         day = now_et().date().isoformat()
         names = [
             rule.name
@@ -4497,6 +4615,7 @@ class MonitorEngine:
                         if rule.enabled
                         and rule.name
                         and (rule.group or rule.condition_session) == session
+                        and not _is_symbol_close_rule(rule)
                         and not _skips_ths_rule_group(rule)
                     ]
                     shared_names = _shared_rule_group_names(config)
@@ -4560,9 +4679,11 @@ class MonitorEngine:
         )
         important = self.load_config().important
         self.ths.set_important_group(important.ths_group)
+        self.ths.set_late_group(important.late_ths_group)
         want_important = _wants_important_watchlist(important, rule, board=board)
+        want_late = want_important and _wants_late_watchlist(session=session)
         if not board and _skips_ths_rule_group(rule):
-            # halt-or-day50 / 5d-boost: alerted names → 我的自选 only.
+            # skip_ths_group: alerted names → 今日自选 (+ 我的自选 in late half).
             target = [
                 symbol.strip().upper()
                 for symbol in (important_symbols if important_symbols is not None else pin)
@@ -4573,8 +4694,15 @@ class MonitorEngine:
             async with self._ths_lock:
                 try:
                     await self.ths.add_important(target, session)
+                    if want_late:
+                        await self.ths.add_late_watchlist(target, session)
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("同花顺 update failed for 我的自选 (%s): %s", rule.id, exc)
+                    logger.warning(
+                        "同花顺 update failed for %s (%s): %s",
+                        important.ths_group,
+                        rule.id,
+                        exc,
+                    )
                     await self._note_problem(
                         f"Tonghuashun add failed for {', '.join(dict.fromkeys(target))}: {exc}"
                     )
@@ -4684,6 +4812,8 @@ class MonitorEngine:
                     ]
                     if target:
                         await self.ths.add_important(target, session)
+                        if want_late:
+                            await self.ths.add_late_watchlist(target, session)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 update failed for %s: %s", group, exc)
                 failed = [

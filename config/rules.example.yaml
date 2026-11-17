@@ -128,8 +128,8 @@ rules:
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
     - id: afterhours-sudden-10
-      name: 盘后1分钟涨超10%的股票
-      description: 盘后涨幅已超10%，约1分钟内再涨超10%，总市值超过100万美元且不超过10亿美元，价格高于0.1美元
+      name: 盘后5分钟涨超10%的股票
+      description: 盘后涨幅已超10%，约5分钟内再涨超10%，总市值超过100万美元且不超过10亿美元，价格高于0.1美元
       label: After-hours sudden 10%
       notify: Afterhours-sudden-10
       symbol: "*"
@@ -140,7 +140,7 @@ rules:
         value: 10
         pool_min_change: 0
         pool_max_change: 20
-        sudden_window_seconds: 60
+        sudden_window_seconds: 300
         late_session: afterhours
         min_price: 0.1
         min_market_cap: 1000000
@@ -207,8 +207,8 @@ rules:
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
     - id: regular-sudden-10
-      name: 盘中1分钟涨超10%的股票
-      description: 盘中涨幅已超10%，约1分钟内再涨超10%，总市值超过100万美元且不超过10亿美元，价格高于0.1美元
+      name: 盘中5分钟涨超10%的股票
+      description: 盘中涨幅已超10%，约5分钟内再涨超10%，总市值超过100万美元且不超过10亿美元，价格高于0.1美元
       label: Regular sudden 10%
       notify: Regular-sudden-10
       symbol: "*"
@@ -219,7 +219,7 @@ rules:
         value: 10
         pool_min_change: 0
         pool_max_change: 20
-        sudden_window_seconds: 60
+        sudden_window_seconds: 300
         late_session: regular
         min_price: 0.1
         min_market_cap: 1000000
@@ -267,8 +267,8 @@ rules:
       slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
 
     - id: premarket-sudden-10
-      name: 盘前1分钟涨超10%的股票
-      description: 盘前涨幅已超10%，约1分钟内再涨超10%，总市值超过100万美元且不超过10亿美元，价格高于0.1美元
+      name: 盘前5分钟涨超10%的股票
+      description: 盘前涨幅已超10%，约5分钟内再涨超10%，总市值超过100万美元且不超过10亿美元，价格高于0.1美元
       label: Premarket sudden 10%
       notify: Premarket-sudden-10
       symbol: "*"
@@ -279,7 +279,7 @@ rules:
         value: 10
         pool_min_change: 0
         pool_max_change: 20
-        sudden_window_seconds: 60
+        sudden_window_seconds: 300
         late_session: premarket
         min_price: 0.1
         min_market_cap: 1000000

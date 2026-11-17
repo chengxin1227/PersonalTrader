@@ -94,6 +94,37 @@ def matched_day_gain_tier(rule: Rule, quote: Quote) -> DayGainTier | None:
     return None
 
 
+def halt_or_5d_trigger_label(
+    rule: Rule,
+    quote: Quote,
+    *,
+    today_floors: set[float] | frozenset[float] | None = None,
+) -> str | None:
+    """Chinese Pushover title/reason for which halt-or-5d OR-leg fired."""
+    if not rule.id.endswith("-halt-or-5d-boost"):
+        return None
+    today_hit = {float(item) for item in (today_floors or ())}
+    tier = matched_day_gain_tier(rule, quote)
+    if tier is not None:
+        floor = float(tier.min_recent_day_change)
+        # Prefer today when that floor was recorded today; else past 5 sessions.
+        from_today = floor in today_hit
+        if floor >= 100:
+            return (
+                "今日盘中一度涨超100%后续超5%"
+                if from_today
+                else "过去5日曾收盘涨超100%后续超5%"
+            )
+        return (
+            "今日盘中一度涨超50%后续超10%"
+            if from_today
+            else "过去5日曾收盘涨超50%后续超10%"
+        )
+    if quote.session_circuit_breaker is True:
+        return "涨停后续超5%"
+    return rule.name
+
+
 def load_rules(path: Path) -> RulesConfig:
     if not path.exists():
         raise FileNotFoundError(
@@ -246,15 +277,16 @@ def evaluate_premarket_scan(
     if low_volume is not None:
         return low_volume
     if tiered_day:
-        if matched_tier is None:
-            parts = [
-                f"day>{tier.min_recent_day_change:g}% & PM>{tier.value:g}%"
-                for tier in day_tiers
-            ]
-            return RuleEvaluation(
-                matched=False,
-                reason="no tier matched (" + " or ".join(parts) + ")",
-            )
+        reject = _reject_without_halt_or_day_tier(
+            rule,
+            quote,
+            matched_tier=matched_tier,
+            day_tiers=day_tiers,
+            session_label="PM",
+            session_op=">=",
+        )
+        if reject is not None:
+            return reject
     else:
         pool = _reject_without_halt_or_day(rule, quote)
         if pool is not None:
@@ -310,6 +342,53 @@ def _reject_without_halt_or_day(rule: Rule, quote: Quote) -> RuleEvaluation | No
     return None
 
 
+def _reject_without_halt_or_day_tier(
+    rule: Rule,
+    quote: Quote,
+    *,
+    matched_tier: DayGainTier | None,
+    day_tiers: list[DayGainTier],
+    session_label: str,
+    session_op: str = ">",
+) -> RuleEvaluation | None:
+    """Pool for halt OR day_gain_tiers: tier match, or breaker + session vs rule.value."""
+    wants_breaker = rule.condition.require_circuit_breaker
+    has_breaker = quote.session_circuit_breaker is True
+    if matched_tier is not None:
+        return None
+    if wants_breaker and has_breaker:
+        change = quote.change_pct
+        if change is None:
+            return RuleEvaluation(matched=False, reason=f"no {session_label} change")
+        if session_op == ">=":
+            if change < rule.condition.value:
+                return RuleEvaluation(
+                    matched=False,
+                    reason=(
+                        f"{session_label} {change:.2f}% < {rule.condition.value:.2f}%"
+                    ),
+                )
+        elif change <= rule.condition.value:
+            return RuleEvaluation(
+                matched=False,
+                reason=(
+                    f"{session_label} {change:.2f}% <= {rule.condition.value:.2f}%"
+                ),
+            )
+        return None
+    parts = [
+        f"day>{tier.min_recent_day_change:g}% & {session_label}>{tier.value:g}%"
+        for tier in day_tiers
+    ]
+    tier_text = "no tier matched (" + " or ".join(parts) + ")"
+    if wants_breaker:
+        return RuleEvaluation(
+            matched=False,
+            reason=f"no upward halt and {tier_text}",
+        )
+    return RuleEvaluation(matched=False, reason=tier_text)
+
+
 def evaluate_regular_day_scan(
     rule: Rule,
     quote: Quote,
@@ -336,15 +415,15 @@ def evaluate_regular_day_scan(
     if low_volume is not None:
         return low_volume
     if tiered_day:
-        if matched_tier is None:
-            parts = [
-                f"day>{tier.min_recent_day_change:g}% & RTH>{tier.value:g}%"
-                for tier in day_tiers
-            ]
-            return RuleEvaluation(
-                matched=False,
-                reason="no tier matched (" + " or ".join(parts) + ")",
-            )
+        reject = _reject_without_halt_or_day_tier(
+            rule,
+            quote,
+            matched_tier=matched_tier,
+            day_tiers=day_tiers,
+            session_label="RTH",
+        )
+        if reject is not None:
+            return reject
     else:
         pool = _reject_without_halt_or_day(rule, quote)
         if pool is not None:
@@ -498,44 +577,20 @@ def evaluate_afterhours_scan(
         return RuleEvaluation(matched=False, reason="regular session trend is not up")
     wants_breaker = rule.condition.require_circuit_breaker
     wants_day = day_min is not None or tiered_day
-    has_breaker = quote.session_circuit_breaker is True
-    has_day = matched_tier is not None if tiered_day else quote.recent_day_spike is True
-    if tiered_day and matched_tier is None and not wants_breaker:
-        parts = [
-            f"day>{tier.min_recent_day_change:g}% & AH>{tier.value:g}%"
-            for tier in day_tiers
-        ]
-        return RuleEvaluation(
-            matched=False,
-            reason="no tier matched (" + " or ".join(parts) + ")",
+    if tiered_day:
+        reject = _reject_without_halt_or_day_tier(
+            rule,
+            quote,
+            matched_tier=matched_tier,
+            day_tiers=day_tiers,
+            session_label="AH",
         )
-    if wants_breaker and wants_day:
-        if not has_breaker and not has_day:
-            return RuleEvaluation(
-                matched=False,
-                reason=(
-                    "no regular-session circuit breaker and no day gain "
-                    f"> {day_min:.2f}% in the last {rule.condition.recent_day_count} days"
-                    if day_min is not None
-                    else "no regular-session circuit breaker and no day-gain tier matched"
-                ),
-            )
-    elif wants_breaker and not has_breaker:
-        return RuleEvaluation(matched=False, reason="no regular-session circuit breaker")
-    elif wants_day and not has_day:
-        if tiered_day:
-            parts = [
-                f"day>{tier.min_recent_day_change:g}% & AH>{tier.value:g}%"
-                for tier in day_tiers
-            ]
-            return RuleEvaluation(
-                matched=False,
-                reason="no tier matched (" + " or ".join(parts) + ")",
-            )
-        return RuleEvaluation(
-            matched=False,
-            reason=f"no day gain > {day_min:.2f}% in the last {rule.condition.recent_day_count} days",
-        )
+        if reject is not None:
+            return reject
+    elif wants_breaker or wants_day:
+        pool = _reject_without_halt_or_day(rule, quote)
+        if pool is not None:
+            return pool
     if rule.condition.skip_market_cap or (
         rule.condition.require_circuit_breaker and rule.condition.max_market_cap is None
     ):
@@ -823,6 +878,7 @@ def render_message(
     extra: dict | None = None,
     *,
     headline: str = "prior",
+    reason: str | None = None,
 ) -> str:
     price = quote.price or 0.0
     change = quote.change_pct if quote.change_pct is not None else 0.0
@@ -852,7 +908,7 @@ def render_message(
         body = template.format(**values)
     except (KeyError, ValueError):
         body = f"{rule.name}: {values['symbol']} is ${price:.2f}"
-    reason = rule.summary
-    if reason and reason not in body:
-        return f"{body}\n{reason}"
+    text = rule.summary if reason is None else reason.strip()
+    if text and text not in body:
+        return f"{body}\n{text}"
     return body

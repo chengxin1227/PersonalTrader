@@ -23,12 +23,11 @@ def test_shared_rule_group_names_from_live_rules():
     from monitor.rules import load_rules
 
     shared = set(_shared_rule_group_names(load_rules(ROOT / "config" / "rules.yaml")))
-    assert "后半段1分钟涨超10%的股票" in shared
+    assert "后半段5分钟涨超10%的股票" in shared
     assert "盘中收盘涨超25%后续涨超10%的股票" in shared
-    assert "5日曾涨超50%的股票" in shared
-    # Retired singles: 我的自选 only — not shared rule groups.
-    assert "5日曾涨超50%后续超5%或曾涨超100%后续超0%的股票" not in shared
-    assert "盘中熔断或涨超50%后续涨超5%的股票" not in shared
+    assert "5日曾涨超50%的股票" not in shared
+    assert "熔断或5日涨超50%后续超10%或曾涨超100%后续超5%的股票" in shared
+    # Half-hour digest boards still use their own names, not shared singles list.
     assert "盘后涨幅最高前5的股票" not in shared
 
 
@@ -41,12 +40,12 @@ def test_rule_group_session_tags_round_trip(tmp_path):
     )
     client = TonghuashunClient(settings)
     client._tag_rule_group_symbols(
-        "后半段1分钟涨超10%的股票", ["AAA", "BBB"], "盘前", members=["AAA", "BBB"]
+        "后半段5分钟涨超10%的股票", ["AAA", "BBB"], "盘前", members=["AAA", "BBB"]
     )
     client._tag_rule_group_symbols(
-        "后半段1分钟涨超10%的股票", ["CCC"], "盘中", members=["AAA", "BBB", "CCC"]
+        "后半段5分钟涨超10%的股票", ["CCC"], "盘中", members=["AAA", "BBB", "CCC"]
     )
-    tags = client._rule_group_tags()["后半段1分钟涨超10%的股票"]
+    tags = client._rule_group_tags()["后半段5分钟涨超10%的股票"]
     assert tags == {"AAA": "盘前", "BBB": "盘前", "CCC": "盘中"}
 
     # Simulate clear of previous session tags without HTTP by pruning like the clear path.
@@ -54,7 +53,7 @@ def test_rule_group_session_tags_round_trip(tmp_path):
     for symbol in removed:
         del tags[symbol]
     client._save_rule_group_tags()
-    assert client._rule_group_tags()["后半段1分钟涨超10%的股票"] == {"CCC": "盘中"}
+    assert client._rule_group_tags()["后半段5分钟涨超10%的股票"] == {"CCC": "盘中"}
 
 
 def test_summary_bump_moves_repeats_to_top():

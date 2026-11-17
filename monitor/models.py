@@ -59,7 +59,8 @@ class Condition(BaseModel):
     stable_minutes: Optional[int] = Field(default=None, ge=1)
     stable_low: Optional[float] = None
     stable_high: Optional[float] = None
-    late_session_hours: int = Field(default=1, ge=1)
+    # None → second half of the session; otherwise last N hours before session end.
+    late_session_hours: Optional[float] = Field(default=None, ge=0)
     late_session: str = "regular"
     sudden_window_seconds: int = Field(default=60, ge=15)
     # Sudden discover band: session gain in [pool_min_change, pool_max_change].
@@ -217,7 +218,10 @@ class ImportantReminderConfig(BaseModel):
 
 
 class ImportantConfig(BaseModel):
-    ths_group: str = "我的自选"
+    # All single-ticket alerts land here.
+    ths_group: str = "今日自选"
+    # During each session's second half, singles also land here.
+    late_ths_group: str = "我的自选"
     high_priority_rule_ids: list[str] = Field(default_factory=list)
     watchlist: ImportantWatchlistConfig = Field(default_factory=ImportantWatchlistConfig)
     watched_symbols: ImportantWatchedSymbolsConfig = Field(

@@ -8,6 +8,7 @@ from monitor.rules import (
     evaluate_stable_afterhours,
     evaluate_last_hour_scan,
     evaluate_premarket_scan,
+    evaluate_regular_day_scan,
     hour_change_pct,
     leaderboard_line,
     render_message,
@@ -759,16 +760,16 @@ def test_day_gain_tiers_or_across_50_and_100():
     from monitor.models import DayGainTier
 
     tiers = [
-        DayGainTier(min_recent_day_change=50, value=5),
-        DayGainTier(min_recent_day_change=100, value=0),
+        DayGainTier(min_recent_day_change=50, value=10),
+        DayGainTier(min_recent_day_change=100, value=5),
     ]
     afterhours = Rule(
-        id="afterhours-5d-boost",
+        id="afterhours-halt-or-5d-boost",
         name="merged",
         symbol="*",
         condition=Condition(
             type=ConditionType.AFTERHOURS_GAIN,
-            value=0,
+            value=5,
             max_market_cap=1_000_000_000,
             min_volume=10_000,
             day_gain_tiers=tiers,
@@ -776,12 +777,12 @@ def test_day_gain_tiers_or_across_50_and_100():
         ),
     )
     premarket = Rule(
-        id="premarket-5d-boost",
+        id="premarket-halt-or-5d-boost",
         name="merged",
         symbol="*",
         condition=Condition(
             type=ConditionType.PREMARKET_GAIN,
-            value=0,
+            value=5,
             max_market_cap=1_000_000_000,
             min_volume=10_000,
             day_gain_tiers=tiers,
@@ -789,8 +790,8 @@ def test_day_gain_tiers_or_across_50_and_100():
         ),
     )
     quote = _quote(volume=10_001)
-    # 50% day + session 5.1% → hit
-    quote.change_pct = 5.1
+    # 50% day + session 10.1% → hit
+    quote.change_pct = 10.1
     quote.recent_day_gain_floors = [50.0]
     assert evaluate_afterhours_scan(
         afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
@@ -798,16 +799,16 @@ def test_day_gain_tiers_or_across_50_and_100():
     assert evaluate_premarket_scan(
         premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
     ).matched
-    # 50% day + session 2% → miss
-    quote.change_pct = 2.0
+    # 50% day + session 5.1% → miss (need >10)
+    quote.change_pct = 5.1
     assert not evaluate_afterhours_scan(
         afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
     ).matched
     assert not evaluate_premarket_scan(
         premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
     ).matched
-    # 100% day + session 0.1% → hit
-    quote.change_pct = 0.1
+    # 100% day + session 5.1% → hit
+    quote.change_pct = 5.1
     quote.recent_day_gain_floors = [100.0]
     assert evaluate_afterhours_scan(
         afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
@@ -815,13 +816,90 @@ def test_day_gain_tiers_or_across_50_and_100():
     assert evaluate_premarket_scan(
         premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
     ).matched
-    # 100% day + session 0% → miss
-    quote.change_pct = 0.0
+    # 100% day + session 5% → miss
+    quote.change_pct = 5.0
     assert not evaluate_afterhours_scan(
         afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
     ).matched
     assert not evaluate_premarket_scan(
         premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
+
+
+def test_halt_or_5d_boost_breaker_leg_without_tier():
+    """Merged rule: breaker + session>5% matches even when no day_gain tier."""
+    from monitor.models import DayGainTier
+
+    tiers = [
+        DayGainTier(min_recent_day_change=50, value=10),
+        DayGainTier(min_recent_day_change=100, value=5),
+    ]
+    common = dict(
+        value=5,
+        max_market_cap=1_000_000_000,
+        min_volume=10_000,
+        min_regular_touch=50,
+        include_circuit_breaker=True,
+        require_circuit_breaker=True,
+        day_gain_tiers=tiers,
+        recent_day_count=5,
+        intraday_touch=True,
+    )
+    afterhours = Rule(
+        id="afterhours-halt-or-5d-boost",
+        name="merged",
+        symbol="*",
+        condition=Condition(type=ConditionType.AFTERHOURS_GAIN, **common),
+    )
+    premarket = Rule(
+        id="premarket-halt-or-5d-boost",
+        name="merged",
+        symbol="*",
+        condition=Condition(type=ConditionType.PREMARKET_GAIN, **common),
+    )
+    regular = Rule(
+        id="regular-halt-or-5d-boost",
+        name="merged",
+        symbol="*",
+        condition=Condition(type=ConditionType.REGULAR_GAIN, **common),
+    )
+    quote = _quote(volume=10_001)
+    quote.change_pct = 5.1
+    quote.session_circuit_breaker = True
+    quote.recent_day_gain_floors = []
+    quote.recent_day_spike = False
+    assert evaluate_afterhours_scan(
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
+    assert evaluate_regular_day_scan(
+        regular, quote, market_cap=None, cap_filtered=True
+    ).matched
+    # Breaker but session only 3% → miss
+    quote.change_pct = 3.0
+    assert not evaluate_afterhours_scan(
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert not evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
+    assert not evaluate_regular_day_scan(
+        regular, quote, market_cap=None, cap_filtered=True
+    ).matched
+    # No breaker, only 100% day + session >5% → hit
+    quote.session_circuit_breaker = False
+    quote.change_pct = 5.1
+    quote.recent_day_gain_floors = [100.0]
+    assert evaluate_afterhours_scan(
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
+    assert evaluate_regular_day_scan(
+        regular, quote, market_cap=None, cap_filtered=True
     ).matched
 
 
@@ -868,7 +946,7 @@ def test_peak_fade_board_is_not_a_single_fade_rule():
     assert _sorts_ths_by_peak_fade(rule)
 
 
-def test_halt_or_day_singles_skip_ths_rule_group():
+def test_halt_or_5d_boost_uses_ths_rule_group():
     from monitor.engine import (
         _is_halt_or_day_rule,
         _skips_ths_rule_group,
@@ -877,8 +955,8 @@ def test_halt_or_day_singles_skip_ths_rule_group():
     from monitor.models import DayGainTier
 
     rule = Rule(
-        id="regular-halt-or-day50",
-        name="盘中熔断或涨超50%后续涨超5%的股票",
+        id="regular-halt-or-5d-boost",
+        name="熔断或5日涨超50%后续超10%或曾涨超100%后续超5%的股票",
         symbol="*",
         condition=Condition(
             type=ConditionType.REGULAR_GAIN,
@@ -886,30 +964,17 @@ def test_halt_or_day_singles_skip_ths_rule_group():
             min_regular_touch=50,
             include_circuit_breaker=True,
             require_circuit_breaker=True,
-            min_recent_day_change=50,
-            recent_day_count=1,
+            day_gain_tiers=[
+                DayGainTier(min_recent_day_change=50, value=10),
+                DayGainTier(min_recent_day_change=100, value=5),
+            ],
+            recent_day_count=5,
             intraday_touch=True,
         ),
     )
     assert _is_halt_or_day_rule(rule)
-    assert _skips_ths_rule_group(rule)
+    assert not _skips_ths_rule_group(rule)
     assert not _sorts_ths_by_peak_fade(rule)
-
-    boost = Rule(
-        id="regular-5d-boost",
-        name="5日曾涨超50%后续超5%或曾涨超100%后续超0%的股票",
-        symbol="*",
-        condition=Condition(
-            type=ConditionType.REGULAR_GAIN,
-            value=0,
-            day_gain_tiers=[
-                DayGainTier(min_recent_day_change=50, value=5),
-                DayGainTier(min_recent_day_change=100, value=0),
-            ],
-            recent_day_count=5,
-        ),
-    )
-    assert _skips_ths_rule_group(boost)
     board = Rule(
         id="afterhours-5d50-board",
         name="5日曾涨超50%的股票",
@@ -925,13 +990,13 @@ def test_halt_or_day_singles_skip_ths_rule_group():
     assert not _skips_ths_rule_group(board)
 
 
-def test_session50_singles_skip_ths_rule_group_and_live_yaml():
+def test_session50_singles_use_ths_rule_group_and_live_yaml():
     from pathlib import Path
 
     from monitor.engine import _skips_ths_rule_group
     from monitor.rules import load_rules
 
-    plain = Rule(
+    with_skip = Rule(
         id="afterhours-session50",
         name="盘后涨超50%的股票",
         symbol="*",
@@ -945,15 +1010,7 @@ def test_session50_singles_skip_ths_rule_group_and_live_yaml():
             min_volume=10_000,
         ),
     )
-    assert _skips_ths_rule_group(plain)
-
-    without_flag = Rule(
-        id="afterhours-plain",
-        name="plain",
-        symbol="*",
-        condition=Condition(type=ConditionType.AFTERHOURS_GAIN, value=50),
-    )
-    assert not _skips_ths_rule_group(without_flag)
+    assert _skips_ths_rule_group(with_skip)
 
     root = Path(__file__).resolve().parent.parent
     config = load_rules(root / "config" / "rules.yaml")
@@ -963,9 +1020,9 @@ def test_session50_singles_skip_ths_rule_group_and_live_yaml():
         "premarket-session50",
     }
     for rule in session50:
-        assert rule.skip_ths_group
+        assert not rule.skip_ths_group
         assert rule.once_per_session
         assert rule.notify == "Session-50"
         assert rule.condition.value == 50
         assert rule.condition.min_volume == 10_000
-        assert _skips_ths_rule_group(rule)
+        assert not _skips_ths_rule_group(rule)

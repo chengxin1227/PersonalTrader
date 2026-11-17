@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 from monitor.engine import MonitorEngine, _alert_cooldown_key
-from monitor.models import Condition, ConditionType, Quote, Rule
+from monitor.models import Condition, ConditionType, DayGainTier, Quote, Rule
 from monitor.store import Store
 
 
@@ -85,8 +85,8 @@ def test_same_rule_alerts_only_once_per_session(tmp_path):
 
     rule = _day25(ConditionType.REGULAR_GAIN, "regular-day25-10")
     halt = Rule(
-        id="regular-halt-or-day50",
-        name="盘中熔断或涨超50%后续涨超5%的股票",
+        id="regular-halt-or-5d-boost",
+        name="熔断或5日涨超50%后续超10%或曾涨超100%后续超5%的股票",
         group="盘中",
         symbol="*",
         cooldown_minutes=240,
@@ -98,8 +98,11 @@ def test_same_rule_alerts_only_once_per_session(tmp_path):
             min_regular_touch=50,
             include_circuit_breaker=True,
             require_circuit_breaker=True,
-            min_recent_day_change=50,
-            recent_day_count=1,
+            day_gain_tiers=[
+                DayGainTier(min_recent_day_change=50, value=10),
+                DayGainTier(min_recent_day_change=100, value=5),
+            ],
+            recent_day_count=5,
             intraday_touch=True,
         ),
         notify="Halt-boost",
@@ -159,14 +162,11 @@ def test_live_rules_once_per_session_flags():
     config = load_rules(ROOT / "config" / "rules.yaml")
     ids = {
         "afterhours-day25-10",
-        "afterhours-halt-or-day50",
-        "afterhours-5d-boost",
+        "afterhours-halt-or-5d-boost",
         "regular-day25-10",
-        "regular-halt-or-day50",
-        "regular-5d-boost",
+        "regular-halt-or-5d-boost",
         "premarket-day25-10",
-        "premarket-halt-or-day50",
-        "premarket-5d-boost",
+        "premarket-halt-or-5d-boost",
     }
     for rule in config.rules:
         if rule.id in ids:

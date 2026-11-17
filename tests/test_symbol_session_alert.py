@@ -77,7 +77,7 @@ def test_claim_symbol_coalesce_alert_blocks_other_rules_briefly(tmp_path):
         store.claim_symbol_coalesce_alert(
             state,
             symbol="NFT",
-            rule_id="premarket-halt-or-day50",
+            rule_id="premarket-halt-or-5d-boost",
             now=now + timedelta(seconds=2),
         )
         == "premarket-day25-10"
@@ -97,7 +97,7 @@ def test_claim_symbol_coalesce_alert_blocks_other_rules_briefly(tmp_path):
         store.claim_symbol_coalesce_alert(
             state,
             symbol="NFT",
-            rule_id="premarket-5d-boost",
+            rule_id="premarket-halt-or-5d-boost",
             now=now + timedelta(seconds=6),
         )
         is None
@@ -132,28 +132,18 @@ def test_same_symbol_simultaneous_multi_rule_sends_one_notify(tmp_path):
                 skip_confirm=True,
             )
             second = await engine._fire_alert(
-                _rule("premarket-halt-or-day50", "Halt-boost"),
+                _rule("premarket-halt-or-5d-boost", "Halt-boost"),
                 quote,
                 state,
                 extra=None,
-                cooldown_key="premarket-halt-or-day50:NFT",
-                skip_confirm=True,
-            )
-            third = await engine._fire_alert(
-                _rule("premarket-5d-boost", "5-day-boost"),
-                quote,
-                state,
-                extra=None,
-                cooldown_key="premarket-5d-boost:NFT",
+                cooldown_key="premarket-halt-or-5d-boost:NFT",
                 skip_confirm=True,
             )
             store.save_state(state)
             assert first is not None
             assert second is None
-            assert third is None
             assert delivered == ["premarket-day25-10:NFT"]
-            assert "premarket-halt-or-day50:NFT" in state["last_fired"]
-            assert "premarket-5d-boost:NFT" in state["last_fired"]
+            assert "premarket-halt-or-5d-boost:NFT" in state["last_fired"]
 
         # After the coalesce window, the same rule may notify again.
         with (
@@ -214,16 +204,16 @@ def test_later_separate_rule_still_notifies(tmp_path):
         ):
             assert (
                 await engine._fire_alert(
-                    _rule("premarket-5d-boost", "5-day-boost"),
+                    _rule("premarket-halt-or-5d-boost", "Halt-boost"),
                     quote,
                     state,
                     extra=None,
-                    cooldown_key="premarket-5d-boost:NFT",
+                    cooldown_key="premarket-halt-or-5d-boost:NFT",
                     skip_confirm=True,
                 )
                 is not None
             )
-        assert delivered == ["premarket-day25-10:NFT", "premarket-5d-boost:NFT"]
+        assert delivered == ["premarket-day25-10:NFT", "premarket-halt-or-5d-boost:NFT"]
 
     asyncio.run(run())
 
@@ -248,7 +238,7 @@ def test_pool_entry_does_not_claim_symbol_coalesce(tmp_path):
         ):
             state = store.load_state()
             pool = await engine._fire_alert(
-                _rule("afterhours-halt-or-day50", "Halt-boost"),
+                _rule("afterhours-halt-or-5d-boost", "Halt-boost"),
                 quote,
                 state,
                 extra=None,
@@ -261,7 +251,7 @@ def test_pool_entry_does_not_claim_symbol_coalesce(tmp_path):
             patch("monitor.store._now", return_value=moment + timedelta(seconds=6)),
         ):
             single = await engine._fire_alert(
-                _rule("afterhours-halt-or-day50", "Halt-boost"),
+                _rule("afterhours-halt-or-5d-boost", "Halt-boost"),
                 quote,
                 state,
                 extra=None,
@@ -271,8 +261,8 @@ def test_pool_entry_does_not_claim_symbol_coalesce(tmp_path):
         assert pool is not None
         assert single is not None
         assert delivered == [
-            "afterhours-halt-or-day50:AIOK",
-            "afterhours-halt-or-day50:AIOK",
+            "afterhours-halt-or-5d-boost:AIOK",
+            "afterhours-halt-or-5d-boost:AIOK",
         ]
 
     asyncio.run(run())

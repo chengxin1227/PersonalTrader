@@ -113,7 +113,7 @@ CHECK_REMINDERS = (
     CheckReminder(
         "regular-close-15",
         time(15, 45),
-        ("afterhours-halt-or-day50", "regular-sudden-10"),
+        ("afterhours-halt-or-5d-boost", "regular-sudden-10"),
         "盘中收盘前15分钟",
     ),
     CheckReminder(
@@ -140,11 +140,13 @@ def afterhours_open_window(
 def session_late_window(
     session: str | None,
     moment: datetime | None = None,
-    hours: int = 2,
+    hours: float | None = None,
 ) -> bool:
-    """True during the last ``hours`` of 盘前 / 盘中 / 盘后.
+    """True during the second half of 盘前 / 盘中 / 盘后.
 
-    Premarket → 07:30–09:30, regular → 14:00–16:00, after-hours → 18:00–20:00 (ET, hours=2).
+    Default (hours=None): half the full session —
+    premarket 06:45–09:30, regular 12:45–16:00, after-hours 18:00–20:00 (ET).
+    If ``hours`` is set, use the last that many hours instead.
     """
     current = now_et(moment)
     if current.weekday() >= 5:
@@ -153,26 +155,33 @@ def session_late_window(
     if key in {"premarket", "盘前"}:
         if not is_premarket(current):
             return False
-        end = PREMARKET_END
+        start_bound, end = PREMARKET_START, PREMARKET_END
     elif key in {"regular", "盘中"}:
         if not is_regular_session(current):
             return False
-        end = REGULAR_END
+        start_bound, end = REGULAR_START, REGULAR_END
     elif key in {"afterhours", "盘后"}:
         if not is_afterhours(current):
             return False
-        end = AFTERHOURS_END
+        start_bound, end = AFTERHOURS_START, AFTERHOURS_END
     else:
         return False
-    start = datetime.combine(current.date(), end, tzinfo=current.tzinfo) - timedelta(hours=hours)
-    return current >= start
+    session_end = datetime.combine(current.date(), end, tzinfo=current.tzinfo)
+    if hours is None:
+        session_start = datetime.combine(
+            current.date(), start_bound, tzinfo=current.tzinfo
+        )
+        late_start = session_end - (session_end - session_start) / 2
+    else:
+        late_start = session_end - timedelta(hours=hours)
+    return current >= late_start
 
 
 def afterhours_late_window(
     moment: datetime | None = None,
-    hours: int = 2,
+    hours: float | None = None,
 ) -> bool:
-    """True during the last ``hours`` of after-hours (default 18:00–20:00 ET)."""
+    """True during the second half of after-hours (default 18:00–20:00 ET)."""
     return session_late_window("afterhours", moment, hours=hours)
 
 

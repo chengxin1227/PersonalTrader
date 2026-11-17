@@ -90,6 +90,42 @@ def test_pushover_title_is_the_symbol_and_change():
     assert seen["title"] == "GYGY  +10.0%  $1.50"
 
 
+def test_pushover_halt_or_5d_title_and_body_use_trigger_label():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        parsed = parse_qs(request.content.decode())
+        seen.update({key: values[0] for key, values in parsed.items()})
+        return httpx.Response(200, json={"status": 1})
+
+    async def run() -> None:
+        client = PushoverClient(
+            _settings(), httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        )
+        trigger = "今日盘中一度涨超50%后续超10%"
+        alert = Alert(
+            id="1",
+            rule_id="afterhours-halt-or-5d-boost",
+            rule_name="熔断或5日",
+            label=trigger,
+            symbol="AIOK",
+            message=f"{trigger}\nAutozi    +12.3%    $1.20",
+            price=1.2,
+            change_pct=12.3,
+            fired_at=datetime.now(timezone.utc),
+        )
+        alert.url = "amihexin://"
+        await client.send_alert(alert)
+        await client.close()
+
+    asyncio.run(run())
+    assert seen["title"] == "今日盘中一度涨超50%后续超10%"
+    assert "今日盘中一度涨超50%后续超10%" in seen["message"]
+    assert seen["message"].index("今日盘中一度涨超50%后续超10%") < seen["message"].index("Autozi")
+    assert "Autozi" in seen["message"]
+    assert "AIOK  +12.3%" not in seen["title"]
+
+
 def test_pushover_title_adds_repeat_count_from_the_second_ping():
     seen: dict[str, str] = {}
 

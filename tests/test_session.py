@@ -75,7 +75,7 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
     assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 15, 44, tzinfo=ET))] == []
     close = due_check_reminders(datetime(2026, 10, 15, 15, 45, tzinfo=ET))
     assert [item.key for item in close] == ["regular-close-15"]
-    assert close[0].rule_ids == ("afterhours-halt-or-day50", "regular-sudden-10")
+    assert close[0].rule_ids == ("afterhours-halt-or-5d-boost", "regular-sudden-10")
     assert due_check_reminders(datetime(2026, 10, 15, 15, 47, 59, tzinfo=ET))
     assert due_check_reminders(datetime(2026, 10, 15, 15, 48, tzinfo=ET)) == []
 
@@ -87,19 +87,19 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
         CheckReminder(
             "afterhours-2h30",
             time(18, 30),
-            ("afterhours-top5", "afterhours-halt-or-day50"),
+            ("afterhours-top5", "afterhours-halt-or-5d-boost"),
             "盘后2.5小时",
         ),
         CheckReminder(
             "afterhours-3h",
             time(19, 0),
-            ("afterhours-top5", "afterhours-halt-or-day50"),
+            ("afterhours-top5", "afterhours-halt-or-5d-boost"),
             "盘后3小时",
         ),
     ]
     mid = due_check_reminders(datetime(2026, 10, 15, 18, 30, tzinfo=ET), extra=extra)
     assert [item.key for item in mid] == ["afterhours-2h30"]
-    assert mid[0].rule_ids == ("afterhours-top5", "afterhours-halt-or-day50")
+    assert mid[0].rule_ids == ("afterhours-top5", "afterhours-halt-or-5d-boost")
     assert [
         item.key for item in due_check_reminders(datetime(2026, 10, 15, 19, 0, tzinfo=ET), extra=extra)
     ] == ["afterhours-3h"]
@@ -168,20 +168,26 @@ def test_last_hour_records_before_the_close_and_alerts_from_15():
     assert last_hour_phase(datetime(2026, 10, 7, 20, 0, tzinfo=ET), hours=2, session="afterhours") is None
 
 
-def test_afterhours_late_window_is_last_two_hours():
-    assert not afterhours_late_window(datetime(2026, 10, 15, 17, 59, tzinfo=ET), hours=2)
-    assert afterhours_late_window(datetime(2026, 10, 15, 18, 0, tzinfo=ET), hours=2)
-    assert afterhours_late_window(datetime(2026, 10, 15, 19, 59, tzinfo=ET), hours=2)
-    assert not afterhours_late_window(datetime(2026, 10, 15, 20, 0, tzinfo=ET), hours=2)
-    assert not afterhours_late_window(datetime(2026, 10, 17, 18, 0, tzinfo=ET), hours=2)
+def test_afterhours_late_window_is_second_half():
+    # After-hours 16:00–20:00 → second half 18:00–20:00.
+    assert not afterhours_late_window(datetime(2026, 10, 15, 17, 59, tzinfo=ET))
+    assert afterhours_late_window(datetime(2026, 10, 15, 18, 0, tzinfo=ET))
+    assert afterhours_late_window(datetime(2026, 10, 15, 19, 59, tzinfo=ET))
+    assert not afterhours_late_window(datetime(2026, 10, 15, 20, 0, tzinfo=ET))
+    assert not afterhours_late_window(datetime(2026, 10, 17, 18, 0, tzinfo=ET))
 
 
-def test_session_late_window_covers_premarket_and_regular():
-    assert session_late_window("premarket", datetime(2026, 10, 15, 7, 30, tzinfo=ET), hours=2)
-    assert not session_late_window("premarket", datetime(2026, 10, 15, 7, 29, tzinfo=ET), hours=2)
+def test_session_late_window_is_second_half_of_each_session():
+    # Premarket 04:00–09:30 → 06:45–09:30.
+    assert session_late_window("premarket", datetime(2026, 10, 15, 6, 45, tzinfo=ET))
+    assert not session_late_window("premarket", datetime(2026, 10, 15, 6, 44, tzinfo=ET))
+    # Regular 09:30–16:00 → 12:45–16:00.
+    assert session_late_window("regular", datetime(2026, 10, 15, 12, 45, tzinfo=ET))
+    assert not session_late_window("regular", datetime(2026, 10, 15, 12, 44, tzinfo=ET))
+    assert session_late_window("盘中", datetime(2026, 10, 15, 15, 0, tzinfo=ET))
+    # Explicit hours override still works.
     assert session_late_window("regular", datetime(2026, 10, 15, 14, 0, tzinfo=ET), hours=2)
     assert not session_late_window("regular", datetime(2026, 10, 15, 13, 59, tzinfo=ET), hours=2)
-    assert session_late_window("盘中", datetime(2026, 10, 15, 15, 0, tzinfo=ET), hours=2)
 
 
 def test_afterhours_board_slot_is_each_half_hour():

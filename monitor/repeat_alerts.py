@@ -34,6 +34,21 @@ def _numbered_block(index: int, message: str, fired_at: datetime | None = None) 
     return "\n".join([first, *lines[1:]])
 
 
+def _history_body(alert: Alert) -> str:
+    """Text shown under the divider for an older same-symbol ping.
+
+    halt-or-5d alerts only keep the OR-leg trigger (label / first line), not the
+    stock move line that sits under it in the live message.
+    """
+    if str(alert.rule_id).endswith("-halt-or-5d-boost"):
+        label = (alert.label or "").strip()
+        if label:
+            return label
+        lines = [line for line in alert.message.splitlines() if line.strip()]
+        return lines[0] if lines else alert.message.strip()
+    return alert.message.strip()
+
+
 def with_repeat_history(alert: Alert, prior: list[Alert]) -> Alert:
     """Stamp ``repeat_count`` and, from the 2nd ping, prepend history into a send copy.
 
@@ -51,7 +66,7 @@ def with_repeat_history(alert: Alert, prior: list[Alert]) -> Alert:
     ordered = [alert, *reversed(prior)]
     top = ordered[0].message.strip()
     history = [
-        _numbered_block(count - offset, item.message, item.fired_at)
+        _numbered_block(count - offset, _history_body(item), item.fired_at)
         for offset, item in enumerate(ordered)
         if offset > 0
     ]

@@ -23,14 +23,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_rules_yaml_loads_important_block():
     config = load_rules(ROOT / "config" / "rules.yaml")
-    assert config.important.ths_group == "我的自选"
+    assert config.important.ths_group == "今日自选"
+    assert config.important.late_ths_group == "我的自选"
     assert config.important.high_priority_rule_ids == []
     # 12:30 / 13:00 NZ check reminders stay high-priority in _deliver_check_reminder.
     assert {item.key for item in config.important.reminders} == {
         "afterhours-2h30",
         "afterhours-3h",
     }
-    # All singles → 我的自选; lists below are unused gates (kept empty).
+    # All singles → 今日自选; late half also → 我的自选. Lists below unused (kept empty).
     assert config.important.watchlist.always == []
     assert config.important.watchlist.event == []
     assert config.important.watchlist.afterhours_open == []
@@ -48,13 +49,18 @@ def test_rules_yaml_loads_important_block():
     board = next(
         rule for rule in config.rules if rule.id == "afterhours-halt50-or-5d50-board"
     )
+    boost = next(
+        rule for rule in config.rules if rule.id == "afterhours-halt-or-5d-boost"
+    )
     assert board.notify == "Halt-5d-board"
-    assert board.condition.top_n == 50
-    assert board.condition.value == 0
-    assert board.condition.min_regular_touch == 50
-    assert board.condition.min_recent_day_change == 50
-    assert board.condition.recent_day_count == 5
-    assert board.condition.include_circuit_breaker is True
+    assert board.condition.top_n == 5
+    assert board.condition.value == boost.condition.value
+    assert board.condition.min_regular_touch == boost.condition.min_regular_touch
+    assert board.condition.recent_day_count == boost.condition.recent_day_count
+    assert board.condition.require_circuit_breaker is True
+    assert [
+        (t.min_recent_day_change, t.value) for t in board.condition.day_gain_tiers
+    ] == [(t.min_recent_day_change, t.value) for t in boost.condition.day_gain_tiers]
     fade = next(rule for rule in config.rules if rule.id == "regular-halt50-fade-board")
     assert fade.board_notify is False
     assert fade.notify is None
@@ -64,24 +70,15 @@ def test_rules_yaml_loads_important_block():
     assert fade.condition.include_circuit_breaker is True
     assert fade.condition.min_fade_from_high == 0
 
-    board5d = [
-        rule
+    assert not any(
+        rule.id in {
+            "afterhours-5d50-board",
+            "regular-5d50-board",
+            "premarket-5d50-board",
+        }
         for rule in config.rules
-        if rule.id
-        in {"afterhours-5d50-board", "regular-5d50-board", "premarket-5d50-board"}
-    ]
-    assert len(board5d) == 3
-    assert {rule.name for rule in board5d} == {"5日曾涨超50%的股票"}
-    assert all(rule.board_notify is False for rule in board5d)
-    assert all(rule.notify is None for rule in board5d)
-    assert all(rule.condition.top_n == 50 for rule in board5d)
-    assert all(rule.condition.min_recent_day_change == 50 for rule in board5d)
-    assert all(rule.condition.recent_day_count == 5 for rule in board5d)
-    assert all(rule.condition.board_interval_minutes == 1 for rule in board5d)
-    assert all(rule.condition.intraday_touch is False for rule in board5d)
-    assert all(rule.condition.min_volume == 10000 for rule in board5d)
-    assert all(rule.condition.min_market_cap == 1_000_000 for rule in board5d)
-    assert all(rule.condition.max_market_cap == 1_000_000_000 for rule in board5d)
+    )
+    assert not any(rule.name == "5日曾涨超50%的股票" for rule in config.rules)
 
     day25 = [rule for rule in config.rules if rule.id.endswith("-day25-10")]
     assert len(day25) == 3
@@ -91,26 +88,30 @@ def test_rules_yaml_loads_important_block():
     assert all(rule.cooldown_minutes == 240 for rule in day25)
     assert all(rule.confirm_delay_minutes == 10 for rule in day25)
     assert all(rule.confirm_value == 0 for rule in day25)
-    halt80 = [rule for rule in config.rules if rule.id.endswith("-halt-or-day50")]
-    assert len(halt80) == 3
-    assert {rule.name for rule in halt80} == {"盘中熔断或涨超50%后续涨超5%的股票"}
-    assert {rule.notify for rule in halt80} == {"Halt-boost"}
-    assert all(rule.condition.value == 5 for rule in halt80)
-    assert all(rule.condition.min_recent_day_change == 50 for rule in halt80)
-    assert all(rule.cooldown_minutes == 240 for rule in halt80)
-    assert all(rule.confirm_delay_minutes == 10 for rule in halt80)
-    assert all(rule.confirm_value == 0 for rule in halt80)
-    boost5d = [rule for rule in config.rules if rule.id.endswith("-5d-boost")]
-    assert len(boost5d) == 3
-    assert {rule.name for rule in boost5d} == {
-        "5日曾涨超50%后续超5%或曾涨超100%后续超0%的股票"
+    merged = [rule for rule in config.rules if rule.id.endswith("-halt-or-5d-boost")]
+    assert len(merged) == 3
+    assert {rule.name for rule in merged} == {
+        "熔断或5日涨超50%后续超10%或曾涨超100%后续超5%的股票"
     }
-    assert {rule.notify for rule in boost5d} == {"5-day-boost"}
-    assert all(rule.cooldown_minutes == 240 for rule in boost5d)
-    assert all(rule.confirm_delay_minutes == 10 for rule in boost5d)
-    assert all(rule.confirm_value == 0 for rule in boost5d)
-    assert all(rule.condition.recent_day_count == 5 for rule in boost5d)
-    assert all(len(rule.condition.day_gain_tiers) == 2 for rule in boost5d)
+    assert {rule.notify for rule in merged} == {"Halt-boost"}
+    assert all(rule.condition.value == 5 for rule in merged)
+    assert all(rule.condition.require_circuit_breaker for rule in merged)
+    assert all(rule.condition.min_regular_touch == 50 for rule in merged)
+    assert all(rule.condition.recent_day_count == 5 for rule in merged)
+    assert all(len(rule.condition.day_gain_tiers) == 2 for rule in merged)
+    assert all(
+        [(t.min_recent_day_change, t.value) for t in rule.condition.day_gain_tiers]
+        == [(50, 10), (100, 5)]
+        for rule in merged
+    )
+    assert all(rule.cooldown_minutes == 240 for rule in merged)
+    assert all(rule.confirm_delay_minutes == 0 for rule in merged)
+    assert all(rule.confirm_value is None for rule in merged)
+    assert not any(rule.id.endswith("-halt-or-day50") for rule in config.rules)
+    assert not any(
+        rule.id.endswith("-5d-boost") and "halt-or" not in rule.id
+        for rule in config.rules
+    )
 
 
 def test_important_reminders_merge_into_due_window():
@@ -143,7 +144,7 @@ def test_wants_important_watchlist_gates():
     )
     sudden_ah = _sudden("afterhours", "afterhours-sudden-10")
     five = Rule(
-        id="afterhours-5d-boost",
+        id="afterhours-halt-or-5d-boost",
         name="f",
         description="d",
         group="盘后",
@@ -166,7 +167,7 @@ def test_wants_important_watchlist_gates():
         symbol="*",
         condition=Condition(type=ConditionType.AFTERHOURS_GAIN, value=0, top_n=5),
     )
-    # All singles → 我的自选; boards only if listed.
+    # All singles → 今日自选; boards only if listed.
     assert _wants_important_watchlist(config, sudden_ah, board=False)
     assert _wants_important_watchlist(config, five, board=False)
     assert not _wants_important_watchlist(config, top5, board=False)

@@ -37,8 +37,8 @@ def test_live_rules_include_sudden_gain_for_each_session():
         assert rule.condition.value == 10
         assert rule.condition.pool_min_change == 0
         assert rule.condition.pool_max_change == 20
-        assert rule.condition.sudden_window_seconds == 60
-        assert rule.condition.late_session_hours == 2
+        assert rule.condition.sudden_window_seconds == 300
+        assert rule.condition.late_session_hours is None
         assert rule.condition.min_volume is None
         assert rule.condition.min_market_cap == 1_000_000
         assert rule.confirm_delay_minutes == 10
@@ -63,9 +63,8 @@ def _sudden_rule(session: str) -> Rule:
             value=10,
             pool_min_change=0,
             pool_max_change=20,
-            sudden_window_seconds=60,
+            sudden_window_seconds=300,
             late_session=session,
-            late_session_hours=2,
             min_price=0.1,
             min_market_cap=1_000_000,
             max_market_cap=1_000_000_000,
@@ -229,8 +228,8 @@ def test_sudden_alert_shows_session_change_not_window_gain():
     live = time.time()
     engine._sudden_day = now_et().date().isoformat()
     engine._sudden_pool["afterhours-sudden-10"] = {"AAA"}
-    # Prior ~60s ago at $1.00; current $1.20 → window +20%, but alert should show session +35%.
-    engine._sudden_prices["afterhours-sudden-10"] = {"AAA": [(live - 60.0, 1.0)]}
+    # Prior ~5m ago at $1.00; current $1.20 → window +20%, but alert should show session +35%.
+    engine._sudden_prices["afterhours-sudden-10"] = {"AAA": [(live - 300.0, 1.0)]}
     engine._sudden_discovered_at["afterhours-sudden-10"] = 10**12
     client = AsyncMock()
     engine._trend_moomoo = client
@@ -260,13 +259,13 @@ def test_sudden_match_without_prior_session_floor():
     live = time.time()
     engine._sudden_day = now_et().date().isoformat()
     engine._sudden_pool["afterhours-sudden-10"] = {"LOW"}
-    engine._sudden_prices["afterhours-sudden-10"] = {"LOW": [(live - 60.0, 1.0)]}
+    engine._sudden_prices["afterhours-sudden-10"] = {"LOW": [(live - 300.0, 1.0)]}
     engine._sudden_discovered_at["afterhours-sudden-10"] = 10**12
     client = AsyncMock()
     engine._trend_moomoo = client
     engine.moomoo = client
     engine.verbose = False
-    # Session only +5%, but 1-minute window +20% — still a match.
+    # Session only +5%, but 5-minute window +20% — still a match.
     client.after_hours_quotes = AsyncMock(
         return_value={
             "LOW": Quote(symbol="LOW", price=1.2, change_pct=5.0, volume=200_000)

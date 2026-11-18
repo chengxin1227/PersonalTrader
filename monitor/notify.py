@@ -9,6 +9,16 @@ from monitor.config import ROOT, Settings
 
 _SUFFIX = re.compile(r"[^A-Za-z0-9]+")
 
+# Pushover "From" is the application name for the API token. Each halt-or-5d OR-leg
+# needs its own app named as the Chinese trigger; tokens live under these env keys.
+HALT_OR_5D_FROM_ENV = {
+    "今日盘中一度涨超50%后续超10%": "PUSHOVER_TOKEN_HALT_FROM_TODAY_50",
+    "过去5日曾收盘涨超50%后续超10%": "PUSHOVER_TOKEN_HALT_FROM_PAST_50",
+    "今日盘中一度涨超100%后续超5%": "PUSHOVER_TOKEN_HALT_FROM_TODAY_100",
+    "过去5日曾收盘涨超100%后续超5%": "PUSHOVER_TOKEN_HALT_FROM_PAST_100",
+    "涨停后续超5%": "PUSHOVER_TOKEN_HALT_FROM_LIMIT_UP",
+}
+
 
 def env_suffix(notify: str) -> str:
     return _SUFFIX.sub("_", notify).strip("_").upper()
@@ -40,6 +50,15 @@ class NotifyRoutes:
 
     def pushover_token(self, notify: str | None) -> str:
         return self._pick("PUSHOVER_TOKEN_", notify, self.default_token)
+
+    def halt_or_5d_from_token(self, trigger: str | None) -> str:
+        """Token whose Pushover app name is the OR-leg (shown as From)."""
+        if not trigger:
+            return ""
+        key = HALT_OR_5D_FROM_ENV.get(trigger.strip())
+        if not key:
+            return ""
+        return self._values.get(key, "")
 
     def has_slack(self, notify: str) -> bool:
         return bool(self._values.get(f"SLACK_WEBHOOK_{env_suffix(notify)}"))

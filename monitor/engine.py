@@ -4492,15 +4492,14 @@ class MonitorEngine:
         trigger = self._halt_or_5d_trigger_label(rule, quote)
         # Persist the trigger move for later history; show prior-session on the live top line.
         if trigger:
-            # Title + body headline = which OR-leg fired; stock line stays under it.
-            stock_stored = render_message(
-                rule, quote, extra, headline="trigger", reason=""
+            # Title = OR-leg; body keeps stock as headline and trigger as the reason line
+            # so Pushover/html_message still link the company name first.
+            stored_message = render_message(
+                rule, quote, extra, headline="trigger", reason=trigger
             )
-            stock_display = render_message(
-                rule, quote, extra, headline="prior", reason=""
+            display_message = render_message(
+                rule, quote, extra, headline="prior", reason=trigger
             )
-            stored_message = f"{trigger}\n{stock_stored}"
-            display_message = f"{trigger}\n{stock_display}"
         else:
             stored_message = render_message(rule, quote, extra, headline="trigger")
             display_message = render_message(rule, quote, extra, headline="prior")
@@ -4938,6 +4937,11 @@ class MonitorEngine:
                 errors.append(f"Slack send failed: {exc}")
                 await self._note_problem(f"Slack send failed: {exc}")
         token = self.routes.pushover_token(alert.notify)
+        if str(alert.rule_id).endswith("-halt-or-5d-boost"):
+            # From = Pushover application name → use per-OR-leg app when configured.
+            from_token = self.routes.halt_or_5d_from_token(alert.label)
+            if from_token:
+                token = from_token
         if self.pushover is not None and token and self.settings.pushover_user:
             try:
                 await self.pushover.send_alert(

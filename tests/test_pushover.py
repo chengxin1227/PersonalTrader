@@ -90,7 +90,7 @@ def test_pushover_title_is_the_symbol_and_change():
     assert seen["title"] == "GYGY  +10.0%  $1.50"
 
 
-def test_pushover_halt_or_5d_title_and_body_use_trigger_label():
+def test_pushover_halt_or_5d_keeps_stock_title():
     seen: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -109,9 +109,10 @@ def test_pushover_halt_or_5d_title_and_body_use_trigger_label():
             rule_name="熔断或5日",
             label=trigger,
             symbol="AIOK",
-            message=f"{trigger}\nAutozi    +12.3%    $1.20",
+            message=f"Autozi    +12.3%    $1.20\n{trigger}",
             price=1.2,
             change_pct=12.3,
+            repeat_count=2,
             fired_at=datetime.now(timezone.utc),
         )
         alert.url = "amihexin://"
@@ -119,11 +120,12 @@ def test_pushover_halt_or_5d_title_and_body_use_trigger_label():
         await client.close()
 
     asyncio.run(run())
-    assert seen["title"] == "今日盘中一度涨超50%后续超10%"
+    assert seen["title"] == "AIOK(#2)  +12.3%  $1.20"
     assert "今日盘中一度涨超50%后续超10%" in seen["message"]
-    assert seen["message"].index("今日盘中一度涨超50%后续超10%") < seen["message"].index("Autozi")
-    assert "Autozi" in seen["message"]
-    assert "AIOK  +12.3%" not in seen["title"]
+    assert seen["message"].index("Autozi") < seen["message"].index(
+        "今日盘中一度涨超50%后续超10%"
+    )
+    assert '<a href="amihexin://">Autozi</a>' in seen["message"]
 
 
 def test_pushover_title_adds_repeat_count_from_the_second_ping():

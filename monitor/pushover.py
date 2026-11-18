@@ -123,19 +123,14 @@ class PushoverClient:
         sound: str | None = None,
     ) -> None:
         count = alert.repeat_count or 1
-        # halt-or-5d: title = which OR-leg fired (also the message reason line).
-        if alert.label and str(alert.rule_id).endswith("-halt-or-5d-boost"):
-            title = (
-                f"{alert.label}(#{count})" if count >= 2 else alert.label
-            )
-        else:
-            head = f"{alert.symbol}(#{count})" if count >= 2 else alert.symbol
-            parts = [head]
-            if alert.change_pct is not None:
-                parts.append(f"{alert.change_pct:+.1f}%")
-            if alert.price is not None:
-                parts.append(format_price(alert.price))
-            title = "  ".join(parts)
+        # Title stays stock SYMBOL(#N) +% $ — From (Pushover app name) is chosen via token.
+        head = f"{alert.symbol}(#{count})" if count >= 2 else alert.symbol
+        parts = [head]
+        if alert.change_pct is not None:
+            parts.append(f"{alert.change_pct:+.1f}%")
+        if alert.price is not None:
+            parts.append(format_price(alert.price))
+        title = "  ".join(parts)
         await self.send_text(
             html_message(alert.message, alert.url),
             title=title,

@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 
 from monitor.models import Alert
-from monitor.rules import FIELD_GAP
+from monitor.rules import FIELD_GAP, format_price
 from monitor.session import format_nz_clock
 
 _CHANGE = re.compile(r"[+-]\d+(?:\.\d+)?%")
@@ -34,19 +34,41 @@ def _numbered_block(index: int, message: str, fired_at: datetime | None = None) 
     return "\n".join([first, *lines[1:]])
 
 
-def _history_body(alert: Alert) -> str:
-    """Text shown under the divider for an older same-symbol ping.
+def _history_headline(alert: Alert) -> str:
+    """Stock name + move line, same shape as a live alert top line."""
+    for line in alert.message.splitlines():
+        if not line.strip():
+            continue
+        if _CHANGE.search(line) or _PRICE.search(line):
+            return line.strip()
+    parts = [alert.symbol]
+    if alert.change_pct is not None:
+        parts.append(f"{alert.change_pct:+.1f}%")
+    if alert.price is not None:
+        parts.append(format_price(alert.price))
+    return FIELD_GAP.join(parts)
 
-    halt-or-5d alerts only keep the OR-leg trigger (label / first line), not the
-    stock move line that sits under it in the live message.
-    """
-    if str(alert.rule_id).endswith("-halt-or-5d-boost"):
-        label = (alert.label or "").strip()
-        if label:
-            return label
-        lines = [line for line in alert.message.splitlines() if line.strip()]
-        return lines[0] if lines else alert.message.strip()
-    return alert.message.strip()
+
+def _history_reason(alert: Alert) -> str:
+    """Short trigger only — label / OR-leg, never the long rule description."""
+    label = (alert.label or "").strip()
+    if label:
+        return label
+    lines = [line for line in alert.message.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if _CHANGE.search(line) or _PRICE.search(line):
+            continue
+        return line
+    return ""
+
+
+def _history_body(alert: Alert) -> str:
+    """Prior ping in the classic two-line layout: stock move, then short trigger."""
+    head = _history_headline(alert)
+    reason = _history_reason(alert)
+    if reason and reason not in head:
+        return f"{head}\n{reason}"
+    return head
 
 
 def with_repeat_history(alert: Alert, prior: list[Alert]) -> Alert:

@@ -720,8 +720,11 @@ def test_fire_alert_uses_trigger_as_pushover_label(tmp_path):
             )
         assert alert is not None
         assert alert.label == "今日盘中一度涨超50%后续超10%"
-        assert alert.message.startswith("今日盘中一度涨超50%后续超10%\n")
+        assert "+12.5%" in alert.message.splitlines()[0]
+        assert alert.message.endswith("今日盘中一度涨超50%后续超10%")
         assert delivered[0].label == alert.label
-        assert delivered[0].message.startswith("今日盘中一度涨超50%后续超10%\n")
+        assert delivered[0].message.index("+12.5%") < delivered[0].message.index(
+            "今日盘中一度涨超50%后续超10%"
+        )
 
     asyncio.run(run())

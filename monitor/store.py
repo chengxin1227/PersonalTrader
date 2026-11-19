@@ -51,6 +51,8 @@ class Store:
         self._day_gains: dict[str, Any] | None = None
         self._peak_gains_path = data_dir / "peak_gains.json"
         self._peak_gains: dict[str, Any] | None = None
+        self._peak_troughs_path = data_dir / "peak_troughs.json"
+        self._peak_troughs: dict[str, Any] | None = None
         self._afterhours_peaks_path = data_dir / "afterhours_peaks.json"
         self._afterhours_peaks: dict[str, Any] | None = None
         self._premarket_peaks_path = data_dir / "premarket_peaks.json"
@@ -373,6 +375,77 @@ class Store:
     def _save_peak_gains(self, peaks: dict[str, Any]) -> None:
         self._peak_gains = peaks
         _atomic_write_json(self._peak_gains_path, peaks)
+
+    def note_peak_trough(
+        self, day: str, symbol: str, change_pct: float
+    ) -> tuple[float, float]:
+        """Track session peak and the lowest gain seen after that peak.
+
+        New highs reset the trough to the new peak. Returns ``(peak, trough)``.
+        """
+        rows = self._load_peak_troughs()
+        day_row = rows.setdefault(day, {})
+        if not isinstance(day_row, dict):
+            day_row = {}
+            rows[day] = day_row
+        key = symbol.upper()
+        existing = day_row.get(key)
+        peak = change_pct
+        trough = change_pct
+        if isinstance(existing, dict):
+            try:
+                peak = float(existing.get("peak"))
+            except (TypeError, ValueError):
+                peak = change_pct
+            try:
+                trough = float(existing.get("trough"))
+            except (TypeError, ValueError):
+                trough = peak
+            if change_pct > peak:
+                peak = change_pct
+                trough = change_pct
+            else:
+                trough = min(trough, change_pct)
+        day_row[key] = {"peak": peak, "trough": trough}
+        self._prune_peak_troughs(rows, day)
+        self._save_peak_troughs(rows)
+        return peak, trough
+
+    def peak_trough(self, day: str, symbol: str) -> tuple[float, float] | None:
+        row = self._load_peak_troughs().get(day, {})
+        if not isinstance(row, dict):
+            return None
+        existing = row.get(symbol.upper())
+        if not isinstance(existing, dict):
+            return None
+        try:
+            return float(existing["peak"]), float(existing["trough"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _prune_peak_troughs(self, rows: dict[str, Any], day: str) -> None:
+        cutoff = date.fromisoformat(day) - timedelta(days=21)
+        for stale in [
+            item
+            for item in rows
+            if _is_iso_date(item) and date.fromisoformat(item) < cutoff
+        ]:
+            rows.pop(stale, None)
+
+    def _load_peak_troughs(self) -> dict[str, Any]:
+        if self._peak_troughs is not None:
+            return self._peak_troughs
+        if not self._peak_troughs_path.exists():
+            self._peak_troughs = {}
+            return self._peak_troughs
+        with self._peak_troughs_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self._peak_troughs = payload if isinstance(payload, dict) else {}
+        return self._peak_troughs
+
+    def _save_peak_troughs(self, rows: dict[str, Any]) -> None:
+        self._peak_troughs = rows
+        _atomic_write_json(self._peak_troughs_path, rows)
 
     def note_afterhours_peak(self, day: str, symbol: str, change_pct: float) -> float:
         """Remember the highest after-hours change seen for `symbol` on `day`."""

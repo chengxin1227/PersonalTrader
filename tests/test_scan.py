@@ -929,7 +929,7 @@ def test_peak_fade_board_is_not_a_single_fade_rule():
 
     rule = Rule(
         id="regular-halt50-fade-board",
-        name="盘中熔断或涨超50%回落的股票",
+        name="盘中熔断或50%回落的股票",
         symbol="*",
         condition=Condition(
             type=ConditionType.REGULAR_GAIN,
@@ -944,6 +944,51 @@ def test_peak_fade_board_is_not_a_single_fade_rule():
     assert _is_peak_fade_board(rule)
     assert not _is_peak_fade_rule(rule)
     assert _sorts_ths_by_peak_fade(rule)
+
+
+def test_peak_rebound_rule_classifier():
+    from monitor.engine import (
+        _is_peak_fade_board,
+        _is_peak_fade_rule,
+        _is_peak_rebound_rule,
+    )
+
+    rule = Rule(
+        id="regular-halt50-rebound",
+        name="盘中熔断或50%回升的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.REGULAR_GAIN,
+            value=0,
+            min_regular_touch=50,
+            include_circuit_breaker=True,
+            min_rebound_from_trough=10,
+            late_session_hours=3.75,
+        ),
+    )
+    assert _is_peak_rebound_rule(rule)
+    assert not _is_peak_fade_rule(rule)
+    assert not _is_peak_fade_board(rule)
+
+
+def test_near_peak_rule_classifier():
+    from monitor.engine import _is_near_peak_rule, _is_peak_fade_rule, _is_peak_rebound_rule
+
+    rule = Rule(
+        id="regular-near-peak-35",
+        name="盘中涨超35%接近最高的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.REGULAR_GAIN,
+            value=35,
+            max_fade_from_high=10,
+            late_session_hours=3.75,
+            min_volume=10_000,
+        ),
+    )
+    assert _is_near_peak_rule(rule)
+    assert not _is_peak_fade_rule(rule)
+    assert not _is_peak_rebound_rule(rule)
 
 
 def test_halt_or_5d_boost_uses_ths_rule_group():
@@ -1015,14 +1060,9 @@ def test_session50_singles_use_ths_rule_group_and_live_yaml():
     root = Path(__file__).resolve().parent.parent
     config = load_rules(root / "config" / "rules.yaml")
     session50 = [rule for rule in config.rules if rule.id.endswith("-session50")]
-    assert {rule.id for rule in session50} == {
-        "afterhours-session50",
-        "premarket-session50",
+    assert session50 == []
+    assert {rule.id for rule in config.rules} >= {
+        "afterhours-top5",
+        "afterhours-halt-or-5d-boost",
+        "afterhours-halt50-or-5d50-board",
     }
-    for rule in session50:
-        assert not rule.skip_ths_group
-        assert rule.once_per_session
-        assert rule.notify == "Session-50"
-        assert rule.condition.value == 50
-        assert rule.condition.min_volume == 10_000
-        assert not _skips_ths_rule_group(rule)

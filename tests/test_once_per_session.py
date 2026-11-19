@@ -59,6 +59,7 @@ def test_same_rule_alerts_only_once_per_session(tmp_path):
         {
             "slack_url": lambda self, _notify=None: "",
             "pushover_token": lambda self, _notify=None: None,
+            "session_pushover_token": lambda self, _session=None: None,
         },
     )()
     engine.last_error = None
@@ -160,14 +161,7 @@ def test_live_rules_once_per_session_flags():
     from monitor.rules import load_rules
 
     config = load_rules(ROOT / "config" / "rules.yaml")
-    ids = {
-        "afterhours-day25-10",
-        "afterhours-halt-or-5d-boost",
-        "regular-day25-10",
-        "regular-halt-or-5d-boost",
-        "premarket-day25-10",
-        "premarket-halt-or-5d-boost",
-    }
-    for rule in config.rules:
-        if rule.id in ids:
-            assert rule.once_per_session is True, rule.id
+    by_id = {rule.id: rule for rule in config.rules}
+    assert by_id["afterhours-top5"].once_per_session is False
+    assert by_id["afterhours-halt-or-5d-boost"].once_per_session is True
+    assert by_id["afterhours-halt50-or-5d50-board"].once_per_session is False

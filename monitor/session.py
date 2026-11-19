@@ -226,9 +226,9 @@ def _interval_slot(current: datetime, interval_minutes: int) -> datetime:
 
 
 def afterhours_board_slot(moment: datetime | None = None) -> datetime | None:
-    """After-hours board marks: first at 16:05 ET, then each half hour.
+    """After-hours board marks: first at 16:15 ET, then each half hour.
 
-    16:05 ET ≈ 10:05 NZ — the first after-hours top-5 digest (no 16:00 board).
+    16:15 ET ≈ 10:15 NZ — the first after-hours top-5 digest (no 16:00 board).
     """
     return session_board_slot("afterhours", moment)
 
@@ -240,8 +240,8 @@ def session_board_slot(
 ) -> datetime | None:
     """Board marks for premarket / regular / afterhours.
 
-    Default is half-hour. After-hours half-hour boards start at 16:05 ET
-    (≈10:05 NZ), then :30 / :00. Custom intervals floor within the hour.
+    Default is half-hour. After-hours half-hour boards start at 16:15 ET
+    (≈10:15 NZ), then :30 / :00. Custom intervals floor within the hour.
     """
     current = now_et(moment)
     interval = max(1, int(interval_minutes))
@@ -257,11 +257,11 @@ def session_board_slot(
         if not is_afterhours(current):
             return None
         if interval == 30:
-            # Wait until 16:05 for the first board (≈10:05 NZ).
-            if current.hour == 16 and current.minute < 5:
+            # Wait until 16:15 for the first board (≈10:15 NZ).
+            if current.hour == 16 and current.minute < 15:
                 return None
-            if current.hour == 16 and 5 <= current.minute < 30:
-                return current.replace(minute=5, second=0, microsecond=0)
+            if current.hour == 16 and 15 <= current.minute < 30:
+                return current.replace(minute=15, second=0, microsecond=0)
             return _half_hour_slot(current)
         return _interval_slot(current, interval)
     return None

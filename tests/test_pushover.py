@@ -171,7 +171,12 @@ def test_slack_message_starts_with_the_stock():
         fired_at=datetime.now(timezone.utc),
     )
     async def run() -> list:
-        client = SlackClient(Settings(slack_webhook_url="https://hooks.slack.com/services/T/B/x"))
+        client = SlackClient(
+            Settings(
+                slack_enabled=True,
+                slack_webhook_url="https://hooks.slack.com/services/T/B/x",
+            )
+        )
         blocks = client._blocks(alert)
         await client.close()
         return blocks

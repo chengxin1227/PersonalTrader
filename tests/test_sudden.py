@@ -27,23 +27,30 @@ def test_trim_keeps_recent_samples_only():
     ]
 
 
-def test_live_rules_include_sudden_gain_for_each_session():
+def test_live_rules_include_session_sudden_gain():
     config = load_rules(ROOT / "config" / "rules.yaml")
-    sudden = [rule for rule in config.rules if rule.condition.type.value == "sudden_gain"]
-    sessions = {rule.condition.late_session for rule in sudden}
-    assert sessions == {"premarket", "regular", "afterhours"}
-    assert {rule.notify for rule in sudden} == {"Sudden-10"}
-    for rule in sudden:
+    sudden = {
+        rule.id: rule
+        for rule in config.rules
+        if rule.condition.type.value == "sudden_gain"
+    }
+    assert set(sudden) == {"afterhours-sudden-10", "premarket-sudden-10"}
+    ah = sudden["afterhours-sudden-10"]
+    assert ah.name == "盘后后半段5分钟涨超10%的股票"
+    assert ah.condition.late_session == "afterhours"
+    assert ah.condition.late_session_hours == 2.5
+    pm = sudden["premarket-sudden-10"]
+    assert pm.name == "盘前后半段5分钟涨超10%的股票"
+    assert pm.condition.late_session == "premarket"
+    assert pm.condition.late_session_hours == 3.25
+    for rule in sudden.values():
         assert rule.condition.value == 10
         assert rule.condition.pool_min_change == 0
         assert rule.condition.pool_max_change == 20
         assert rule.condition.sudden_window_seconds == 300
-        assert rule.condition.late_session_hours is None
-        assert rule.condition.min_volume is None
-        assert rule.condition.min_market_cap == 1_000_000
-        assert rule.confirm_delay_minutes == 10
-        assert rule.confirm_value == 10
-        assert rule.cooldown_minutes == 240
+        assert rule.condition.min_volume == 10_000
+        assert rule.confirm_delay_minutes == 0
+        assert rule.confirm_value is None
 
 
 def _sudden_rule(session: str) -> Rule:
@@ -305,6 +312,7 @@ def test_sudden_first_and_hold_both_add_important(tmp_path):
         {
             "slack_url": lambda self, _notify=None: "",
             "pushover_token": lambda self, _notify=None: None,
+            "session_pushover_token": lambda self, _session=None: None,
         },
     )()
     engine.last_error = None

@@ -35,6 +35,34 @@ def test_rule_route_uses_its_own_webhook_and_token():
     assert not routes.has_pushover("trend")
 
 
+def test_slack_disabled_routes_never_return_webhooks():
+    routes = NotifyRoutes(
+        {"SLACK_WEBHOOK_HALT": "https://hooks.slack.com/services/halt"},
+        default_slack="https://hooks.slack.com/services/default",
+        slack_enabled=False,
+    )
+    assert routes.slack_url("halt") == ""
+    assert routes.slack_url(None) == ""
+    assert not routes.has_slack("halt")
+
+
+def test_session_pushover_token_picks_the_session_app():
+    routes = NotifyRoutes(
+        {
+            "PUSHOVER_TOKEN_PREMARKET": "pre-token",
+            "PUSHOVER_TOKEN_REGULAR": "rth-token",
+            "PUSHOVER_TOKEN_AFTERHOURS": "ah-token",
+        },
+        default_token="fallback-token",
+    )
+    assert routes.session_pushover_token("盘前") == "pre-token"
+    assert routes.session_pushover_token("盘中") == "rth-token"
+    assert routes.session_pushover_token("盘后") == "ah-token"
+    assert routes.session_pushover_token(None) == "fallback-token"
+    assert routes.session_pushover_token("未知") == "fallback-token"
+    assert routes.has_session_pushover("盘前")
+
+
 def test_slack_posts_to_the_rule_webhook():
     seen: dict[str, str] = {}
 
@@ -44,7 +72,10 @@ def test_slack_posts_to_the_rule_webhook():
 
     async def run() -> None:
         client = SlackClient(
-            Settings(slack_webhook_url="https://hooks.slack.com/services/default"),
+            Settings(
+                slack_enabled=True,
+                slack_webhook_url="https://hooks.slack.com/services/default",
+            ),
             httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         )
         alert = Alert(

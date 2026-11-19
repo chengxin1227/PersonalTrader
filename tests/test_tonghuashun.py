@@ -3,7 +3,10 @@ from monitor.engine import _shared_rule_group_names
 from monitor.problems import problem_notice
 from monitor.tonghuashun import (
     TonghuashunClient,
+    _SESSION_WATCHLIST_GROUP,
+    _SESSION_WATCHLIST_GROUPS,
     _encrypt,
+    _session_watchlist_group,
     format_selfstock,
     parse_selfstock,
     previous_watchlist_session,
@@ -11,7 +14,22 @@ from monitor.tonghuashun import (
 )
 
 
+def test_session_watchlist_groups_are_今日盘x():
+    assert _SESSION_WATCHLIST_GROUP == {
+        "盘前": "今日盘前分组",
+        "盘中": "今日盘中分组",
+        "盘后": "今日盘后分组",
+    }
+    assert _session_watchlist_group("盘后") == "今日盘后分组"
+    assert set(_SESSION_WATCHLIST_GROUPS) == {
+        "今日盘前分组",
+        "今日盘中分组",
+        "今日盘后分组",
+    }
+
+
 def test_important_watchlist_previous_session_cycle():
+    # Still used for shared rule-group session tags.
     assert previous_watchlist_session("盘前") == "盘后"
     assert previous_watchlist_session("盘中") == "盘前"
     assert previous_watchlist_session("盘后") == "盘中"
@@ -22,13 +40,63 @@ def test_shared_rule_group_names_from_live_rules():
     from monitor.config import ROOT
     from monitor.rules import load_rules
 
-    shared = set(_shared_rule_group_names(load_rules(ROOT / "config" / "rules.yaml")))
-    assert "后半段5分钟涨超10%的股票" in shared
-    assert "盘中收盘涨超25%后续涨超10%的股票" in shared
-    assert "5日曾涨超50%的股票" not in shared
-    assert "熔断或5日涨超50%后续超10%或曾涨超100%后续超5%的股票" in shared
-    # Half-hour digest boards still use their own names, not shared singles list.
-    assert "盘后涨幅最高前5的股票" not in shared
+    config = load_rules(ROOT / "config" / "rules.yaml")
+    shared = set(_shared_rule_group_names(config))
+    # Board digests are not shared singles; halt-or-5d-boost is afterhours-only so not shared.
+    assert "今日盘后涨幅最高前5的股票" not in shared
+    assert "熔断或5日盘后前5的股票" not in shared
+
+
+def test_sync_groups_keep_includes_session_and_important():
+    keep_names = ["今日盘后涨幅最高前5的股票"]
+    keep = {
+        "今日自选",
+        *_SESSION_WATCHLIST_GROUPS,
+        *(name.strip() for name in keep_names if name.strip()),
+    }
+    assert keep == {
+        "今日自选",
+        "今日盘前分组",
+        "今日盘中分组",
+        "今日盘后分组",
+        "今日盘后涨幅最高前5的股票",
+    }
+
+
+def test_clear_session_day_clears_session_group_and_important_once(tmp_path):
+    settings = Settings(
+        data_dir=tmp_path,
+        ths_username="",
+        ths_password="",
+        slack_webhook_url="https://example.invalid",
+    )
+    client = TonghuashunClient(settings)
+    client.set_important_group("今日自选")
+    cleared_batches: list[list[str]] = []
+
+    def fake_clear_day(names: list[str], day: str) -> list[str]:
+        cleared_batches.append(list(names))
+        return list(names)
+
+    client._clear_day_sync = fake_clear_day  # type: ignore[method-assign]
+    client._clear_session_watchlist_tags = lambda session: None  # type: ignore[method-assign]
+
+    first = client._clear_session_day_sync(
+        "盘后", "2026-11-20", ["今日盘后涨幅最高前5的股票"]
+    )
+    assert "今日盘后分组" in first
+    assert "今日自选" in first
+    assert any("今日盘后分组" in batch for batch in cleared_batches)
+    assert any("今日自选" in batch for batch in cleared_batches)
+
+    # Same ET day: 今日自选 already stamped, so important clear is a no-op.
+    client._group_days = lambda: {"今日自选": "2026-11-20"}  # type: ignore[method-assign]
+    cleared_batches.clear()
+    second = client._clear_session_day_sync(
+        "盘中", "2026-11-20", ["某盘中规则"]
+    )
+    assert "今日盘中分组" in second
+    assert "今日自选" not in second
 
 
 def test_rule_group_session_tags_round_trip(tmp_path):

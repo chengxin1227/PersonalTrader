@@ -15,7 +15,7 @@ from monitor.notify import NotifyRoutes
 from monitor.moomoo_client import MoomooClient
 from monitor.pushover import PushoverClient
 from monitor.rules import load_rules
-from monitor.session import CHECK_REMINDER_NOTIFY, is_premarket
+from monitor.session import is_premarket
 from monitor.slack import SlackClient
 from monitor.store import Store
 
@@ -36,20 +36,13 @@ def _print_routes(settings: Settings, rules: list) -> None:
     if not routed:
         return
     routes = NotifyRoutes.load(settings)
-    own = sum(
-        1 for rule in routed if routes.has_slack(rule.notify) and routes.has_pushover(rule.notify)
-    )
-    print(f"  routes    {own}/{len(routed)} rules have their own Slack channel and Pushover app")
-    for rule in routed:
-        slack = "own" if routes.has_slack(rule.notify) else "default"
-        pushover = "own" if routes.has_pushover(rule.notify) else "default"
-        print(f"    - {rule.label or rule.notify}: slack {slack}, pushover {pushover}")
-    slack = "own" if routes.has_slack("opend") else "default"
-    pushover = "own" if routes.has_pushover("opend") else "default"
-    print(f"    - OpenD: slack {slack}, pushover {pushover}")
-    slack = "own" if routes.has_slack(CHECK_REMINDER_NOTIFY) else "missing"
-    pushover = "own" if routes.has_pushover(CHECK_REMINDER_NOTIFY) else "missing"
-    print(f"    - Important reminder: slack {slack}, pushover {pushover}")
+    print("  pushover  session apps")
+    for session, label in (("盘前", "今日盘前自选"), ("盘中", "今日盘中自选"), ("盘后", "今日盘后自选")):
+        ok = "yes" if routes.has_session_pushover(session) else "NO"
+        print(f"    - {session} ({label}): {ok}")
+    if settings.slack_enabled:
+        own = sum(1 for rule in routed if routes.has_slack(rule.notify))
+        print(f"  slack     {own}/{len(routed)} rules have their own webhook")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -113,7 +106,7 @@ def require_alpaca(settings: Settings) -> None:
 
 def require_slack(settings: Settings) -> None:
     if not settings.slack_configured:
-        sys.exit("Set SLACK_WEBHOOK_URL in .env")
+        sys.exit("Set SLACK_ENABLED=true and SLACK_WEBHOOK_URL in .env")
 
 
 def require_pushover(settings: Settings) -> None:

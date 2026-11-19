@@ -25,15 +25,15 @@ _LOGIN_AGENT = "同花顺/7.0.10 CFNetwork/1333.0.4 Darwin/21.5.0".encode("utf-8
 _API_AGENT = "hevo"
 _GROUP_AGENT = "Hexin_Gphone/11.28.03 (Royal Flush) okhttp/3.14.9"
 _SESSION_SECONDS = 12 * 60 * 60
-# Session keys tag 今日自选 / 我的自选 membership for per-session clear.
-# 盘前/盘中/盘后分组 are no longer written; singles go to 今日自选 (and late-half → 我的自选).
+# Session keys → 今日盘前/盘中/盘后分组. Tags track which session added each symbol.
+# Singles also go to 今日自选 (cleared once per ET day). 我的自选 is unused.
 _SESSION_WATCHLIST_GROUP = {
-    "盘前": "盘前分组",
-    "盘中": "盘中分组",
-    "盘后": "盘后分组",
+    "盘前": "今日盘前分组",
+    "盘中": "今日盘中分组",
+    "盘后": "今日盘后分组",
 }
 _SESSION_WATCHLIST_GROUPS = tuple(_SESSION_WATCHLIST_GROUP.values())
-# Summary groups: when the next session starts, drop names tagged for the previous one.
+# Shared rule groups: when the next session starts, drop names tagged for the previous one.
 _PREVIOUS_WATCHLIST_SESSION = {
     "盘前": "盘后",
     "盘中": "盘前",
@@ -44,20 +44,20 @@ _DEFAULT_LATE_GROUP = "我的自选"
 
 
 def _session_watchlist_group(session: str) -> str:
-    """Map 盘前/盘中/盘后 → 盘前分组/盘中分组/盘后分组."""
+    """Map 盘前/盘中/盘后 → 今日盘前/盘中/盘后分组."""
     cleaned = (session or "").strip()
     return _SESSION_WATCHLIST_GROUP.get(cleaned, _SESSION_WATCHLIST_GROUP["盘中"])
 
 
 def previous_watchlist_session(session: str) -> str | None:
-    """Session whose summary-group tags should clear when ``session`` begins."""
+    """Session whose shared-rule-group tags should clear when ``session`` begins."""
     return _PREVIOUS_WATCHLIST_SESSION.get((session or "").strip())
 
 
 def summary_group_order(
     existing: list[str], symbols: list[str], *, bump: bool
 ) -> list[str]:
-    """Order for 我的自选 after adding ``symbols``.
+    """Order for 今日自选 / 今日盘x分组 after adding ``symbols``.
 
     ``bump=True``: alert order — put ``symbols`` (deduped, including repeats) at the
     front and keep the rest in place. ``bump=False``: append only missing names.
@@ -121,7 +121,7 @@ def _encrypt(pubkey: str, value: str) -> str:
 
 
 class TonghuashunClient:
-    """Adds alerted names to a rule group, 盘前/盘中/盘后分组, and optionally 我的自选."""
+    """Adds alerted names to a rule group, 今日盘x分组, and 今日自选 (singles)."""
 
     def __init__(self, settings: Settings) -> None:
         self._username = settings.ths_username
@@ -486,7 +486,7 @@ class TonghuashunClient:
         late: bool = False,
         bump: bool = True,
     ) -> None:
-        """Keep alerted names in 今日自选 / 我的自选 (or legacy 盘x分组).
+        """Keep alerted names in 今日自选 or 今日盘x分组.
 
         With ``bump=True`` (default), alerted names — including repeats — move to the top.
         With ``bump=False``, only append names that are missing; leave order alone.
@@ -664,10 +664,10 @@ class TonghuashunClient:
         )
 
     def _sync_groups_sync(self, keep_names: list[str]) -> dict[str, list[str]]:
-        """Ensure rule groups + 今日自选 / 我的自选 exist. Never delete user-created groups."""
+        """Ensure rule groups + 今日自选 + 今日盘x分组 exist. Never delete user groups."""
         keep = {
             self._important_group,
-            self._late_group,
+            *_SESSION_WATCHLIST_GROUPS,
             *(name.strip() for name in keep_names if name.strip()),
         }
 
@@ -734,7 +734,7 @@ class TonghuashunClient:
             for code, market in rows:
                 known.setdefault(code.upper(), market)
             if replace:
-                # Peak top-N boards stay in the rule group only; skip 我的自选.
+                # Peak top-N boards replace the rule group; session groups bump separately.
                 members = []
                 for symbol in symbols:
                     if not symbol or symbol in members:
@@ -747,7 +747,6 @@ class TonghuashunClient:
                 if symbol not in members:
                     self._market(http, symbol)
                     members.append(symbol)
-            # Singles no longer mirror into 盘前/盘中/盘后分组.
             return members
 
         return self._with_session(work)
@@ -921,8 +920,8 @@ class TonghuashunClient:
         return await asyncio.to_thread(self._clear_day_sync, names, day)
 
     async def add_daily(self, symbols: list[str], session: str) -> None:
-        """Deprecated: 盘x分组 are unused; route to 我的自选 instead."""
-        await self.add_important(symbols, session)
+        """Bump names into the session group (今日盘前/盘中/盘后分组)."""
+        await asyncio.to_thread(self._add_summary_sync, symbols, session, important=False)
 
     async def add_important(self, symbols: list[str], session: str) -> None:
         """Keep names in the primary summary group (今日自选)."""
@@ -972,7 +971,7 @@ class TonghuashunClient:
         self._with_session(work)
 
     async def replace_important(self, symbols: list[str], session: str) -> None:
-        """Clear 我的自选 and write ``symbols`` in the given order."""
+        """Clear 今日自选 and write ``symbols`` in the given order."""
         await asyncio.to_thread(
             self._replace_summary_sync, symbols, session, important=True
         )
@@ -986,43 +985,18 @@ class TonghuashunClient:
             del tags[symbol]
         self._save_session_tags(important=False)
 
-    def _clear_important_session_day_sync(self, session: str, day: str) -> list[str]:
-        """Drop leftover summary-group names tagged with ``session`` once per ET day."""
-        session_key = session.strip()
-        if session_key not in _SESSION_WATCHLIST_GROUP:
-            return []
+    def _clear_important_day_sync(self, day: str) -> list[str]:
+        """Empty 今日自选 once per ET day (full group clear, not per-session tags)."""
+        name = self._important_group
         days = self._group_days()
-        removed: list[str] = []
-        for group_name, important, late in (
-            (self._important_group, True, False),
-            (self._late_group, False, True),
-        ):
-            stamp = f"{group_name}#{session_key}"
-            if days.get(stamp) == day:
-                continue
-            removed.extend(
-                self._clear_summary_session_sync(
-                    session_key, group_name, important=important, late=late
-                )
-            )
-            days[stamp] = day
-        self._save_group_days()
-        return removed
-
-    def _clear_important_previous_session_sync(self, session: str) -> list[str]:
-        """When ``session`` starts, drop summary-group names tagged for the previous session."""
-        prev = previous_watchlist_session(session)
-        if prev is None:
+        if days.get(name) == day:
             return []
-        removed = self._clear_summary_session_sync(
-            prev, self._important_group, important=True
-        )
-        removed.extend(
-            self._clear_summary_session_sync(
-                prev, self._late_group, important=False, late=True
-            )
-        )
-        return removed
+        cleared = self._clear_day_sync([name], day)
+        tags = self._session_tags(important=True)
+        if tags:
+            tags.clear()
+            self._save_session_tags(important=True)
+        return cleared
 
     def _clear_session_day_sync(
         self,
@@ -1031,16 +1005,16 @@ class TonghuashunClient:
         rule_names: list[str],
         shared_rule_names: list[str] | None = None,
     ) -> list[str]:
-        """Clear this session's rule groups for the new ET day.
+        """Clear this session's rule + 今日盘x分组 for the new ET day.
 
         Shared rule groups: drop the previous session's symbols when this session starts.
-        今日自选 / 我的自选: clear the previous session's names when this session starts, and
-        drop any leftover same-session tags from an earlier day.
+        今日自选: full clear once per ET day.
         """
         session_key = session.strip()
         names = [name.strip() for name in rule_names if name.strip()]
+        if session_key in _SESSION_WATCHLIST_GROUP:
+            names.append(_session_watchlist_group(session_key))
         cleared = self._clear_day_sync(names, day)
-        # Drop leftover 盘x分组 tags if any remain from older builds.
         if session_key in _SESSION_WATCHLIST_GROUP:
             self._clear_session_watchlist_tags(session_key)
         prev = previous_watchlist_session(session_key)
@@ -1054,8 +1028,9 @@ class TonghuashunClient:
                 removed = self._clear_rule_group_session_sync(name, prev)
                 if removed and name not in cleared:
                     cleared.append(name)
-        self._clear_important_previous_session_sync(session_key)
-        self._clear_important_session_day_sync(session_key, day)
+        for name in self._clear_important_day_sync(day):
+            if name not in cleared:
+                cleared.append(name)
         return cleared
 
     async def clear_session_day(
@@ -1065,7 +1040,7 @@ class TonghuashunClient:
         rule_names: list[str],
         shared_rule_names: list[str] | None = None,
     ) -> list[str]:
-        """Clear this session's rule groups; shared + 今日自选/我的自选 drop the previous session."""
+        """Clear this session's rule + 今日盘x分组; 今日自选 clears once per ET day."""
         return await asyncio.to_thread(
             self._clear_session_day_sync, session, day, rule_names, shared_rule_names
         )

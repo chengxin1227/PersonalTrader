@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     alpaca_data_url: str = "https://data.alpaca.markets"
     alpaca_trade_url: str = "https://paper-api.alpaca.markets"
     alpaca_feed: str = "iex"
+    # Off by default: alerts go to Pushover only. Set SLACK_ENABLED=true to re-enable.
+    slack_enabled: bool = False
     slack_webhook_url: str = ""
     pushover_token: str = ""
     pushover_user: str = ""
@@ -39,7 +41,7 @@ class Settings(BaseSettings):
 
     @property
     def slack_configured(self) -> bool:
-        return bool(self.slack_webhook_url)
+        return bool(self.slack_enabled and self.slack_webhook_url)
 
     @property
     def pushover_configured(self) -> bool:

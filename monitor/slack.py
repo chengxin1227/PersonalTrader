@@ -37,6 +37,8 @@ class SlackClient:
             await self._client.aclose()
 
     async def send_alert(self, alert: Alert, webhook_url: str | None = None) -> None:
+        if not self._settings.slack_enabled:
+            return
         url = webhook_url or self._settings.slack_webhook_url
         if not url:
             raise RuntimeError("SLACK_WEBHOOK_URL is not set")
@@ -63,6 +65,8 @@ class SlackClient:
         webhook_url: str | None = None,
         reason: str | None = None,
     ) -> None:
+        if not self._settings.slack_enabled:
+            return
         url = webhook_url or self._settings.slack_webhook_url
         if not url:
             raise RuntimeError("SLACK_WEBHOOK_URL is not set")
@@ -96,6 +100,8 @@ class SlackClient:
         response.raise_for_status()
 
     async def send_text(self, text: str, webhook_url: str | None = None) -> None:
+        if not self._settings.slack_enabled:
+            return
         url = webhook_url or self._settings.slack_webhook_url
         if not url:
             raise RuntimeError("SLACK_WEBHOOK_URL is not set")

@@ -53,6 +53,7 @@ def test_pool_entry_alert_does_not_block_afterhours_single(tmp_path):
         {
             "slack_url": lambda self, _notify=None: "",
             "pushover_token": lambda self, _notify=None: None,
+            "session_pushover_token": lambda self, _session=None: None,
         },
     )()
     engine.last_error = None
@@ -271,6 +272,7 @@ def test_regular_halt_skips_pool_entry_alert(tmp_path):
         {
             "slack_url": lambda self, _notify=None: "",
             "pushover_token": lambda self, _notify=None: None,
+            "session_pushover_token": lambda self, _session=None: None,
         },
     )()
     engine.last_error = None
@@ -351,6 +353,7 @@ def test_confirm_arm_is_rule_scoped_not_shared_notify(tmp_path):
         {
             "slack_url": lambda self, _notify=None: "",
             "pushover_token": lambda self, _notify=None: None,
+            "session_pushover_token": lambda self, _session=None: None,
         },
     )()
     engine.last_error = None
@@ -672,6 +675,7 @@ def test_fire_alert_uses_trigger_as_pushover_label(tmp_path):
         {
             "slack_url": lambda self, _notify=None: "",
             "pushover_token": lambda self, _notify=None: None,
+            "session_pushover_token": lambda self, _session=None: None,
         },
     )()
     engine.last_error = None

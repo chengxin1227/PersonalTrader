@@ -85,24 +85,24 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
 
     extra = [
         CheckReminder(
-            "afterhours-2h30",
-            time(18, 30),
-            ("afterhours-top5", "afterhours-halt-or-5d-boost"),
-            "盘后2.5小时",
+            "afterhours-2h",
+            time(18, 0),
+            ("afterhours-top5",),
+            "盘后2小时",
         ),
         CheckReminder(
-            "afterhours-3h",
-            time(19, 0),
-            ("afterhours-top5", "afterhours-halt-or-5d-boost"),
-            "盘后3小时",
+            "afterhours-3h45",
+            time(19, 45),
+            ("afterhours-top5",),
+            "盘后3小时45分",
         ),
     ]
-    mid = due_check_reminders(datetime(2026, 10, 15, 18, 30, tzinfo=ET), extra=extra)
-    assert [item.key for item in mid] == ["afterhours-2h30"]
-    assert mid[0].rule_ids == ("afterhours-top5", "afterhours-halt-or-5d-boost")
+    mid = due_check_reminders(datetime(2026, 10, 15, 18, 0, tzinfo=ET), extra=extra)
+    assert [item.key for item in mid] == ["afterhours-2h"]
+    assert mid[0].rule_ids == ("afterhours-top5",)
     assert [
-        item.key for item in due_check_reminders(datetime(2026, 10, 15, 19, 0, tzinfo=ET), extra=extra)
-    ] == ["afterhours-3h"]
+        item.key for item in due_check_reminders(datetime(2026, 10, 15, 19, 45, tzinfo=ET), extra=extra)
+    ] == ["afterhours-3h45"]
 
     assert [item.rule_ids for item in due_check_reminders(datetime(2026, 10, 15, 9, 15, tzinfo=ET))] == [
         ("premarket-sudden-10",)
@@ -192,14 +192,14 @@ def test_session_late_window_is_second_half_of_each_session():
 
 def test_afterhours_board_slot_is_each_half_hour():
     assert afterhours_board_slot(datetime(2026, 10, 6, 15, 59, tzinfo=ET)) is None
-    # First board at 16:05 ET (≈10:05 NZ); nothing before that.
+    # First board at 16:15 ET (≈10:15 NZ); nothing before that.
     assert afterhours_board_slot(datetime(2026, 10, 6, 16, 0, tzinfo=ET)) is None
-    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 4, tzinfo=ET)) is None
-    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 5, tzinfo=ET)) == datetime(
-        2026, 10, 6, 16, 5, tzinfo=ET
+    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 14, tzinfo=ET)) is None
+    assert afterhours_board_slot(datetime(2026, 10, 6, 16, 15, tzinfo=ET)) == datetime(
+        2026, 10, 6, 16, 15, tzinfo=ET
     )
     assert afterhours_board_slot(datetime(2026, 10, 6, 16, 29, tzinfo=ET)) == datetime(
-        2026, 10, 6, 16, 5, tzinfo=ET
+        2026, 10, 6, 16, 15, tzinfo=ET
     )
     assert afterhours_board_slot(datetime(2026, 10, 6, 16, 30, tzinfo=ET)) == datetime(
         2026, 10, 6, 16, 30, tzinfo=ET
@@ -228,8 +228,8 @@ def test_session_board_slot_covers_premarket_and_regular():
         2026, 10, 6, 11, 0, tzinfo=ET
     )
     assert session_board_slot("regular", datetime(2026, 10, 6, 16, 0, tzinfo=ET)) is None
-    assert session_board_slot("afterhours", datetime(2026, 10, 6, 16, 5, tzinfo=ET)) == (
-        afterhours_board_slot(datetime(2026, 10, 6, 16, 5, tzinfo=ET))
+    assert session_board_slot("afterhours", datetime(2026, 10, 6, 16, 15, tzinfo=ET)) == (
+        afterhours_board_slot(datetime(2026, 10, 6, 16, 15, tzinfo=ET))
     )
 
 

@@ -41,6 +41,10 @@ class Condition(BaseModel):
     min_regular_volume: Optional[float] = None
     min_prior_change: Optional[float] = None
     min_fade_from_high: Optional[float] = None
+    # Near-peak hold: peak − current must be strictly below this many pp.
+    max_fade_from_high: Optional[float] = None
+    # Rebound: current gain >= post-peak trough + this many pp.
+    min_rebound_from_trough: Optional[float] = None
     prior_change_lag_minutes: int = Field(default=5, ge=0)
     require_new_high: bool = False
     require_uptrend: bool = False
@@ -88,7 +92,7 @@ class Rule(BaseModel):
     confirm_value: Optional[float] = None
     # After the first delivered alert for this rule+symbol in the session day, do not re-alert.
     once_per_session: bool = False
-    # When true, alerted names go to 我的自选 only — no dedicated Tonghuashun rule group.
+    # When true, alerted names skip the rule-name group (still 今日自选 + 今日盘x分组).
     skip_ths_group: bool = False
     # top_n boards: when false, refresh/record (同花顺) only — no Slack/Pushover digest.
     board_notify: bool = True
@@ -218,9 +222,9 @@ class ImportantReminderConfig(BaseModel):
 
 
 class ImportantConfig(BaseModel):
-    # All single-ticket alerts land here.
+    # All single-ticket alerts land here; cleared once per ET day.
     ths_group: str = "今日自选"
-    # During each session's second half, singles also land here.
+    # Unused (kept for config compat); late-half 我的自选 writing is disabled.
     late_ths_group: str = "我的自选"
     high_priority_rule_ids: list[str] = Field(default_factory=list)
     watchlist: ImportantWatchlistConfig = Field(default_factory=ImportantWatchlistConfig)

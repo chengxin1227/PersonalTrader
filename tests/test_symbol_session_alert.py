@@ -37,6 +37,7 @@ def _engine(tmp_path) -> tuple[MonitorEngine, list[str], Store]:
         {
             "slack_url": lambda self, _notify=None: "",
             "pushover_token": lambda self, _notify=None: None,
+            "session_pushover_token": lambda self, _session=None: None,
         },
     )()
     engine.last_error = None

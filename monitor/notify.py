@@ -9,14 +9,11 @@ from monitor.config import ROOT, Settings
 
 _SUFFIX = re.compile(r"[^A-Za-z0-9]+")
 
-# Pushover "From" is the application name for the API token. Each halt-or-5d OR-leg
-# needs its own app named as the Chinese trigger; tokens live under these env keys.
-HALT_OR_5D_FROM_ENV = {
-    "今日盘中一度涨超50%后续超10%": "PUSHOVER_TOKEN_HALT_FROM_TODAY_50",
-    "过去5日曾收盘涨超50%后续超10%": "PUSHOVER_TOKEN_HALT_FROM_PAST_50",
-    "今日盘中一度涨超100%后续超5%": "PUSHOVER_TOKEN_HALT_FROM_TODAY_100",
-    "过去5日曾收盘涨超100%后续超5%": "PUSHOVER_TOKEN_HALT_FROM_PAST_100",
-    "涨停后续超5%": "PUSHOVER_TOKEN_HALT_FROM_LIMIT_UP",
+# Pushover From = application name. One app per ET session (今日盘前/盘中/盘后自选).
+SESSION_PUSHOVER_ENV = {
+    "盘前": "PUSHOVER_TOKEN_PREMARKET",
+    "盘中": "PUSHOVER_TOKEN_REGULAR",
+    "盘后": "PUSHOVER_TOKEN_AFTERHOURS",
 }
 
 
@@ -25,10 +22,11 @@ def env_suffix(notify: str) -> str:
 
 
 class NotifyRoutes:
-    """Per-rule Slack webhooks and Pushover application tokens.
+    """Slack webhooks (optional) and session Pushover application tokens.
 
-    A rule's ``notify`` name maps to ``SLACK_WEBHOOK_<NAME>`` and
-    ``PUSHOVER_TOKEN_<NAME>``. Missing names use the default webhook and token.
+    Market alerts use the session token (盘前/盘中/盘后 → 今日盘前/盘中/盘后自选).
+    A rule's ``notify`` name still maps to ``SLACK_WEBHOOK_<NAME>`` when Slack is on.
+    Per-rule ``PUSHOVER_TOKEN_<NAME>`` remains as a fallback only when no session token.
     """
 
     def __init__(
@@ -36,31 +34,46 @@ class NotifyRoutes:
         values: dict[str, str],
         default_slack: str = "",
         default_token: str = "",
+        *,
+        slack_enabled: bool = True,
     ) -> None:
         self._values = {key: value for key, value in values.items() if value}
         self.default_slack = default_slack
         self.default_token = default_token
+        self.slack_enabled = slack_enabled
 
     @classmethod
     def load(cls, settings: Settings) -> NotifyRoutes:
-        return cls(_route_values(), settings.slack_webhook_url, settings.pushover_token)
+        return cls(
+            _route_values(),
+            settings.slack_webhook_url,
+            settings.pushover_token,
+            slack_enabled=settings.slack_enabled,
+        )
 
     def slack_url(self, notify: str | None) -> str:
+        if not self.slack_enabled:
+            return ""
         return self._pick("SLACK_WEBHOOK_", notify, self.default_slack)
 
     def pushover_token(self, notify: str | None) -> str:
         return self._pick("PUSHOVER_TOKEN_", notify, self.default_token)
 
-    def halt_or_5d_from_token(self, trigger: str | None) -> str:
-        """Token whose Pushover app name is the OR-leg (shown as From)."""
-        if not trigger:
-            return ""
-        key = HALT_OR_5D_FROM_ENV.get(trigger.strip())
-        if not key:
-            return ""
-        return self._values.get(key, "")
+    def session_pushover_token(self, session: str | None) -> str:
+        """Token for 今日盘前/盘中/盘后自选; falls back to default ``PUSHOVER_TOKEN``."""
+        key = SESSION_PUSHOVER_ENV.get((session or "").strip())
+        if key:
+            token = self._values.get(key, "")
+            if token:
+                return token
+        return self.default_token
+
+    def has_session_pushover(self, session: str | None) -> bool:
+        return bool(self.session_pushover_token(session))
 
     def has_slack(self, notify: str) -> bool:
+        if not self.slack_enabled:
+            return False
         return bool(self._values.get(f"SLACK_WEBHOOK_{env_suffix(notify)}"))
 
     def has_pushover(self, notify: str) -> bool:

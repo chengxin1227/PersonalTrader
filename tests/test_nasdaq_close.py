@@ -31,31 +31,10 @@ def _nasdaq_rule() -> Rule:
     )
 
 
-def test_rules_yaml_loads_nasdaq_close_rule():
-    from monitor.engine import _skips_ths_rule_group
-
+def test_rules_yaml_has_no_nasdaq_close_rule_yet():
     config = load_rules(ROOT / "config" / "rules.yaml")
-    rule = next(rule for rule in config.rules if rule.id == "regular-nasdaq-2")
-    assert rule.symbol == "^IXIC"
-    assert uses_yahoo_quote(rule.symbol)
-    assert yahoo_ticker(rule.symbol) == "^IXIC"
-    assert rule.condition.type is ConditionType.REGULAR_CLOSE
-    assert rule.condition.abs_change is True
-    assert rule.condition.value == 2
-    assert rule.condition.close_minutes == 5
-    assert rule.notify == "Important-reminder"
-    assert _is_symbol_close_rule(rule)
-    # Index close alerts must never create/clear a Tonghuashun rule group.
-    session_names = {
-        item.name
-        for item in config.rules
-        if item.enabled
-        and item.name
-        and (item.group or item.condition_session) == "盘中"
-        and not _is_symbol_close_rule(item)
-        and not _skips_ths_rule_group(item)
-    }
-    assert "纳斯达克涨跌超2%" not in session_names
+    assert not any(rule.id == "regular-nasdaq-2" for rule in config.rules)
+    assert "afterhours-halt-or-5d-boost" in {rule.id for rule in config.rules}
 
 
 def test_match_symbol_close_uses_yahoo_for_ixic(tmp_path):

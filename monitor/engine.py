@@ -135,6 +135,24 @@ def _is_peak_fade_board(rule: Rule) -> bool:
     )
 
 
+def _is_peak_rebound_rule(rule: Rule) -> bool:
+    """Singles: current gain rebound from post-peak trough by N pp."""
+    return (
+        rule.condition.min_rebound_from_trough is not None
+        and not _is_leaderboard_rule(rule)
+        and rule.condition.type is ConditionType.REGULAR_GAIN
+    )
+
+
+def _is_near_peak_rule(rule: Rule) -> bool:
+    """Singles: session gain above value and still within max_fade_from_high of peak."""
+    return (
+        rule.condition.max_fade_from_high is not None
+        and not _is_leaderboard_rule(rule)
+        and rule.condition.type is ConditionType.REGULAR_GAIN
+    )
+
+
 def _is_new_high_rule(rule: Rule) -> bool:
     return rule.condition.require_new_high
 
@@ -738,6 +756,16 @@ class MonitorEngine:
                 for rule in fade_rules:
                     matched = await self._match_peak_fade_rule(rule)
                     fired.extend(await self._emit_trend_matches(rule, matched, state))
+            rebound_rules = [rule for rule in open_rules if _is_peak_rebound_rule(rule)]
+            if rebound_rules:
+                for rule in rebound_rules:
+                    matched = await self._match_peak_rebound_rule(rule)
+                    fired.extend(await self._emit_trend_matches(rule, matched, state))
+            near_peak_rules = [rule for rule in open_rules if _is_near_peak_rule(rule)]
+            if near_peak_rules:
+                for rule in near_peak_rules:
+                    matched = await self._match_near_peak_rule(rule)
+                    fired.extend(await self._emit_trend_matches(rule, matched, state))
             new_high_rules = [rule for rule in open_rules if _is_new_high_rule(rule)]
             if new_high_rules and not self._spike_loop_running and not self._regular_loop_running:
                 for rule in new_high_rules:
@@ -778,6 +806,8 @@ class MonitorEngine:
                     rule in afterhours_rules
                     or _is_spike_rule(rule)
                     or _is_peak_fade_rule(rule)
+                    or _is_peak_rebound_rule(rule)
+                    or _is_near_peak_rule(rule)
                     or _is_new_high_rule(rule)
                     or _is_breaker_rule(rule)
                     or _is_leaderboard_rule(rule)
@@ -1092,6 +1122,8 @@ class MonitorEngine:
                         if (
                             _is_new_high_rule(rule)
                             or _is_peak_fade_rule(rule)
+                            or _is_peak_rebound_rule(rule)
+                            or _is_near_peak_rule(rule)
                             or _is_leaderboard_rule(rule)
                             or _is_day_spike_rule(rule)
                         ):
@@ -1142,6 +1174,34 @@ class MonitorEngine:
                     ]
                     for rule in regular_fade:
                         matched = await self._match_peak_fade_rule(rule)
+                        self._note_opend_ok()
+                        if not matched:
+                            continue
+                        async with self._lock:
+                            state = self.store.load_state()
+                            await self._emit_trend_matches(rule, matched, state)
+                            self.store.save_state(state)
+                    regular_rebound = [
+                        rule
+                        for rule in config.rules
+                        if rule.enabled and _is_peak_rebound_rule(rule)
+                    ]
+                    for rule in regular_rebound:
+                        matched = await self._match_peak_rebound_rule(rule)
+                        self._note_opend_ok()
+                        if not matched:
+                            continue
+                        async with self._lock:
+                            state = self.store.load_state()
+                            await self._emit_trend_matches(rule, matched, state)
+                            self.store.save_state(state)
+                    regular_near_peak = [
+                        rule
+                        for rule in config.rules
+                        if rule.enabled and _is_near_peak_rule(rule)
+                    ]
+                    for rule in regular_near_peak:
+                        matched = await self._match_near_peak_rule(rule)
                         self._note_opend_ok()
                         if not matched:
                             continue
@@ -1892,7 +1952,7 @@ class MonitorEngine:
             if not symbols:
                 return
             try:
-                # Reminder sync replaces 我的自选 with current rule-group leaders.
+                # Reminder sync replaces 今日自选 with current rule-group leaders.
                 await self.ths.replace_important(symbols, session)
                 logger.info(
                     "同花顺 %s reminder sync: %s",
@@ -1906,16 +1966,18 @@ class MonitorEngine:
         text = check_reminder_text(label, names)
         routes = getattr(self, "routes", None)
         notify = CHECK_REMINDER_NOTIFY
+        # Check reminders are afterhours (18:00 / 19:45 ET) → 今日盘后自选.
+        session = et_session_name() or "盘后"
         slack_url = ""
         token = ""
         if routes is not None and routes.has_slack(notify):
             slack_url = routes.slack_url(notify)
-        if routes is not None and routes.has_pushover(notify):
-            token = routes.pushover_token(notify)
+        if routes is not None:
+            token = routes.session_pushover_token(session)
         if self.pushover is None and self.slack is None:
             return
         if not token and not slack_url:
-            raise RuntimeError(f"{notify} has no Slack webhook or Pushover token")
+            raise RuntimeError(f"session {session} has no Pushover token (and Slack off)")
         delivered = False
         errors: list[Exception] = []
         if self.pushover is not None and token:
@@ -2000,7 +2062,6 @@ class MonitorEngine:
             logger.info("ALERT important-watched | %s", alert.message.replace("\n", " | "))
             if self.ths.configured:
                 self.ths.set_important_group(config.important.ths_group)
-                self.ths.set_late_group(config.important.late_ths_group)
                 task = asyncio.create_task(
                     self._watched_symbol_tonghuashun(symbol, session, config)
                 )
@@ -2013,8 +2074,7 @@ class MonitorEngine:
         async with self._ths_lock:
             try:
                 await self.ths.add_important([symbol], session)
-                if _wants_late_watchlist(session=session):
-                    await self.ths.add_late_watchlist([symbol], session)
+                await self.ths.add_daily([symbol], session)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 watched symbol failed for %s: %s", symbol, exc)
 
@@ -2628,6 +2688,136 @@ class MonitorEngine:
             rule.id,
             [quote.symbol for quote in matched],
             f"New high after {rule.condition.value:g}%",
+        )
+        return matched
+
+    async def _match_peak_rebound_rule(self, rule: Rule) -> list[Quote]:
+        """Halt/50% pool: after late window, current >= post-peak trough + rebound pp."""
+        client = self._trend_moomoo or self.moomoo
+        rebound_min = rule.condition.min_rebound_from_trough
+        if client is None or rebound_min is None:
+            return []
+        if not session_late_window(
+            "regular",
+            hours=rule.condition.late_session_hours,
+        ):
+            return []
+        symbols = self._halt_or_day_pool_symbols(rule)
+        if not symbols:
+            return []
+        day = now_et().date().isoformat()
+        snaps = await self._moomoo_snapshots(client, sorted(symbols))
+        if not snaps:
+            return []
+        matched: list[Quote] = []
+        for symbol in symbols:
+            key = symbol.upper()
+            quote = snaps.get(key) or snaps.get(symbol)
+            if quote is None or quote.change_pct is None:
+                continue
+            if rule.condition.min_volume is not None and (
+                quote.volume is None or quote.volume <= rule.condition.min_volume
+            ):
+                continue
+            peak_touch = regular_touch_change_pct(
+                change_pct=quote.change_pct,
+                high=quote.daily_high,
+                prev_close=quote.prev_close,
+                pre_high=quote.premarket_high,
+            )
+            observed = quote.change_pct
+            candidates = [
+                value
+                for value in (peak_touch, quote.session_high_pct, quote.change_pct)
+                if value is not None
+            ]
+            if candidates:
+                best = max(candidates)
+                self.store.note_peak_gain(day, key, best)
+                observed = quote.change_pct
+            peak, trough = self.store.note_peak_trough(day, key, observed)
+            quote.session_high_pct = peak
+            if peak <= trough:
+                continue
+            lift = quote.change_pct - trough
+            if lift < rebound_min:
+                continue
+            if self.verbose:
+                logger.info(
+                    "  %s %s: rebound %.1fpp (trough %.1f%% → %.1f%%, peak %.1f%%)",
+                    rule.id,
+                    key,
+                    lift,
+                    trough,
+                    quote.change_pct,
+                    peak,
+                )
+            matched.append(quote)
+        matched.sort(key=lambda item: item.change_pct or float("-inf"), reverse=True)
+        self._log_saved_matches(
+            rule.id, [quote.symbol for quote in matched], "Regular peak rebound"
+        )
+        return matched
+
+    async def _match_near_peak_rule(self, rule: Rule) -> list[Quote]:
+        """After late window: current gain > value and peak − current < max_fade_from_high."""
+        client = self._trend_moomoo or self.moomoo
+        fade_max = rule.condition.max_fade_from_high
+        if client is None or fade_max is None:
+            return []
+        if not session_late_window(
+            "regular",
+            hours=rule.condition.late_session_hours,
+        ):
+            return []
+        found = await client.regular_gainers(
+            rule.condition.value,
+            max_market_cap=rule.condition.max_market_cap,
+            min_market_cap=rule.condition.min_market_cap,
+            min_volume=rule.condition.min_volume,
+        )
+        if not found:
+            return []
+        day = now_et().date().isoformat()
+        matched: list[Quote] = []
+        for quote in found:
+            if quote.change_pct is None or quote.change_pct <= rule.condition.value:
+                continue
+            if rule.condition.min_volume is not None and (
+                quote.volume is None or quote.volume <= rule.condition.min_volume
+            ):
+                continue
+            peak_touch = regular_touch_change_pct(
+                change_pct=quote.change_pct,
+                high=quote.daily_high,
+                prev_close=quote.prev_close,
+                pre_high=quote.premarket_high,
+            )
+            candidates = [
+                value
+                for value in (peak_touch, quote.session_high_pct, quote.change_pct)
+                if value is not None
+            ]
+            if not candidates:
+                continue
+            peak = self.store.note_peak_gain(day, quote.symbol, max(candidates))
+            quote.session_high_pct = peak
+            fade = peak - quote.change_pct
+            if fade >= fade_max:
+                continue
+            if self.verbose:
+                logger.info(
+                    "  %s %s: near peak fade %.1fpp (%.1f%% → %.1f%%)",
+                    rule.id,
+                    quote.symbol,
+                    fade,
+                    peak,
+                    quote.change_pct,
+                )
+            matched.append(quote)
+        matched.sort(key=lambda item: item.change_pct or float("-inf"), reverse=True)
+        self._log_saved_matches(
+            rule.id, [quote.symbol for quote in matched], "Regular near peak"
         )
         return matched
 
@@ -3669,7 +3859,12 @@ class MonitorEngine:
             title = f"{format_nz_clock(slot)} {rule.name}"
             reason = rule.board_summary
             delivered = await self._deliver_digest(
-                rule.id, title, rows, rule.notify, reason=reason
+                rule.id,
+                title,
+                rows,
+                rule.notify,
+                reason=reason,
+                session=rule.group or rule.condition_session,
             )
             if not delivered:
                 self._board_retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
@@ -4051,6 +4246,7 @@ class MonitorEngine:
         rows: list[tuple[str, str]],
         notify: str | None = None,
         reason: str | None = None,
+        session: str | None = None,
     ) -> bool:
         delivered = False
         slack_url = self.routes.slack_url(notify)
@@ -4063,7 +4259,7 @@ class MonitorEngine:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Slack leaderboard failed for %s: %s", rule_id, exc)
                 self.last_error = f"Slack send failed: {exc}"
-        token = self.routes.pushover_token(notify)
+        token = self.routes.session_pushover_token(session)
         if self.pushover is not None and token and self.settings.pushover_user:
             try:
                 await self.pushover.send_digest(
@@ -4573,15 +4769,14 @@ class MonitorEngine:
         return None
 
     async def _maybe_sync_tonghuashun_groups(self, config: RulesConfig) -> None:
-        """Create groups once; clear each session's rule groups on that session's next day.
+        """Create groups once; clear each session's rule + 今日盘x分组 on that session's next day.
 
-        Shared rule groups and 今日自选/我的自选 clear the previous session's names when
-        the next session starts.
+        今日自选 clears once per ET day. Shared rule groups drop the previous session's tags
+        when the next session starts.
         """
         if not self.ths.configured:
             return
         self.ths.set_important_group(config.important.ths_group)
-        self.ths.set_late_group(config.important.late_ths_group)
         day = now_et().date().isoformat()
         names = [
             rule.name
@@ -4678,23 +4873,21 @@ class MonitorEngine:
         )
         important = self.load_config().important
         self.ths.set_important_group(important.ths_group)
-        self.ths.set_late_group(important.late_ths_group)
         want_important = _wants_important_watchlist(important, rule, board=board)
-        want_late = want_important and _wants_late_watchlist(session=session)
+        session_target = [
+            symbol.strip().upper()
+            for symbol in (important_symbols if important_symbols is not None else pin)
+            if symbol and str(symbol).strip()
+        ]
         if not board and _skips_ths_rule_group(rule):
-            # skip_ths_group: alerted names → 今日自选 (+ 我的自选 in late half).
-            target = [
-                symbol.strip().upper()
-                for symbol in (important_symbols if important_symbols is not None else pin)
-                if symbol and str(symbol).strip()
-            ]
-            if not (want_important and target):
+            # skip_ths_group: alerted names → 今日自选 + 今日盘x分组 (no rule group).
+            if not session_target:
                 return
             async with self._ths_lock:
                 try:
-                    await self.ths.add_important(target, session)
-                    if want_late:
-                        await self.ths.add_late_watchlist(target, session)
+                    if want_important:
+                        await self.ths.add_important(session_target, session)
+                    await self.ths.add_daily(session_target, session)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "同花顺 update failed for %s (%s): %s",
@@ -4703,7 +4896,7 @@ class MonitorEngine:
                         exc,
                     )
                     await self._note_problem(
-                        f"Tonghuashun add failed for {', '.join(dict.fromkeys(target))}: {exc}"
+                        f"Tonghuashun add failed for {', '.join(dict.fromkeys(session_target))}: {exc}"
                     )
             return
         replace_board = board and (
@@ -4715,6 +4908,7 @@ class MonitorEngine:
             # Plain *-top5 groups keep only the current leaders.
             symbols = [symbol for symbol in pin if symbol]
             pin = list(symbols)
+            session_target = list(pin)
         async with self._ths_lock:
             try:
                 members = await self.ths.members(
@@ -4803,16 +4997,11 @@ class MonitorEngine:
                     session=session,
                     tag_symbols=pin if not replace_board else ordered,
                 )
-                if want_important:
-                    target = [
-                        symbol.strip().upper()
-                        for symbol in (important_symbols if important_symbols is not None else pin)
-                        if symbol and str(symbol).strip()
-                    ]
-                    if target:
-                        await self.ths.add_important(target, session)
-                        if want_late:
-                            await self.ths.add_late_watchlist(target, session)
+                if want_important and session_target:
+                    await self.ths.add_important(session_target, session)
+                # Always mirror into 今日盘前/盘中/盘后分组 (bump; boards do not replace).
+                if session_target:
+                    await self.ths.add_daily(session_target, session)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 update failed for %s: %s", group, exc)
                 failed = [
@@ -4920,6 +5109,20 @@ class MonitorEngine:
         logger.info("Sent test alert for %s at %s", symbol, quote.price)
         return alert
 
+    def _pushover_session_for(self, alert: Alert) -> str | None:
+        """Session that owns this alert's Pushover app (今日盘前/盘中/盘后自选)."""
+        try:
+            config = self.load_config()
+        except Exception:  # noqa: BLE001
+            config = None
+        if config is not None:
+            rule = next((item for item in config.rules if item.id == alert.rule_id), None)
+            if rule is not None:
+                session = (rule.group or rule.condition_session or "").strip()
+                if session:
+                    return session
+        return et_session_name()
+
     async def _deliver(
         self,
         alert: Alert,
@@ -4936,12 +5139,7 @@ class MonitorEngine:
                 logger.warning("Slack send failed for %s: %s", alert.rule_id, exc)
                 errors.append(f"Slack send failed: {exc}")
                 await self._note_problem(f"Slack send failed: {exc}")
-        token = self.routes.pushover_token(alert.notify)
-        if str(alert.rule_id).endswith("-halt-or-5d-boost"):
-            # From = Pushover application name → use per-OR-leg app when configured.
-            from_token = self.routes.halt_or_5d_from_token(alert.label)
-            if from_token:
-                token = from_token
+        token = self.routes.session_pushover_token(self._pushover_session_for(alert))
         if self.pushover is not None and token and self.settings.pushover_user:
             try:
                 await self.pushover.send_alert(

@@ -75,6 +75,16 @@ def test_peak_gains_keep_the_intraday_high(tmp_path):
     assert store.peak_gain("2026-10-08", "AAA") is None
 
 
+def test_peak_trough_tracks_low_after_high(tmp_path):
+    store = Store(tmp_path)
+    assert store.note_peak_trough("2026-10-09", "aaa", 80.0) == (80.0, 80.0)
+    assert store.note_peak_trough("2026-10-09", "AAA", 40.0) == (80.0, 40.0)
+    assert store.note_peak_trough("2026-10-09", "aaa", 55.0) == (80.0, 40.0)
+    assert store.note_peak_trough("2026-10-09", "aaa", 95.0) == (95.0, 95.0)
+    assert store.note_peak_trough("2026-10-09", "aaa", 70.0) == (95.0, 70.0)
+    assert store.peak_trough("2026-10-09", "aaa") == (95.0, 70.0)
+
+
 def test_afterhours_peaks_stay_separate_from_regular_peaks(tmp_path):
     store = Store(tmp_path)
     store.note_peak_gain("2026-10-09", "AAA", 90.0)

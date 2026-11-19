@@ -24,14 +24,13 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_rules_yaml_loads_important_block():
     config = load_rules(ROOT / "config" / "rules.yaml")
     assert config.important.ths_group == "今日自选"
-    assert config.important.late_ths_group == "我的自选"
     assert config.important.high_priority_rule_ids == []
-    # 12:30 / 13:00 NZ check reminders stay high-priority in _deliver_check_reminder.
+    # 12:00 / 13:45 NZ check reminders stay high-priority in _deliver_check_reminder.
     assert {item.key for item in config.important.reminders} == {
-        "afterhours-2h30",
-        "afterhours-3h",
+        "afterhours-2h",
+        "afterhours-3h45",
     }
-    # All singles → 今日自选; late half also → 我的自选. Lists below unused (kept empty).
+    # All singles → 今日自选 (半点榜默认不进). Lists below unused (kept empty).
     assert config.important.watchlist.always == []
     assert config.important.watchlist.event == []
     assert config.important.watchlist.afterhours_open == []
@@ -40,85 +39,81 @@ def test_rules_yaml_loads_important_block():
     assert config.important.watchlist.reminder_sync == []
     assert config.important.watched_symbols.symbols == []
     keys = [item.key for item in config.important.reminders]
-    assert keys == ["afterhours-2h30", "afterhours-3h"]
+    assert keys == ["afterhours-2h", "afterhours-3h45"]
+    assert [item.at for item in config.important.reminders] == ["18:00", "19:45"]
     assert all(
-        item.rule_ids == ["afterhours-top5", "afterhours-halt50-or-5d50-board"]
+        item.rule_ids
+        == ["afterhours-top5", "afterhours-halt50-or-5d50-board"]
         for item in config.important.reminders
     )
     assert all(item.sync_watchlist is False for item in config.important.reminders)
+
+    assert [rule.id for rule in config.rules] == [
+        "afterhours-top5",
+        "afterhours-halt-or-5d-boost",
+        "afterhours-halt50-or-5d50-board",
+        "afterhours-sudden-10",
+        "regular-top5",
+        "regular-halt50-fade-board",
+        "regular-halt50-rebound",
+        "regular-near-peak-35",
+        "premarket-top5",
+        "premarket-sudden-10",
+    ]
+    for rule_id, name in (
+        ("regular-top5", "今日盘中涨幅最高前5的股票"),
+        ("premarket-top5", "今日盘前涨幅最高前5的股票"),
+    ):
+        board = next(rule for rule in config.rules if rule.id == rule_id)
+        assert board.name == name
+        assert board.condition.top_n == 5
+        assert board.condition.min_volume == 100_000
+        assert board.condition.min_market_cap == 1_000_000
+        assert board.condition.max_market_cap == 1_000_000_000
+    fade = next(rule for rule in config.rules if rule.id == "regular-halt50-fade-board")
+    assert fade.name == "盘中熔断或50%回落的股票"
+    assert fade.board_notify is False
+    assert fade.condition.min_fade_from_high == 0
+    rebound = next(rule for rule in config.rules if rule.id == "regular-halt50-rebound")
+    assert rebound.name == "盘中熔断或50%回升的股票"
+    assert rebound.condition.min_rebound_from_trough == 10
+    assert rebound.condition.late_session_hours == 3.75
+    assert rebound.once_per_session is True
+    near = next(rule for rule in config.rules if rule.id == "regular-near-peak-35")
+    assert near.name == "盘中涨超35%接近最高的股票"
+    assert near.condition.value == 35
+    assert near.condition.max_fade_from_high == 10
+    assert near.condition.min_volume == 10_000
+    assert near.condition.late_session_hours == 3.75
+    assert near.once_per_session is True
+    top5 = next(rule for rule in config.rules if rule.id == "afterhours-top5")
+    assert top5.name == "今日盘后涨幅最高前5的股票"
+    assert top5.condition.top_n == 5
+    assert top5.condition.min_volume == 100_000
+    assert top5.condition.min_market_cap == 1_000_000
+    assert top5.condition.max_market_cap == 1_000_000_000
+    boost = next(rule for rule in config.rules if rule.id == "afterhours-halt-or-5d-boost")
     board = next(
         rule for rule in config.rules if rule.id == "afterhours-halt50-or-5d50-board"
     )
-    boost = next(
-        rule for rule in config.rules if rule.id == "afterhours-halt-or-5d-boost"
-    )
-    assert board.notify == "Halt-5d-board"
+    assert boost.once_per_session is True
+    assert boost.condition.top_n is None
     assert board.condition.top_n == 5
     assert board.condition.value == boost.condition.value
     assert board.condition.min_regular_touch == boost.condition.min_regular_touch
-    assert board.condition.recent_day_count == boost.condition.recent_day_count
     assert board.condition.require_circuit_breaker is True
     assert [
         (t.min_recent_day_change, t.value) for t in board.condition.day_gain_tiers
     ] == [(t.min_recent_day_change, t.value) for t in boost.condition.day_gain_tiers]
-    fade = next(rule for rule in config.rules if rule.id == "regular-halt50-fade-board")
-    assert fade.board_notify is False
-    assert fade.notify is None
-    assert fade.condition.top_n == 50
-    assert fade.condition.board_interval_minutes == 1
-    assert fade.condition.min_regular_touch == 50
-    assert fade.condition.include_circuit_breaker is True
-    assert fade.condition.min_fade_from_high == 0
-
-    assert not any(
-        rule.id in {
-            "afterhours-5d50-board",
-            "regular-5d50-board",
-            "premarket-5d50-board",
-        }
-        for rule in config.rules
-    )
-    assert not any(rule.name == "5日曾涨超50%的股票" for rule in config.rules)
-
-    day25 = [rule for rule in config.rules if rule.id.endswith("-day25-10")]
-    assert len(day25) == 3
-    assert {rule.name for rule in day25} == {"盘中收盘涨超25%后续涨超10%的股票"}
-    assert {rule.notify for rule in day25} == {"Day-25-boost"}
-    assert all(rule.condition.intraday_touch is False for rule in day25)
-    assert all(rule.cooldown_minutes == 240 for rule in day25)
-    assert all(rule.confirm_delay_minutes == 10 for rule in day25)
-    assert all(rule.confirm_value == 0 for rule in day25)
-    merged = [rule for rule in config.rules if rule.id.endswith("-halt-or-5d-boost")]
-    assert len(merged) == 3
-    assert {rule.name for rule in merged} == {
-        "熔断或5日涨超50%后续超10%或曾涨超100%后续超5%的股票"
-    }
-    assert {rule.notify for rule in merged} == {"Halt-boost"}
-    assert all(rule.condition.value == 5 for rule in merged)
-    assert all(rule.condition.require_circuit_breaker for rule in merged)
-    assert all(rule.condition.min_regular_touch == 50 for rule in merged)
-    assert all(rule.condition.recent_day_count == 5 for rule in merged)
-    assert all(len(rule.condition.day_gain_tiers) == 2 for rule in merged)
-    assert all(
-        [(t.min_recent_day_change, t.value) for t in rule.condition.day_gain_tiers]
-        == [(50, 10), (100, 5)]
-        for rule in merged
-    )
-    assert all(rule.cooldown_minutes == 240 for rule in merged)
-    assert all(rule.confirm_delay_minutes == 0 for rule in merged)
-    assert all(rule.confirm_value is None for rule in merged)
-    assert not any(rule.id.endswith("-halt-or-day50") for rule in config.rules)
-    assert not any(
-        rule.id.endswith("-5d-boost") and "halt-or" not in rule.id
-        for rule in config.rules
-    )
 
 
 def test_important_reminders_merge_into_due_window():
     config = load_rules(ROOT / "config" / "rules.yaml")
     extra = _important_reminders(config.important)
-    due = due_check_reminders(datetime(2026, 10, 15, 19, 1, tzinfo=ET), extra=extra)
-    assert [item.key for item in due] == ["afterhours-3h"]
+    due = due_check_reminders(datetime(2026, 10, 15, 19, 45, tzinfo=ET), extra=extra)
+    assert [item.key for item in due] == ["afterhours-3h45"]
+    due_early = due_check_reminders(datetime(2026, 10, 15, 18, 0, tzinfo=ET), extra=extra)
+    assert [item.key for item in due_early] == ["afterhours-2h"]
 
 
 def _sudden(session: str, rule_id: str) -> Rule:
@@ -180,7 +175,7 @@ def test_live_rules_top5_skips_important_and_session_groups():
     config = load_rules(ROOT / "config" / "rules.yaml").important
     top5 = Rule(
         id="afterhours-top5",
-        name="盘后涨幅最高前5的股票",
+        name="今日盘后涨幅最高前5的股票",
         description="d",
         group="盘后",
         symbol="*",

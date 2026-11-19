@@ -1,0 +1,394 @@
+# The monitor reloads this file on every poll, so you can change rules without restarting.
+#
+# 规则按 afterhours（盘后）、regular（盘中）、premarket（盘前）分组，放在哪一组就是哪个时段，要和条件一致。
+# name 是短名字，也是同花顺的分组名。
+# description 是单票提醒下面的解释；board_description 是半点前N digest 下面的解释。
+# notify 对应 .env 里的 SLACK_WEBHOOK_<NAME> / PUSHOVER_TOKEN_<NAME>。
+# 盘后半点榜：第一次 16:05 ET（≈10:05 NZ），之后每半小时；18:30/19:00 ET（≈12:30/13:00 NZ）重点提醒。
+# Top5 半点只写入规则分组（清空后按涨幅从高到低）；今日自选只收单票，不进前5；后半段单票另进我的自选。
+
+poll_interval_seconds: 2
+scanner_interval_seconds: 2
+background_scan_interval_seconds: 5
+poll_when_closed: true
+# Alpaca only. Moomoo ignores these.
+# feed: iex
+# scanner_feed: iex
+# stream_all_trades: false
+
+watchlist: []
+
+# 重要票：所有单票提醒进规则分组 + 今日自选（不再写盘前/盘中/盘后分组）；时段后半段起单票同时进我的自选。
+# 今日自选/我的自选按提醒先后排：新提醒/重复提醒都顶到最前，不再按盘后涨幅重排。
+# 同一只股票 5 秒内同时命中多条单票规则时只推一条：先触发的发提醒，其余仍进分组并冷却；半点榜不受影响。
+# Top5 / halt50-or-5d50（=halt-or-5d-boost 命中池前5）/ fade 半点榜只进规则分组，不进今日自选。12:30 / 13:00 NZ 重点提醒 afterhours-top5 与 afterhours-halt50-or-5d50-board。
+# regular-halt50-fade-board：盘中熔断或涨超50%池，每分钟按最高涨幅−当前涨幅写入同花顺（不发 Slack/Pushover）。
+# day25-10 / halt-or-5d-boost / sudden-10：盘前、盘中、盘后各一条，只跑当前时段（盘中不发盘前/盘后）。确认可跨时段，但提醒仍由当时段那条发出。session50 仅盘前/盘后。
+# day25-10 / halt-or-5d-boost：同一条规则对同一票每个时段只提醒一次（once_per_session）；两条规则互不影响。
+# day25-10：盘中收盘涨超25%（不是盘中最高），后续涨超10%；第一次超10%只记时，满10分钟后再超0%才提醒。
+# halt-or-5d-boost：今日盘中一度超50%或过去5日（不含今天）曾收盘超50%后时段超10%；今日盘中一度超100%、涨停或过去5日曾收盘超100%后时段超5%；达标即提醒（无10分钟确认）。盘中不进池推送；盘前/盘后仍可在首次进池时推一次。进规则分组 + 今日自选（后半段另进我的自选）。
+# sudden-10：时段后半段（全时段时长的一半：盘前06:45–09:30、盘中12:45–16:00、盘后18:00–20:00 ET），观察池只收时段涨幅 0%–20%（抓从 0% 附近突然拉升），约5分钟内涨超10%（价>$0.1，市值$100万–$10亿）；第一次与确认后均进规则分组 + 今日自选（后半段另进我的自选）。已涨超20%的不再进池。
+# session50：盘前或盘后涨幅超50%（成交量>1万，市值$100万–$10亿）提醒；进规则分组 + 今日自选（后半段另进我的自选）。盘中不跑。
+# nasdaq-2：盘中收盘前（默认最后5分钟）纳斯达克综指 IXIC（Yahoo）涨超2%或跌超2%；不进同花顺。
+# Pushover：除 12:30/13:00 NZ（18:30/19:00 ET）盘后重点提醒外，其余单票/半点榜均为普通优先级。
+important:
+  ths_group: 今日自选
+  late_ths_group: 我的自选
+  high_priority_rule_ids: []
+  watchlist:
+    # 单票一律进今日自选；时段后半段同时进我的自选。board 列表可让半点榜也进（默认空）。
+    board: []
+    always: []
+    session_late: []
+    reminder_sync: []
+  watched_symbols:
+    min_change: 10
+    cooldown_minutes: 240
+    notify: Important-reminder
+    symbols: []
+  reminders:
+    - key: afterhours-2h30
+      at: "18:30"
+      label: 盘后2.5小时
+      rule_ids:
+        - afterhours-top5
+        - afterhours-halt50-or-5d50-board
+      sync_watchlist: false
+    - key: afterhours-3h
+      at: "19:00"
+      label: 盘后3小时
+      rule_ids:
+        - afterhours-top5
+        - afterhours-halt50-or-5d50-board
+      sync_watchlist: false
+
+rules:
+  afterhours:
+    - id: afterhours-top5
+      name: 盘后涨幅最高前5的股票
+      board_description: 半点按盘后当前涨幅从高到低取前5（行内另附冲高），第一次16:05 ET（≈10:05 NZ），成交量超过10万，总市值超过100万美元且不超过10亿美元；12:30与13:00 NZ重点提醒
+      label: After-hours current-gain top 5
+      notify: Afterhours-top5
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 240
+      condition:
+        type: afterhours_gain
+        value: 0
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+        min_volume: 100000
+        top_n: 5
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: afterhours-halt50-or-5d50-board
+      name: 熔断或5日涨超50%后续超10%或曾涨超100%后续超5%前5的股票
+      board_description: 与 afterhours-halt-or-5d-boost 同一命中池（今日盘中一度超50%/过去5日曾收盘超50%后盘后超10%，或今日一度超100%/涨停/过去5日曾收盘超100%后盘后超5%），半点按盘后当前涨幅取前5（第一次16:05 ET≈10:05 NZ），成交量超过1万（16:00开盘除外），总市值超过100万美元且不超过10亿美元；12:30与13:00 NZ重点提醒
+      label: Halt-or-5d-boost AH top 5 board
+      notify: Halt-5d-board
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 240
+      condition:
+        type: afterhours_gain
+        value: 5
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+        min_volume: 10000
+        top_n: 5
+        min_regular_touch: 50
+        include_circuit_breaker: true
+        require_circuit_breaker: true
+        day_gain_tiers:
+          - min_recent_day_change: 50
+            value: 10
+          - min_recent_day_change: 100
+            value: 5
+        recent_day_count: 5
+        intraday_touch: true
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: afterhours-day25-10
+      name: 盘中收盘涨超25%后续涨超10%的股票
+      description: 盘中收盘涨超25%（非盘中最高），盘后涨幅超10%，成交量超过1万，总市值超过100万美元且不超过10亿美元；第一次超10%不提醒，满10分钟后任意时段再超0%才提醒
+      label: Day 25% close then session +10%
+      notify: Day-25-boost
+      symbol: "*"
+      enabled: true
+      once_per_session: true
+      cooldown_minutes: 240
+      confirm_delay_minutes: 10
+      confirm_value: 0
+      condition:
+        type: afterhours_gain
+        value: 10
+        min_recent_day_change: 25
+        recent_day_count: 1
+        intraday_touch: false
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+        min_volume: 10000
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: afterhours-halt-or-5d-boost
+      name: 熔断或5日涨超50%后续超10%或曾涨超100%后续超5%的股票
+      description: 今日盘中一度涨超50%或过去5个交易日（不含今天）曾收盘涨超50%且盘后超10%；今日盘中一度涨超100%、涨停或过去5日曾收盘涨超100%且盘后超5%；成交量超过1万，总市值超过100万美元且不超过10亿美元；达标即提醒
+      label: Halt or 5-day boost
+      notify: Halt-boost
+      symbol: "*"
+      enabled: true
+      once_per_session: true
+      cooldown_minutes: 240
+      condition:
+        type: afterhours_gain
+        value: 5
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+        min_volume: 10000
+        min_regular_touch: 50
+        include_circuit_breaker: true
+        require_circuit_breaker: true
+        day_gain_tiers:
+          - min_recent_day_change: 50
+            value: 10
+          - min_recent_day_change: 100
+            value: 5
+        recent_day_count: 5
+        intraday_touch: true
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: afterhours-sudden-10
+      name: 后半段5分钟涨超10%的股票
+      description: 盘后后半段（18:00–20:00 ET，全时段一半），观察时段涨幅0%–20%的票，约5分钟内涨超10%，总市值超过100万美元且不超过10亿美元，价格高于0.1美元；第一次与确认后均进规则分组和我的自选，满10分钟后时段涨幅仍不低于10%再提醒
+      label: Sudden 10%
+      notify: Sudden-10
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 240
+      confirm_delay_minutes: 10
+      confirm_value: 10
+      condition:
+        type: sudden_gain
+        value: 10
+        pool_min_change: 0
+        pool_max_change: 20
+        sudden_window_seconds: 300
+        late_session: afterhours
+        min_price: 0.1
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: afterhours-session50
+      name: 盘后涨超50%的股票
+      description: 盘后涨幅超过50%，成交量超过1万，总市值超过100万美元且不超过10亿美元；提醒，进规则分组和我的自选
+      label: After-hours +50%
+      notify: Session-50
+      symbol: "*"
+      enabled: true
+      once_per_session: true
+      cooldown_minutes: 240
+      condition:
+        type: afterhours_gain
+        value: 50
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+        min_volume: 10000
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+  regular:
+    - id: regular-nasdaq-2
+      name: 纳斯达克涨跌超2%
+      description: 盘中收盘时纳斯达克综指（IXIC）涨超2%或跌超2%
+      label: Nasdaq Composite >2% at close
+      notify: Important-reminder
+      symbol: "^IXIC"
+      enabled: true
+      cooldown_minutes: 1200
+      condition:
+        type: regular_close
+        value: 2
+        abs_change: true
+        close_minutes: 5
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: regular-halt50-fade-board
+      name: 盘中熔断或涨超50%回落的股票
+      board_description: 盘中最高涨超50%或触发涨停；每分钟按最高涨幅−当前涨幅从高到低写入同花顺（不发提醒），成交量超过1万（9:30开盘除外），总市值超过100万美元且不超过10亿美元
+      label: Halt/50% fade board
+      board_notify: false
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 240
+      condition:
+        type: regular_gain
+        value: 0
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+        min_volume: 10000
+        top_n: 50
+        board_interval_minutes: 1
+        min_regular_touch: 50
+        include_circuit_breaker: true
+        min_fade_from_high: 0
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: regular-day25-10
+      name: 盘中收盘涨超25%后续涨超10%的股票
+      description: 盘中收盘涨超25%（非盘中最高），次日盘中涨幅超10%，成交量超过1万，总市值超过100万美元且不超过10亿美元；第一次超10%不提醒，满10分钟后任意时段再超0%才提醒
+      label: Day 25% close then session +10%
+      notify: Day-25-boost
+      symbol: "*"
+      enabled: true
+      once_per_session: true
+      cooldown_minutes: 240
+      confirm_delay_minutes: 10
+      confirm_value: 0
+      condition:
+        type: regular_gain
+        value: 10
+        min_recent_day_change: 25
+        recent_day_count: 1
+        intraday_touch: false
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+        min_volume: 10000
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: regular-halt-or-5d-boost
+      name: 熔断或5日涨超50%后续超10%或曾涨超100%后续超5%的股票
+      description: 今日盘中一度涨超50%或过去5个交易日（不含今天）曾收盘涨超50%且盘中超10%；今日盘中一度涨超100%、涨停或过去5日曾收盘涨超100%且盘中超5%才提醒（不因首次进池推送）；成交量超过1万，总市值超过100万美元且不超过10亿美元；达标即提醒
+      label: Halt or 5-day boost
+      notify: Halt-boost
+      symbol: "*"
+      enabled: true
+      once_per_session: true
+      cooldown_minutes: 240
+      condition:
+        type: regular_gain
+        value: 5
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+        min_volume: 10000
+        min_regular_touch: 50
+        include_circuit_breaker: true
+        require_circuit_breaker: true
+        day_gain_tiers:
+          - min_recent_day_change: 50
+            value: 10
+          - min_recent_day_change: 100
+            value: 5
+        recent_day_count: 5
+        intraday_touch: true
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: regular-sudden-10
+      name: 后半段5分钟涨超10%的股票
+      description: 盘中后半段（12:45–16:00 ET，全时段一半），观察时段涨幅0%–20%的票，约5分钟内涨超10%，总市值超过100万美元且不超过10亿美元，价格高于0.1美元；第一次与确认后均进规则分组和我的自选，满10分钟后时段涨幅仍不低于10%再提醒
+      label: Sudden 10%
+      notify: Sudden-10
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 240
+      confirm_delay_minutes: 10
+      confirm_value: 10
+      condition:
+        type: sudden_gain
+        value: 10
+        pool_min_change: 0
+        pool_max_change: 20
+        sudden_window_seconds: 300
+        late_session: regular
+        min_price: 0.1
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+  premarket:
+    - id: premarket-day25-10
+      name: 盘中收盘涨超25%后续涨超10%的股票
+      description: 盘中收盘涨超25%（非盘中最高），盘前涨幅超10%，成交量超过1万，总市值超过100万美元且不超过10亿美元；第一次超10%不提醒，满10分钟后任意时段再超0%才提醒
+      label: Day 25% close then session +10%
+      notify: Day-25-boost
+      symbol: "*"
+      enabled: true
+      once_per_session: true
+      cooldown_minutes: 240
+      confirm_delay_minutes: 10
+      confirm_value: 0
+      condition:
+        type: premarket_gain
+        value: 10
+        min_recent_day_change: 25
+        recent_day_count: 1
+        intraday_touch: false
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+        min_volume: 10000
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: premarket-halt-or-5d-boost
+      name: 熔断或5日涨超50%后续超10%或曾涨超100%后续超5%的股票
+      description: 今日盘中一度涨超50%或过去5个交易日（不含今天）曾收盘涨超50%且盘前超10%；今日盘中一度涨超100%、涨停或过去5日曾收盘涨超100%且盘前超5%；成交量超过1万，总市值超过100万美元且不超过10亿美元；达标即提醒
+      label: Halt or 5-day boost
+      notify: Halt-boost
+      symbol: "*"
+      enabled: true
+      once_per_session: true
+      cooldown_minutes: 240
+      condition:
+        type: premarket_gain
+        value: 5
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+        min_volume: 10000
+        min_regular_touch: 50
+        include_circuit_breaker: true
+        require_circuit_breaker: true
+        day_gain_tiers:
+          - min_recent_day_change: 50
+            value: 10
+          - min_recent_day_change: 100
+            value: 5
+        recent_day_count: 5
+        intraday_touch: true
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: premarket-sudden-10
+      name: 后半段5分钟涨超10%的股票
+      description: 盘前后半段（06:45–09:30 ET，全时段一半），观察时段涨幅0%–20%的票，约5分钟内涨超10%，总市值超过100万美元且不超过10亿美元，价格高于0.1美元；第一次与确认后均进规则分组和我的自选，满10分钟后时段涨幅仍不低于10%再提醒
+      label: Sudden 10%
+      notify: Sudden-10
+      symbol: "*"
+      enabled: true
+      cooldown_minutes: 240
+      confirm_delay_minutes: 10
+      confirm_value: 10
+      condition:
+        type: sudden_gain
+        value: 10
+        pool_min_change: 0
+        pool_max_change: 20
+        sudden_window_seconds: 300
+        late_session: premarket
+        min_price: 0.1
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"
+
+    - id: premarket-session50
+      name: 盘前涨超50%的股票
+      description: 盘前涨幅超过50%，成交量超过1万，总市值超过100万美元且不超过10亿美元；提醒，进规则分组和我的自选
+      label: Pre-market +50%
+      notify: Session-50
+      symbol: "*"
+      enabled: true
+      once_per_session: true
+      cooldown_minutes: 240
+      condition:
+        type: premarket_gain
+        value: 50
+        min_market_cap: 1000000
+        max_market_cap: 1000000000
+        min_volume: 10000
+      slack_message: "{stock_name}{field_gap}{move_text}{price_text}"

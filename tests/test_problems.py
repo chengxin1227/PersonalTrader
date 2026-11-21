@@ -41,11 +41,25 @@ def test_other_errors_notify_once_until_the_problem_goes_quiet():
     notice = problem_notice("Trend scan failed: unexpected payload")
     assert notice is not None
     assert notice[1] == "扫描出错"
-    latch = ProblemLatch(quiet_seconds=120)
+    latch = ProblemLatch(quiet_seconds=120, remind_seconds=None)
     now = datetime(2026, 10, 7, 0, 0, tzinfo=timezone.utc)
     assert latch.should_send(notice[0], now)
     assert not latch.should_send(notice[0], now + timedelta(seconds=5))
+    # Quiet for 2+ minutes, then a new occurrence alerts again.
     assert latch.should_send(notice[0], now + timedelta(seconds=5 + 121))
+
+
+def test_open_problems_remind_every_half_hour():
+    latch = ProblemLatch(quiet_seconds=120, remind_seconds=1800)
+    key = "error:tonghuashun:timeout"
+    now = datetime(2026, 10, 7, 0, 0, tzinfo=timezone.utc)
+    assert latch.should_send(key, now)
+    # Still failing every few minutes — no spam (gaps < remind, and < would-be quiet reset after sent).
+    assert not latch.should_send(key, now + timedelta(minutes=5))
+    assert not latch.should_send(key, now + timedelta(minutes=29))
+    # Same ongoing problem: remind once per 30 minutes.
+    assert latch.should_send(key, now + timedelta(minutes=30))
+    assert not latch.should_send(key, now + timedelta(minutes=40))
 
 
 def test_state_json_corrupt_is_a_clear_pause_notice():
@@ -58,8 +72,19 @@ def test_state_json_corrupt_is_a_clear_pause_notice():
     assert "state.json" in notice[2]
 
 
+def test_tonghuashun_timeouts_share_one_notice_key():
+    a = problem_notice("Tonghuashun add failed for pepg: timeout")
+    b = problem_notice(
+        "Tonghuashun add failed for AAA, BBB: The read operation timed out"
+    )
+    c = problem_notice("Tonghuashun add failed for XYZ: SSL handshake failed")
+    assert a is not None and b is not None and c is not None
+    assert a[0] == b[0] == c[0] == "error:tonghuashun:timeout"
+    assert a[1] == "加自选超时"
+
+
 def test_tonghuashun_add_failure_includes_symbols():
-    notice = problem_notice("Tonghuashun add failed for pepg: timeout")
+    notice = problem_notice("Tonghuashun add failed for pepg: 同花顺加自选失败: 网络错误")
     assert notice is not None
     assert notice[0] == "error:tonghuashun:PEPG"
     assert notice[1] == "加自选失败 PEPG"

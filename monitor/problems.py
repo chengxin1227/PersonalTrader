@@ -48,6 +48,16 @@ def problem_notice(text: str) -> tuple[str, str, str] | None:
             body = f"{body}{detail}"
         return key, "OpenD 超限", body
     if lowered.startswith("tonghuashun add failed"):
+        # Timeouts share one key so the latch can remind at most every remind_seconds.
+        if any(
+            part in lowered
+            for part in ("timed out", "timeout", "handshake", "temporarily")
+        ):
+            return (
+                "error:tonghuashun:timeout",
+                "加自选超时",
+                "同花顺加自选超时（网络或握手）。",
+            )
         symbols = _ths_fail_symbols(raw)
         if symbols:
             return (
@@ -83,22 +93,42 @@ def _is_state_corrupt(lowered: str) -> bool:
 
 
 class ProblemLatch:
-    """One notice per problem until it has been quiet, then a new one can send."""
+    """Dedupe problem notices with an optional periodic re-remind.
 
-    def __init__(self, quiet_seconds: int = 120) -> None:
+    - ``quiet_seconds``: if no report for this long, the next one is a fresh alert.
+    - ``remind_seconds``: while reports keep coming, send at most this often
+      (default 30 minutes). ``None`` means only one alert until quiet.
+    """
+
+    def __init__(
+        self, quiet_seconds: int = 120, remind_seconds: int | None = 1800
+    ) -> None:
         self.quiet_seconds = quiet_seconds
-        self._open: set[str] = set()
+        self.remind_seconds = remind_seconds
         self._last: dict[str, datetime] = {}
+        self._sent: dict[str, datetime] = {}
 
     def should_send(self, key: str, now: datetime) -> bool:
         last = self._last.get(key)
-        if last is not None and (now - last).total_seconds() >= self.quiet_seconds:
-            self._open.discard(key)
+        # Require a quiet stretch at least as long as the remind interval, otherwise
+        # a board that fails every 5 minutes would look "quiet" every time (quiet=2m)
+        # and spam a fresh alert.
+        reset_after = self.quiet_seconds
+        if self.remind_seconds is not None:
+            reset_after = max(reset_after, self.remind_seconds)
+        if last is not None and (now - last).total_seconds() >= reset_after:
+            self._sent.pop(key, None)
         self._last[key] = now
-        if key in self._open:
+        sent = self._sent.get(key)
+        if sent is None:
+            self._sent[key] = now
+            return True
+        if self.remind_seconds is None:
             return False
-        self._open.add(key)
-        return True
+        if (now - sent).total_seconds() >= self.remind_seconds:
+            self._sent[key] = now
+            return True
+        return False
 
 
 def _is_rate_limit(lowered: str) -> bool:

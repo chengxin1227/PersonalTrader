@@ -144,10 +144,31 @@ class TonghuashunClient:
         self._rule_group_sessions: dict[str, dict[str, str]] | None = None
         self._important_group = _DEFAULT_IMPORTANT_GROUP
         self._late_group = _DEFAULT_LATE_GROUP
+        # Reuse one Client so singles don't pay a fresh TLS handshake each write.
+        self._http: httpx.Client | None = None
 
     @property
     def configured(self) -> bool:
         return bool(self._username and self._password)
+
+    def _http_client(self) -> httpx.Client:
+        if self._http is None or self._http.is_closed:
+            # connect separate from read: handshake is what singles were dying on.
+            self._http = httpx.Client(
+                timeout=httpx.Timeout(120.0, connect=120.0),
+                follow_redirects=True,
+                trust_env=False,
+            )
+        return self._http
+
+    def _reset_http_client(self) -> None:
+        client = self._http
+        self._http = None
+        if client is not None and not client.is_closed:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def set_important_group(self, name: str) -> None:
         cleaned = (name or "").strip() or _DEFAULT_IMPORTANT_GROUP
@@ -290,17 +311,42 @@ class TonghuashunClient:
             raise TonghuashunError(f"同花顺加自选失败: {payload.get('errorMsg') or '未知错误'}")
 
     def _with_session(self, work):
-        with self._lock, httpx.Client(timeout=10, follow_redirects=True) as http:
-            self._load_session()
-            if self._cookies is None:
-                self._login(http)
-            try:
-                return work(http)
-            except (TonghuashunError, httpx.HTTPStatusError):
-                # Expired sessions fail as a business error; log in again once.
-                self._cookies = None
-                self._login(http)
-                return work(http)
+        # Full group arrange can take 40–60s on a slow link; keep headroom.
+        # Retry transport/timeouts: slow NZ→同花顺 links often fail the first handshake.
+        with self._lock:
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                http = self._http_client()
+                self._load_session()
+                if self._cookies is None:
+                    try:
+                        self._login(http)
+                    except (httpx.TimeoutException, httpx.TransportError) as exc:
+                        last_exc = exc
+                        self._reset_http_client()
+                        if attempt < 2:
+                            time.sleep(1.5 * (attempt + 1))
+                            continue
+                        raise
+                try:
+                    return work(http)
+                except (TonghuashunError, httpx.HTTPStatusError):
+                    # Expired sessions fail as a business error; log in again once.
+                    self._cookies = None
+                    self._login(http)
+                    return work(http)
+                except (httpx.TimeoutException, httpx.TransportError) as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "同花顺 transport attempt %s/3 failed: %s", attempt + 1, exc
+                    )
+                    self._reset_http_client()
+                    if attempt < 2:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    raise
+            assert last_exc is not None
+            raise last_exc
 
     def _known_markets(self) -> dict[str, str]:
         if self._markets is None:

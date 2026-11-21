@@ -546,6 +546,8 @@ class MonitorEngine:
         # session (盘前/盘中/盘后) -> ET date last cleared for that session's groups
         self._ths_cleared_session_day: dict[str, str] = {}
         self._ths_groups_synced = False
+        # rule.id -> last successfully arranged symbol order (skip redundant fade rewrites)
+        self._ths_last_board_order: dict[str, tuple[str, ...]] = {}
         self.store = store
         self.verbose = verbose
         self.quotes: dict[str, Quote] = {}
@@ -586,7 +588,8 @@ class MonitorEngine:
         self._day_spike_loop_running = False
         self._opend_down_notified = False
         self._opend_ok_at: Optional[datetime] = None
-        self._problems = ProblemLatch()
+        # Re-remind every 30m while the same problem keeps firing (e.g. 同花顺 timeout).
+        self._problems = ProblemLatch(quiet_seconds=120, remind_seconds=1800)
         self._board_retry_at: Optional[datetime] = None
         self._breaker_checked_at: Optional[datetime] = None
         self._close_checked_at: Optional[datetime] = None
@@ -4839,6 +4842,15 @@ class MonitorEngine:
     ) -> None:
         if not self.ths.configured:
             return
+        # Fade boards rewrite every board_interval; skip when pin order is unchanged.
+        if board and _sorts_ths_by_peak_fade(rule):
+            order = tuple(
+                symbol.strip().upper()
+                for symbol in (pin_symbols or [])
+                if symbol and str(symbol).strip()
+            )
+            if order and self._ths_last_board_order.get(rule.id) == order:
+                return
         task = asyncio.create_task(
             self._tonghuashun_sync(
                 rule,
@@ -4997,10 +5009,13 @@ class MonitorEngine:
                     session=session,
                     tag_symbols=pin if not replace_board else ordered,
                 )
+                if board and _sorts_ths_by_peak_fade(rule):
+                    self._ths_last_board_order[rule.id] = tuple(pin)
                 if want_important and session_target:
                     await self.ths.add_important(session_target, session)
-                # Always mirror into 今日盘前/盘中/盘后分组 (bump; boards do not replace).
-                if session_target:
+                # Mirror into 今日盘x分组. Record-only boards (board_notify false, e.g. fade
+                # every N minutes) stay in the rule group only — no repeated session bump.
+                if session_target and not (board and not rule.board_notify):
                     await self.ths.add_daily(session_target, session)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同花顺 update failed for %s: %s", group, exc)

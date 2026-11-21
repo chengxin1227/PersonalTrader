@@ -140,7 +140,12 @@ def _is_peak_rebound_rule(rule: Rule) -> bool:
     return (
         rule.condition.min_rebound_from_trough is not None
         and not _is_leaderboard_rule(rule)
-        and rule.condition.type is ConditionType.REGULAR_GAIN
+        and rule.condition.type
+        in {
+            ConditionType.AFTERHOURS_GAIN,
+            ConditionType.PREMARKET_GAIN,
+            ConditionType.REGULAR_GAIN,
+        }
     )
 
 
@@ -726,6 +731,7 @@ class MonitorEngine:
                 if not _is_trend_rule(rule)
                 and not _is_spike_rule(rule)
                 and not _is_peak_fade_rule(rule)
+                and not _is_peak_rebound_rule(rule)
                 and not _is_new_high_rule(rule)
                 and not _is_breaker_rule(rule)
                 and not _is_leaderboard_rule(rule)
@@ -1187,7 +1193,9 @@ class MonitorEngine:
                     regular_rebound = [
                         rule
                         for rule in config.rules
-                        if rule.enabled and _is_peak_rebound_rule(rule)
+                        if rule.enabled
+                        and _is_peak_rebound_rule(rule)
+                        and rule.condition.type is ConditionType.REGULAR_GAIN
                     ]
                     for rule in regular_rebound:
                         matched = await self._match_peak_rebound_rule(rule)
@@ -1969,7 +1977,7 @@ class MonitorEngine:
         text = check_reminder_text(label, names)
         routes = getattr(self, "routes", None)
         notify = CHECK_REMINDER_NOTIFY
-        # Check reminders are afterhours (18:00 / 19:45 ET) → 今日盘后自选.
+        # Check reminders are afterhours-tied (18:00 / 19:50 / 03:00 ET) → 今日盘后自选.
         session = et_session_name() or "盘后"
         slack_url = ""
         token = ""
@@ -2695,50 +2703,123 @@ class MonitorEngine:
         return matched
 
     async def _match_peak_rebound_rule(self, rule: Rule) -> list[Quote]:
-        """Halt/50% pool: after late window, current >= post-peak trough + rebound pp."""
+        """Pool once peaked high enough; after late window, current >= trough + rebound pp.
+
+        Regular: halt / min_regular_touch pool. Premarket / after-hours: session peak
+        >= condition.value only (no circuit breaker).
+        """
         client = self._trend_moomoo or self.moomoo
         rebound_min = rule.condition.min_rebound_from_trough
         if client is None or rebound_min is None:
             return []
-        if not session_late_window(
-            "regular",
-            hours=rule.condition.late_session_hours,
-        ):
+        kind = rule.condition.type
+        if kind is ConditionType.AFTERHOURS_GAIN:
+            late = rule.condition.late_session or "afterhours"
+            label = "After-hours peak rebound"
+            trough_session = "afterhours"
+        elif kind is ConditionType.PREMARKET_GAIN:
+            late = rule.condition.late_session or "premarket"
+            label = "Pre-market peak rebound"
+            trough_session = "premarket"
+        elif kind is ConditionType.REGULAR_GAIN:
+            late = rule.condition.late_session or "regular"
+            label = "Regular peak rebound"
+            trough_session = "regular"
+        else:
             return []
-        symbols = self._halt_or_day_pool_symbols(rule)
-        if not symbols:
+        if not session_late_window(late, hours=rule.condition.late_session_hours):
             return []
         day = now_et().date().isoformat()
-        snaps = await self._moomoo_snapshots(client, sorted(symbols))
-        if not snaps:
-            return []
+        if kind is ConditionType.REGULAR_GAIN:
+            symbols = self._halt_or_day_pool_symbols(rule)
+            if not symbols:
+                return []
+            snaps = await self._moomoo_snapshots(client, sorted(symbols))
+            if not snaps:
+                return []
+            marks = snaps
+        else:
+            peak_floor = rule.condition.value
+            if kind is ConditionType.AFTERHOURS_GAIN:
+                found_rows = await client.scan_afterhours(
+                    peak_floor,
+                    rule.condition.max_market_cap,
+                    min_market_cap=rule.condition.min_market_cap,
+                )
+                found = [quote for quote, _cap in found_rows]
+                note_peak = self.store.note_afterhours_peak
+                peaks = self.store.afterhours_peaks
+                load_marks = self._saved_afterhours_quotes
+            else:
+                found_rows = await client.scan_premarket(
+                    peak_floor,
+                    rule.condition.max_market_cap,
+                    min_market_cap=rule.condition.min_market_cap,
+                )
+                found = [quote for quote, _cap in found_rows]
+                note_peak = self.store.note_premarket_peak
+                peaks = self.store.premarket_peaks
+                load_marks = self._saved_premarket_quotes
+            for quote in found:
+                observed = quote.change_pct
+                if quote.session_high_pct is not None:
+                    observed = (
+                        quote.session_high_pct
+                        if observed is None
+                        else max(observed, quote.session_high_pct)
+                    )
+                if observed is not None:
+                    note_peak(day, quote.symbol, observed)
+            symbols = sorted(
+                symbol
+                for symbol, peak in peaks(day).items()
+                if peak >= peak_floor
+            )
+            if not symbols:
+                self._log_saved_matches(rule.id, [], label)
+                return []
+            marks = await load_marks(client, symbols)
+            if not marks:
+                return []
         matched: list[Quote] = []
         for symbol in symbols:
             key = symbol.upper()
-            quote = snaps.get(key) or snaps.get(symbol)
+            quote = marks.get(key) or marks.get(symbol)
             if quote is None or quote.change_pct is None:
                 continue
             if rule.condition.min_volume is not None and (
                 quote.volume is None or quote.volume <= rule.condition.min_volume
             ):
                 continue
-            peak_touch = regular_touch_change_pct(
-                change_pct=quote.change_pct,
-                high=quote.daily_high,
-                prev_close=quote.prev_close,
-                pre_high=quote.premarket_high,
-            )
-            observed = quote.change_pct
-            candidates = [
-                value
-                for value in (peak_touch, quote.session_high_pct, quote.change_pct)
-                if value is not None
-            ]
-            if candidates:
-                best = max(candidates)
-                self.store.note_peak_gain(day, key, best)
+            if kind is ConditionType.REGULAR_GAIN:
+                peak_touch = regular_touch_change_pct(
+                    change_pct=quote.change_pct,
+                    high=quote.daily_high,
+                    prev_close=quote.prev_close,
+                    pre_high=quote.premarket_high,
+                )
+                candidates = [
+                    value
+                    for value in (peak_touch, quote.session_high_pct, quote.change_pct)
+                    if value is not None
+                ]
+                if candidates:
+                    self.store.note_peak_gain(day, key, max(candidates))
                 observed = quote.change_pct
-            peak, trough = self.store.note_peak_trough(day, key, observed)
+            else:
+                observed = quote.change_pct
+                high_mark = (
+                    max(quote.session_high_pct, quote.change_pct)
+                    if quote.session_high_pct is not None
+                    else quote.change_pct
+                )
+                note_peak(day, key, high_mark)
+                stored = peaks(day).get(key)
+                if stored is None or stored < peak_floor:
+                    continue
+            peak, trough = self.store.note_peak_trough(
+                day, key, observed, session=trough_session
+            )
             quote.session_high_pct = peak
             if peak <= trough:
                 continue
@@ -2757,9 +2838,7 @@ class MonitorEngine:
                 )
             matched.append(quote)
         matched.sort(key=lambda item: item.change_pct or float("-inf"), reverse=True)
-        self._log_saved_matches(
-            rule.id, [quote.symbol for quote in matched], "Regular peak rebound"
-        )
+        self._log_saved_matches(rule.id, [quote.symbol for quote in matched], label)
         return matched
 
     async def _match_near_peak_rule(self, rule: Rule) -> list[Quote]:

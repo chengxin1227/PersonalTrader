@@ -377,18 +377,30 @@ class Store:
         _atomic_write_json(self._peak_gains_path, peaks)
 
     def note_peak_trough(
-        self, day: str, symbol: str, change_pct: float
+        self,
+        day: str,
+        symbol: str,
+        change_pct: float,
+        *,
+        session: str = "regular",
     ) -> tuple[float, float]:
         """Track session peak and the lowest gain seen after that peak.
 
         New highs reset the trough to the new peak. Returns ``(peak, trough)``.
+        ``session`` keeps 盘前/盘中/盘后 troughs from overwriting each other
+        (regular keeps the bare symbol key for existing data).
         """
         rows = self._load_peak_troughs()
         day_row = rows.setdefault(day, {})
         if not isinstance(day_row, dict):
             day_row = {}
             rows[day] = day_row
-        key = symbol.upper()
+        session_key = (session or "regular").strip() or "regular"
+        key = (
+            symbol.upper()
+            if session_key == "regular"
+            else f"{session_key}:{symbol.upper()}"
+        )
         existing = day_row.get(key)
         peak = change_pct
         trough = change_pct
@@ -411,11 +423,19 @@ class Store:
         self._save_peak_troughs(rows)
         return peak, trough
 
-    def peak_trough(self, day: str, symbol: str) -> tuple[float, float] | None:
+    def peak_trough(
+        self, day: str, symbol: str, *, session: str = "regular"
+    ) -> tuple[float, float] | None:
         row = self._load_peak_troughs().get(day, {})
         if not isinstance(row, dict):
             return None
-        existing = row.get(symbol.upper())
+        session_key = (session or "regular").strip() or "regular"
+        key = (
+            symbol.upper()
+            if session_key == "regular"
+            else f"{session_key}:{symbol.upper()}"
+        )
+        existing = row.get(key)
         if not isinstance(existing, dict):
             return None
         try:

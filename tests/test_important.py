@@ -25,10 +25,11 @@ def test_rules_yaml_loads_important_block():
     config = load_rules(ROOT / "config" / "rules.yaml")
     assert config.important.ths_group == "今日自选"
     assert config.important.high_priority_rule_ids == []
-    # 12:00 / 13:45 NZ check reminders stay high-priority in _deliver_check_reminder.
+    # 18:00 / 19:50 / 03:00 ET check reminders stay high-priority in _deliver_check_reminder.
     assert {item.key for item in config.important.reminders} == {
         "afterhours-2h",
-        "afterhours-3h45",
+        "afterhours-buy",
+        "afterhours-sell",
     }
     # All singles → 今日自选 (半点榜默认不进). Lists below unused (kept empty).
     assert config.important.watchlist.always == []
@@ -39,8 +40,13 @@ def test_rules_yaml_loads_important_block():
     assert config.important.watchlist.reminder_sync == []
     assert config.important.watched_symbols.symbols == []
     keys = [item.key for item in config.important.reminders]
-    assert keys == ["afterhours-2h", "afterhours-3h45"]
-    assert [item.at for item in config.important.reminders] == ["18:00", "19:45"]
+    assert keys == ["afterhours-2h", "afterhours-buy", "afterhours-sell"]
+    assert [item.at for item in config.important.reminders] == ["18:00", "19:50", "03:00"]
+    assert [item.label for item in config.important.reminders] == [
+        "盘后2小时",
+        "准备买入",
+        "准备卖出",
+    ]
     assert all(
         item.rule_ids
         == ["afterhours-top5", "afterhours-halt50-or-5d50-board"]
@@ -53,12 +59,14 @@ def test_rules_yaml_loads_important_block():
         "afterhours-halt-or-5d-boost",
         "afterhours-halt50-or-5d50-board",
         "afterhours-sudden-10",
+        "afterhours-50-rebound",
         "regular-top5",
         "regular-halt50-fade-board",
         "regular-halt50-rebound",
         "regular-near-peak-35",
         "premarket-top5",
         "premarket-sudden-10",
+        "premarket-50-rebound",
     ]
     for rule_id, name in (
         ("regular-top5", "今日盘中涨幅最高前5的股票"),
@@ -79,6 +87,22 @@ def test_rules_yaml_loads_important_block():
     assert rebound.condition.min_rebound_from_trough == 10
     assert rebound.condition.late_session_hours == 3.75
     assert rebound.once_per_session is True
+    ah_rebound = next(rule for rule in config.rules if rule.id == "afterhours-50-rebound")
+    assert ah_rebound.name == "盘后涨超50%回升的股票"
+    assert ah_rebound.condition.value == 50
+    assert ah_rebound.condition.min_rebound_from_trough == 10
+    assert ah_rebound.condition.late_session == "afterhours"
+    assert ah_rebound.condition.late_session_hours == 2.5
+    assert ah_rebound.condition.include_circuit_breaker is False
+    assert ah_rebound.once_per_session is True
+    pm_rebound = next(rule for rule in config.rules if rule.id == "premarket-50-rebound")
+    assert pm_rebound.name == "盘前涨超50%回升的股票"
+    assert pm_rebound.condition.value == 50
+    assert pm_rebound.condition.min_rebound_from_trough == 10
+    assert pm_rebound.condition.late_session == "premarket"
+    assert pm_rebound.condition.late_session_hours == 3.25
+    assert pm_rebound.condition.include_circuit_breaker is False
+    assert pm_rebound.once_per_session is True
     near = next(rule for rule in config.rules if rule.id == "regular-near-peak-35")
     assert near.name == "盘中涨超35%接近最高的股票"
     assert near.condition.value == 35
@@ -110,10 +134,14 @@ def test_rules_yaml_loads_important_block():
 def test_important_reminders_merge_into_due_window():
     config = load_rules(ROOT / "config" / "rules.yaml")
     extra = _important_reminders(config.important)
-    due = due_check_reminders(datetime(2026, 10, 15, 19, 45, tzinfo=ET), extra=extra)
-    assert [item.key for item in due] == ["afterhours-3h45"]
+    due = due_check_reminders(datetime(2026, 10, 15, 19, 50, tzinfo=ET), extra=extra)
+    assert [item.key for item in due] == ["afterhours-buy"]
+    assert due[0].label == "准备买入"
     due_early = due_check_reminders(datetime(2026, 10, 15, 18, 0, tzinfo=ET), extra=extra)
     assert [item.key for item in due_early] == ["afterhours-2h"]
+    due_sell = due_check_reminders(datetime(2026, 10, 16, 3, 0, tzinfo=ET), extra=extra)
+    assert [item.key for item in due_sell] == ["afterhours-sell"]
+    assert due_sell[0].label == "准备卖出"
 
 
 def _sudden(session: str, rule_id: str) -> Rule:

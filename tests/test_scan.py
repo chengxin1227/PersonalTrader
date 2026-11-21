@@ -970,6 +970,35 @@ def test_peak_rebound_rule_classifier():
     assert not _is_peak_fade_rule(rule)
     assert not _is_peak_fade_board(rule)
 
+    ah = Rule(
+        id="afterhours-50-rebound",
+        name="盘后涨超50%回升的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.AFTERHOURS_GAIN,
+            value=50,
+            min_rebound_from_trough=10,
+            late_session="afterhours",
+            late_session_hours=2.5,
+        ),
+    )
+    pm = Rule(
+        id="premarket-50-rebound",
+        name="盘前涨超50%回升的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.PREMARKET_GAIN,
+            value=50,
+            min_rebound_from_trough=10,
+            late_session="premarket",
+            late_session_hours=3.25,
+        ),
+    )
+    assert _is_peak_rebound_rule(ah)
+    assert _is_peak_rebound_rule(pm)
+    assert not _is_peak_fade_rule(ah)
+    assert not _is_peak_fade_rule(pm)
+
 
 def test_near_peak_rule_classifier():
     from monitor.engine import _is_near_peak_rule, _is_peak_fade_rule, _is_peak_rebound_rule

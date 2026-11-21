@@ -83,6 +83,15 @@ def test_peak_trough_tracks_low_after_high(tmp_path):
     assert store.note_peak_trough("2026-10-09", "aaa", 95.0) == (95.0, 95.0)
     assert store.note_peak_trough("2026-10-09", "aaa", 70.0) == (95.0, 70.0)
     assert store.peak_trough("2026-10-09", "aaa") == (95.0, 70.0)
+    # Session namespaces stay independent of regular.
+    assert store.note_peak_trough(
+        "2026-10-09", "aaa", 60.0, session="afterhours"
+    ) == (60.0, 60.0)
+    assert store.note_peak_trough(
+        "2026-10-09", "aaa", 30.0, session="afterhours"
+    ) == (60.0, 30.0)
+    assert store.peak_trough("2026-10-09", "aaa") == (95.0, 70.0)
+    assert store.peak_trough("2026-10-09", "aaa", session="afterhours") == (60.0, 30.0)
 
 
 def test_afterhours_peaks_stay_separate_from_regular_peaks(tmp_path):

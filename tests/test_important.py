@@ -65,6 +65,7 @@ def test_rules_yaml_loads_important_block():
         "regular-halt50-rebound",
         "regular-near-peak-35",
         "premarket-top5",
+        "premarket-halt-or-5d-boost",
         "premarket-sudden-10",
         "premarket-50-rebound",
     ]
@@ -128,6 +129,18 @@ def test_rules_yaml_loads_important_block():
     assert board.condition.require_circuit_breaker is True
     assert [
         (t.min_recent_day_change, t.value) for t in board.condition.day_gain_tiers
+    ] == [(t.min_recent_day_change, t.value) for t in boost.condition.day_gain_tiers]
+    pm_boost = next(
+        rule for rule in config.rules if rule.id == "premarket-halt-or-5d-boost"
+    )
+    assert pm_boost.name == "熔断或5日盘前的股票"
+    assert pm_boost.once_per_session is True
+    assert pm_boost.condition.type is ConditionType.PREMARKET_GAIN
+    assert pm_boost.condition.value == boost.condition.value
+    assert pm_boost.condition.min_regular_touch == boost.condition.min_regular_touch
+    assert pm_boost.condition.require_circuit_breaker is True
+    assert [
+        (t.min_recent_day_change, t.value) for t in pm_boost.condition.day_gain_tiers
     ] == [(t.min_recent_day_change, t.value) for t in boost.condition.day_gain_tiers]
 
 

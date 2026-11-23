@@ -824,6 +824,16 @@ def test_day_gain_tiers_or_across_50_and_100():
     assert not evaluate_premarket_scan(
         premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
     ).matched
+    # 100% day + current 3.8% but session high 7.9% → still hit (touch, not only last)
+    quote.change_pct = 3.8
+    quote.session_high_pct = 7.9
+    quote.recent_day_gain_floors = [100.0]
+    assert evaluate_afterhours_scan(
+        afterhours, quote, market_cap=None, in_afterhours=True, cap_filtered=True
+    ).matched
+    assert evaluate_premarket_scan(
+        premarket, quote, market_cap=None, in_premarket=True, cap_filtered=True
+    ).matched
 
 
 def test_halt_or_5d_boost_breaker_leg_without_tier():
@@ -1000,6 +1010,131 @@ def test_peak_rebound_rule_classifier():
     assert not _is_peak_fade_rule(pm)
 
 
+def test_peak_rebound_tracks_trough_before_late_window(tmp_path):
+    """Trough updates all session; matches only after late window."""
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock, patch
+    from zoneinfo import ZoneInfo
+
+    from monitor.engine import MonitorEngine
+    from monitor.models import Quote
+    from monitor.store import Store
+
+    ET = ZoneInfo("America/New_York")
+    store = Store(tmp_path)
+    engine = MonitorEngine.__new__(MonitorEngine)
+    engine.store = store
+    engine.verbose = False
+    engine.moomoo = object()
+    engine._trend_moomoo = None
+    engine._scan_log = {}
+
+    rule = Rule(
+        id="regular-halt50-rebound",
+        name="盘中熔断或50%回升的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.REGULAR_GAIN,
+            value=0,
+            min_regular_touch=50,
+            include_circuit_breaker=True,
+            min_rebound_from_trough=10,
+            late_session="regular",
+            late_session_hours=3.75,
+            min_volume=10_000,
+        ),
+    )
+    day = "2026-11-23"
+    store.note_day_gains(day, 50, ["BNAI"])
+
+    # prev_close=5, daily_high=9 → touch +80% (matches change_pct peak)
+    quote_high = Quote(
+        symbol="BNAI",
+        price=9.0,
+        change_pct=80.0,
+        volume=50_000,
+        daily_high=9.0,
+        prev_close=5.0,
+    )
+    quote_dip = Quote(
+        symbol="BNAI",
+        price=7.5,
+        change_pct=50.0,
+        volume=50_000,
+        daily_high=9.0,
+        prev_close=5.0,
+    )
+    quote_lift = Quote(
+        symbol="BNAI",
+        price=8.5,
+        change_pct=70.0,
+        volume=50_000,
+        daily_high=9.0,
+        prev_close=5.0,
+    )
+
+    async def run() -> None:
+        early = datetime(2026, 11, 23, 11, 40, tzinfo=ET)  # before 12:15
+        late = datetime(2026, 11, 23, 13, 30, tzinfo=ET)
+
+        with (
+            patch("monitor.engine.now_et", return_value=early),
+            patch("monitor.engine.session_late_window", return_value=False),
+            patch.object(
+                engine,
+                "_halt_or_day_pool_symbols",
+                return_value=["BNAI"],
+            ),
+            patch.object(
+                engine,
+                "_moomoo_snapshots",
+                new=AsyncMock(return_value={"BNAI": quote_high}),
+            ),
+        ):
+            matched = await engine._match_peak_rebound_rule(rule)
+        assert matched == []
+        assert store.peak_trough(day, "BNAI") == (80.0, 80.0)
+
+        with (
+            patch("monitor.engine.now_et", return_value=early),
+            patch("monitor.engine.session_late_window", return_value=False),
+            patch.object(
+                engine,
+                "_halt_or_day_pool_symbols",
+                return_value=["BNAI"],
+            ),
+            patch.object(
+                engine,
+                "_moomoo_snapshots",
+                new=AsyncMock(return_value={"BNAI": quote_dip}),
+            ),
+        ):
+            matched = await engine._match_peak_rebound_rule(rule)
+        assert matched == []
+        assert store.peak_trough(day, "BNAI") == (80.0, 50.0)
+
+        with (
+            patch("monitor.engine.now_et", return_value=late),
+            patch("monitor.engine.session_late_window", return_value=True),
+            patch.object(
+                engine,
+                "_halt_or_day_pool_symbols",
+                return_value=["BNAI"],
+            ),
+            patch.object(
+                engine,
+                "_moomoo_snapshots",
+                new=AsyncMock(return_value={"BNAI": quote_lift}),
+            ),
+        ):
+            matched = await engine._match_peak_rebound_rule(rule)
+        assert [q.symbol for q in matched] == ["BNAI"]
+        assert store.peak_trough(day, "BNAI") == (80.0, 50.0)
+
+    asyncio.run(run())
+
+
 def test_near_peak_rule_classifier():
     from monitor.engine import _is_near_peak_rule, _is_peak_fade_rule, _is_peak_rebound_rule
 
@@ -1094,4 +1229,5 @@ def test_session50_singles_use_ths_rule_group_and_live_yaml():
         "afterhours-top5",
         "afterhours-halt-or-5d-boost",
         "afterhours-halt50-or-5d50-board",
+        "premarket-halt-or-5d-boost",
     }

@@ -77,19 +77,29 @@ def _finish_with_market_cap(
 
 
 def matched_day_gain_tier(rule: Rule, quote: Quote) -> DayGainTier | None:
-    """First tier whose prior-day floor and session gain both clear."""
+    """First tier whose prior-day floor and session gain both clear.
+
+    Session leg uses the better of current change and session high so a brief
+    spike above the tier (e.g. AH +7.9% then back to +3%) still counts.
+    """
     tiers = day_gain_tiers_for(rule)
     if not tiers:
         return None
     floors = {float(item) for item in (quote.recent_day_gain_floors or [])}
     if not floors and quote.recent_day_spike is True and rule.condition.min_recent_day_change is not None:
         floors.add(float(rule.condition.min_recent_day_change))
-    if quote.change_pct is None:
+    marks = [
+        value
+        for value in (quote.change_pct, quote.session_high_pct)
+        if value is not None
+    ]
+    if not marks:
         return None
+    session_gain = max(marks)
     for tier in tiers:
         if tier.min_recent_day_change not in floors:
             continue
-        if quote.change_pct > tier.value:
+        if session_gain > tier.value:
             return tier
     return None
 

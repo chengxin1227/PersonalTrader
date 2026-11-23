@@ -2703,7 +2703,10 @@ class MonitorEngine:
         return matched
 
     async def _match_peak_rebound_rule(self, rule: Rule) -> list[Quote]:
-        """Pool once peaked high enough; after late window, current >= trough + rebound pp.
+        """Track peak→trough all session; alert only in late window on trough + rebound pp.
+
+        Peak/trough updates run whenever the session is open so early dips are kept.
+        Matching (alerts) stays gated on ``late_session`` / ``late_session_hours``.
 
         Regular: halt / min_regular_touch pool. Premarket / after-hours: session peak
         >= condition.value only (no circuit breaker).
@@ -2727,8 +2730,7 @@ class MonitorEngine:
             trough_session = "regular"
         else:
             return []
-        if not session_late_window(late, hours=rule.condition.late_session_hours):
-            return []
+        in_late = session_late_window(late, hours=rule.condition.late_session_hours)
         day = now_et().date().isoformat()
         if kind is ConditionType.REGULAR_GAIN:
             symbols = self._halt_or_day_pool_symbols(rule)
@@ -2787,10 +2789,6 @@ class MonitorEngine:
             quote = marks.get(key) or marks.get(symbol)
             if quote is None or quote.change_pct is None:
                 continue
-            if rule.condition.min_volume is not None and (
-                quote.volume is None or quote.volume <= rule.condition.min_volume
-            ):
-                continue
             if kind is ConditionType.REGULAR_GAIN:
                 peak_touch = regular_touch_change_pct(
                     change_pct=quote.change_pct,
@@ -2804,7 +2802,12 @@ class MonitorEngine:
                     if value is not None
                 ]
                 if candidates:
-                    self.store.note_peak_gain(day, key, max(candidates))
+                    high_mark = max(candidates)
+                    self.store.note_peak_gain(day, key, high_mark)
+                    # Seed peak from daily high so trough tracks from the real high.
+                    self.store.note_peak_trough(
+                        day, key, high_mark, session=trough_session
+                    )
                 observed = quote.change_pct
             else:
                 observed = quote.change_pct
@@ -2814,6 +2817,9 @@ class MonitorEngine:
                     else quote.change_pct
                 )
                 note_peak(day, key, high_mark)
+                self.store.note_peak_trough(
+                    day, key, high_mark, session=trough_session
+                )
                 stored = peaks(day).get(key)
                 if stored is None or stored < peak_floor:
                     continue
@@ -2821,6 +2827,13 @@ class MonitorEngine:
                 day, key, observed, session=trough_session
             )
             quote.session_high_pct = peak
+            # Volume / late window only gate alerts — trough still updates above.
+            if not in_late:
+                continue
+            if rule.condition.min_volume is not None and (
+                quote.volume is None or quote.volume <= rule.condition.min_volume
+            ):
+                continue
             if peak <= trough:
                 continue
             lift = quote.change_pct - trough

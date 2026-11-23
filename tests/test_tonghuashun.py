@@ -42,9 +42,11 @@ def test_shared_rule_group_names_from_live_rules():
 
     config = load_rules(ROOT / "config" / "rules.yaml")
     shared = set(_shared_rule_group_names(config))
-    # Board digests are not shared singles; halt-or-5d-boost is afterhours-only so not shared.
+    # Board digests are not shared singles; AH/PM halt-or-5d use different group names.
     assert "今日盘后涨幅最高前5的股票" not in shared
     assert "熔断或5日盘后前5的股票" not in shared
+    assert "熔断或5日盘后的股票" not in shared
+    assert "熔断或5日盘前的股票" not in shared
 
 
 def test_sync_groups_keep_includes_session_and_important():

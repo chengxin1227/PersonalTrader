@@ -164,4 +164,5 @@ def test_live_rules_once_per_session_flags():
     by_id = {rule.id: rule for rule in config.rules}
     assert by_id["afterhours-top5"].once_per_session is False
     assert by_id["afterhours-halt-or-5d-boost"].once_per_session is True
+    assert by_id["premarket-halt-or-5d-boost"].once_per_session is True
     assert by_id["afterhours-halt50-or-5d50-board"].once_per_session is False

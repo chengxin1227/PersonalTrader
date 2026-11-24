@@ -48,9 +48,9 @@ from monitor.rules import (
     halt_or_5d_trigger_label,
     matched_day_gain_tier,
     peak_leaderboard_line,
-    price_age_seconds_ago,
     render_message,
     save_rules,
+    sudden_baseline,
     trim_price_samples,
 )
 from monitor.session import (
@@ -3353,7 +3353,9 @@ class MonitorEngine:
             samples = prices.setdefault(symbol, [])
             samples.append((now, price))
             prices[symbol] = trim_price_samples(samples, now=now, keep_seconds=keep)
-            prior = price_age_seconds_ago(prices[symbol], now=now, window_seconds=window)
+            prior = sudden_baseline(
+                prices[symbol], now=now, window_seconds=window
+            )
             if prior is None:
                 continue
             sudden = hour_change_pct(prior[1], price)
@@ -3389,6 +3391,9 @@ class MonitorEngine:
                 _symbols_text(sorted(dropped)),
                 len(still),
             )
+        # Prune after matching so a climb out of the 0–20% band can still
+        # fire on the same spike that pushed session gain above pool_max.
+        self._prune_sudden_leave_band(rule)
         if matched:
             logger.info(
                 "Sudden matches for %s: %s",
@@ -3396,6 +3401,35 @@ class MonitorEngine:
                 ", ".join(f"{quote.symbol} {quote.change_pct:+.1f}%" for quote in matched),
             )
         return matched
+
+    def _prune_sudden_leave_band(self, rule: Rule) -> None:
+        """Drop watches whose session gain left the early-move band."""
+        pool_max = rule.condition.pool_max_change
+        if pool_max is None:
+            return
+        pool_min = (
+            rule.condition.pool_min_change
+            if rule.condition.pool_min_change is not None
+            else 0.0
+        )
+        pool = self._sudden_pool.setdefault(rule.id, set())
+        prices = self._sudden_prices.setdefault(rule.id, {})
+        left_band = [
+            symbol
+            for symbol in list(pool)
+            if self._sudden_session.get(f"{rule.id}:{symbol}", pool_min) > pool_max
+        ]
+        for symbol in left_band:
+            pool.discard(symbol)
+            prices.pop(symbol, None)
+            self._sudden_session.pop(f"{rule.id}:{symbol}", None)
+        if left_band:
+            logger.info(
+                "Sudden %s pool leave-band %s (now %s)",
+                rule.id,
+                _symbols_text(sorted(left_band)),
+                len(pool),
+            )
 
     async def _discover_sudden_pool(
         self, rule: Rule, client: MoomooClient, session: str
@@ -3458,8 +3492,14 @@ class MonitorEngine:
             if quote.change_pct is None or quote.change_pct < pool_min:
                 continue
             if pool_max is not None and quote.change_pct > pool_max:
-                # Still record gain so leave-band can drop prior early-move watches.
+                # Mark above-band so match can still see this spike, then prune.
                 self._sudden_session[f"{rule.id}:{quote.symbol}"] = quote.change_pct
+                if quote.symbol in pool and quote.price is not None and quote.price > 0:
+                    samples = prices.setdefault(quote.symbol, [])
+                    samples.append((now, quote.price))
+                    prices[quote.symbol] = trim_price_samples(
+                        samples, now=now, keep_seconds=keep_samples
+                    )
                 continue
             if min_volume is not None and (quote.volume is None or quote.volume <= min_volume):
                 continue
@@ -3469,31 +3509,14 @@ class MonitorEngine:
                 added.append(quote.symbol)
             pool.add(quote.symbol)
             self._sudden_session[f"{rule.id}:{quote.symbol}"] = quote.change_pct
-            # Seed/refresh a price sample from the rank so the 1-minute window can start immediately.
+            # Seed/refresh a price sample from the rank so the window can start immediately.
             if quote.price is not None and quote.price > 0:
                 samples = prices.setdefault(quote.symbol, [])
                 samples.append((now, quote.price))
                 prices[quote.symbol] = trim_price_samples(
                     samples, now=now, keep_seconds=keep_samples
                 )
-        # Drop names that left the early-move band (already extended).
-        if pool_max is not None:
-            left_band = [
-                symbol
-                for symbol in list(pool)
-                if self._sudden_session.get(f"{rule.id}:{symbol}", pool_min) > pool_max
-            ]
-            for symbol in left_band:
-                pool.discard(symbol)
-                prices.pop(symbol, None)
-                self._sudden_session.pop(f"{rule.id}:{symbol}", None)
-            if left_band:
-                logger.info(
-                    "Sudden %s pool leave-band %s (now %s)",
-                    rule.id,
-                    _symbols_text(sorted(left_band)),
-                    len(pool),
-                )
+        # leave-band prune runs after match so the exit spike can still alert
         if len(pool) > 200:
             ranked = sorted(
                 pool,

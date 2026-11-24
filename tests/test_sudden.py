@@ -4,7 +4,13 @@ from unittest.mock import AsyncMock
 from monitor.config import ROOT
 from monitor.engine import MonitorEngine
 from monitor.models import Condition, ConditionType, Quote, Rule
-from monitor.rules import hour_change_pct, load_rules, price_age_seconds_ago, trim_price_samples
+from monitor.rules import (
+    hour_change_pct,
+    load_rules,
+    price_age_seconds_ago,
+    sudden_baseline,
+    trim_price_samples,
+)
 
 
 def test_price_age_picks_newest_sample_old_enough():
@@ -17,6 +23,18 @@ def test_price_age_picks_newest_sample_old_enough():
 def test_price_age_needs_a_full_window():
     samples = [(170.0, 1.0), (200.0, 1.2)]
     assert price_age_seconds_ago(samples, now=200.0, window_seconds=60) is None
+
+
+def test_sudden_baseline_allows_partial_window_spike():
+    """+10% in ~2 minutes counts before a full 5-minute sample exists."""
+    samples = [(100.0, 1.0), (220.0, 1.05)]
+    assert price_age_seconds_ago(samples, now=220.0, window_seconds=300) is None
+    assert sudden_baseline(
+        samples, now=220.0, window_seconds=300, min_age_seconds=60
+    ) == (100.0, 1.0)
+    assert sudden_baseline(
+        samples, now=130.0, window_seconds=300, min_age_seconds=60
+    ) is None
 
 
 def test_trim_keeps_recent_samples_only():
@@ -119,12 +137,15 @@ def test_sudden_discover_uses_afterhours_rank(caplog):
     assert any("pool +2" in record.message for record in caplog.records)
 
 
-def test_sudden_discover_drops_names_that_leave_early_band():
+def test_sudden_discover_marks_leave_band_but_keeps_until_prune():
+    import time
+
     engine = _engine()
     rule = _sudden_rule("afterhours")
+    live = time.time()
     engine._sudden_pool[rule.id] = {"EARLY"}
     engine._sudden_session[f"{rule.id}:EARLY"] = 12.0
-    engine._sudden_prices[rule.id] = {"EARLY": [(1.0, 1.0)]}
+    engine._sudden_prices[rule.id] = {"EARLY": [(live - 90.0, 1.0)]}
     client = AsyncMock()
     client.scan_afterhours = AsyncMock(
         return_value=[
@@ -137,6 +158,11 @@ def test_sudden_discover_drops_names_that_leave_early_band():
         await engine._discover_sudden_pool(rule, client, "afterhours")
 
     asyncio.run(run())
+    # Still in pool so match can see the exit spike; session marked >20%.
+    assert engine._sudden_pool[rule.id] == {"EARLY", "NEW"}
+    assert engine._sudden_session[f"{rule.id}:EARLY"] == 25.0
+    assert len(engine._sudden_prices[rule.id]["EARLY"]) == 2
+    engine._prune_sudden_leave_band(rule)
     assert engine._sudden_pool[rule.id] == {"NEW"}
     assert f"{rule.id}:EARLY" not in engine._sudden_session
 
@@ -253,6 +279,40 @@ def test_sudden_alert_shows_session_change_not_window_gain():
         assert len(matched) == 1
         assert matched[0].change_pct == 35.0
         assert matched[0].price == 1.2
+
+    asyncio.run(run())
+
+
+def test_sudden_match_fires_on_partial_window_then_leave_band():
+    """ONFO-style: +12% in ~2m inside 0–20% band, then session >20% — still alert."""
+    import time
+
+    from monitor.session import now_et
+
+    engine = _engine()
+    live = time.time()
+    rule = _sudden_rule("afterhours")
+    engine._sudden_day = now_et().date().isoformat()
+    engine._sudden_pool[rule.id] = {"ONFO"}
+    engine._sudden_session[f"{rule.id}:ONFO"] = 15.0
+    engine._sudden_prices[rule.id] = {"ONFO": [(live - 120.0, 1.0)]}
+    engine._sudden_discovered_at[rule.id] = 10**12
+    client = AsyncMock()
+    engine._trend_moomoo = client
+    engine.moomoo = client
+    engine.verbose = False
+    client.after_hours_quotes = AsyncMock(
+        return_value={
+            "ONFO": Quote(symbol="ONFO", price=1.12, change_pct=25.0, volume=200_000)
+        }
+    )
+
+    async def run() -> None:
+        matched = await engine._match_sudden_rule(rule)
+        assert [q.symbol for q in matched] == ["ONFO"]
+        assert matched[0].change_pct == 25.0
+        # Pruned after match because session gain left the 0–20% band.
+        assert "ONFO" not in engine._sudden_pool[rule.id]
 
     asyncio.run(run())
 

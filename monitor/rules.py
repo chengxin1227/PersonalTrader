@@ -203,6 +203,37 @@ def price_age_seconds_ago(
     return chosen
 
 
+def sudden_baseline(
+    samples: list[tuple[float, float]],
+    *,
+    now: float,
+    window_seconds: int,
+    min_age_seconds: int = 60,
+) -> tuple[float, float] | None:
+    """Baseline price for a sudden move within ``window_seconds``.
+
+    Prefer a sample ~window old (rolling N-minute change). If history is shorter
+    than the window but at least ``min_age_seconds`` old, use the oldest sample
+    so a +10% spike in 2 minutes still counts as "within ~5 minutes".
+    """
+    full = price_age_seconds_ago(
+        samples, now=now, window_seconds=window_seconds
+    )
+    if full is not None:
+        return full
+    if not samples or min_age_seconds <= 0:
+        return None
+    oldest: tuple[float, float] | None = None
+    for stamp, price in samples:
+        if price <= 0:
+            continue
+        if oldest is None or stamp < oldest[0]:
+            oldest = (stamp, price)
+    if oldest is None or now - oldest[0] < min_age_seconds:
+        return None
+    return oldest
+
+
 def trim_price_samples(
     samples: list[tuple[float, float]],
     *,

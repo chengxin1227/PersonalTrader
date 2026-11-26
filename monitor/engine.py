@@ -1888,6 +1888,9 @@ class MonitorEngine:
         await self._send_system(title, message)
 
     async def _maybe_send_check_reminders(self, config: RulesConfig) -> None:
+        # Weekends + exchange holidays (Thanksgiving, etc.): no check reminders.
+        if not is_trading_day(self.market):
+            return
         due = due_check_reminders(extra=_important_reminders(config.important))
         if not due:
             return
@@ -3918,6 +3921,9 @@ class MonitorEngine:
         return matched
 
     async def _maybe_send_leaderboard(self, rule: Rule, state: dict) -> None:
+        # Weekends + exchange holidays: no half-hour / interval boards.
+        if not is_trading_day(self.market):
+            return
         slot = _board_slot_for_rule(rule)
         if slot is None or self.moomoo is None:
             return

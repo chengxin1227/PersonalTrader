@@ -296,6 +296,13 @@ def test_trading_day_uses_next_open():
         next_open=datetime(2026, 9, 28, 9, 30, tzinfo=ET),
     )
     assert not is_trading_day(weekend, datetime(2026, 9, 26, 10, 0, tzinfo=ET))
+    # Thanksgiving 2026: weekday but next open is Friday.
+    thanksgiving = datetime(2026, 11, 26, 16, 15, tzinfo=ET)
+    holiday = MarketClock(
+        is_open=False,
+        next_open=datetime(2026, 11, 27, 9, 30, tzinfo=ET),
+    )
+    assert not is_trading_day(holiday, thanksgiving)
 
 
 def test_session_board_slot_five_minute_interval():

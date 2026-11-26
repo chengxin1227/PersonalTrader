@@ -611,6 +611,111 @@ def test_halt50_board_takes_boost_top5(tmp_path):
     asyncio.run(run())
 
 
+def test_tonghuashun_sync_routes_ah_halt_to_subgroup(tmp_path):
+    """AH halt-or-5d singles write the trigger subgroup, not the umbrella name."""
+    from monitor.models import DayGainTier
+    from monitor.rules import HALT_OR_5D_AH_THS_PAST_100
+
+    store = Store(tmp_path)
+    engine = MonitorEngine.__new__(MonitorEngine)
+    engine.store = store
+    engine._ths_lock = asyncio.Lock()
+    engine._ths_active_session = lambda: "盘后"  # type: ignore[method-assign]
+    engine._session_changes = AsyncMock(return_value={})  # type: ignore[method-assign]
+    engine._note_problem = AsyncMock()  # type: ignore[method-assign]
+    captured: list[str] = []
+
+    class FakeTHS:
+        configured = True
+
+        def set_important_group(self, _name: str) -> None:
+            return None
+
+        async def members(
+            self,
+            group: str,
+            day: str,
+            symbols,
+            session: str,
+            bump_symbols=None,
+            *,
+            replace: bool = False,
+        ):
+            del day, session, replace
+            captured.append(group)
+            return list(bump_symbols if bump_symbols is not None else symbols)
+
+        async def arrange(self, group: str, ordered, *, session=None, tag_symbols=None):
+            del ordered, session, tag_symbols
+            captured.append(f"arrange:{group}")
+
+        async def add_important(self, *_a, **_k):
+            return None
+
+        async def add_daily(self, *_a, **_k):
+            return None
+
+    engine.ths = FakeTHS()
+    engine.load_config = lambda: type(  # type: ignore[method-assign]
+        "Cfg",
+        (),
+        {
+            "important": type(
+                "Imp",
+                (),
+                {
+                    "ths_group": "今日自选",
+                    "high_priority_rule_ids": [],
+                    "watchlist": type(
+                        "W",
+                        (),
+                        {
+                            "board": [],
+                            "always": [],
+                            "event": [],
+                            "afterhours_open": [],
+                            "session_late": [],
+                            "reminder_sync": [],
+                        },
+                    )(),
+                },
+            )()
+        },
+    )()
+
+    rule = Rule(
+        id="afterhours-halt-or-5d-boost",
+        name="熔断或5日盘后的股票",
+        group="盘后",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.AFTERHOURS_GAIN,
+            value=5,
+            day_gain_tiers=[
+                DayGainTier(min_recent_day_change=50, value=10),
+                DayGainTier(min_recent_day_change=100, value=5),
+            ],
+            recent_day_count=5,
+        ),
+    )
+    quote = Quote(
+        symbol="ABC",
+        change_pct=6.0,
+        recent_day_gain_floors=[100.0],
+    )
+
+    async def run() -> None:
+        with patch("monitor.engine.now_et") as now:
+            now.return_value = datetime(2026, 11, 18, 17, 0, tzinfo=timezone.utc)
+            await engine._tonghuashun_sync(rule, [quote], board=False)
+
+    asyncio.run(run())
+    assert captured == [
+        HALT_OR_5D_AH_THS_PAST_100,
+        f"arrange:{HALT_OR_5D_AH_THS_PAST_100}",
+    ]
+
+
 def test_halt_or_5d_trigger_label_legs():
     from monitor.models import DayGainTier
     from monitor.rules import halt_or_5d_trigger_label

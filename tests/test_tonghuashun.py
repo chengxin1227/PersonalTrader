@@ -47,6 +47,8 @@ def test_shared_rule_group_names_from_live_rules():
     assert "熔断或5日盘后前5的股票" not in shared
     assert "熔断或5日盘后的股票" not in shared
     assert "熔断或5日盘前的股票" not in shared
+    # Past-5d 100% pool reuses one THS name across 盘前/盘中/盘后.
+    assert "过去5日超100%的股票" in shared
 
 
 def test_sync_groups_keep_includes_session_and_important():

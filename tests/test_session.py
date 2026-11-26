@@ -72,18 +72,19 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
     from monitor.session import CheckReminder, afterhours_open_window
     from datetime import time
 
-    assert [item.key for item in due_check_reminders(datetime(2026, 10, 15, 15, 44, tzinfo=ET))] == []
-    close = due_check_reminders(datetime(2026, 10, 15, 15, 45, tzinfo=ET))
-    assert [item.key for item in close] == ["regular-close-15"]
-    assert close[0].rule_ids == ("afterhours-halt-or-5d-boost", "regular-sudden-10")
-    assert due_check_reminders(datetime(2026, 10, 15, 15, 47, 59, tzinfo=ET))
-    assert due_check_reminders(datetime(2026, 10, 15, 15, 48, tzinfo=ET)) == []
-
-    # Built-in list no longer includes the deleted day30 / 18:30 entries.
+    # No built-in schedule — only yaml/extra reminders.
+    assert due_check_reminders(datetime(2026, 10, 15, 15, 45, tzinfo=ET)) == []
+    assert due_check_reminders(datetime(2026, 10, 15, 9, 15, tzinfo=ET)) == []
     assert due_check_reminders(datetime(2026, 10, 15, 16, 5, tzinfo=ET)) == []
     assert due_check_reminders(datetime(2026, 10, 15, 18, 30, tzinfo=ET)) == []
 
     extra = [
+        CheckReminder(
+            "afterhours-halt-or-5d-check",
+            time(16, 15),
+            ("afterhours-halt-or-5d-boost",),
+            "熔断或5日盘后",
+        ),
         CheckReminder(
             "afterhours-2h",
             time(18, 0),
@@ -97,17 +98,19 @@ def test_check_reminders_fire_once_inside_a_three_minute_window():
             "盘后3小时45分",
         ),
     ]
+    assert due_check_reminders(datetime(2026, 10, 15, 16, 14, tzinfo=ET), extra=extra) == []
+    first = due_check_reminders(datetime(2026, 10, 15, 16, 15, tzinfo=ET), extra=extra)
+    assert [item.key for item in first] == ["afterhours-halt-or-5d-check"]
+    assert first[0].rule_ids == ("afterhours-halt-or-5d-boost",)
+    assert due_check_reminders(datetime(2026, 10, 15, 16, 17, 59, tzinfo=ET), extra=extra)
+    assert due_check_reminders(datetime(2026, 10, 15, 16, 18, tzinfo=ET), extra=extra) == []
     mid = due_check_reminders(datetime(2026, 10, 15, 18, 0, tzinfo=ET), extra=extra)
     assert [item.key for item in mid] == ["afterhours-2h"]
     assert mid[0].rule_ids == ("afterhours-top5",)
     assert [
         item.key for item in due_check_reminders(datetime(2026, 10, 15, 19, 45, tzinfo=ET), extra=extra)
     ] == ["afterhours-3h45"]
-
-    assert [item.rule_ids for item in due_check_reminders(datetime(2026, 10, 15, 9, 15, tzinfo=ET))] == [
-        ("premarket-sudden-10",)
-    ]
-    assert due_check_reminders(datetime(2026, 10, 17, 15, 45, tzinfo=ET)) == []  # Saturday
+    assert due_check_reminders(datetime(2026, 10, 17, 16, 15, tzinfo=ET), extra=extra) == []  # Saturday
 
     assert afterhours_open_window(datetime(2026, 10, 15, 16, 0, tzinfo=ET), minutes=15)
     assert afterhours_open_window(datetime(2026, 10, 15, 16, 14, 59, tzinfo=ET), minutes=15)

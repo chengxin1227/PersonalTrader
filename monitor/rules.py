@@ -135,6 +135,101 @@ def halt_or_5d_trigger_label(
     return rule.name
 
 
+# Tonghuashun subgroups for afterhours-halt-or-5d-boost (alert rule stays one).
+HALT_OR_5D_AH_THS_PAST_50 = "过去5日超50%且盘后一度超10%"
+HALT_OR_5D_AH_THS_PAST_100 = "过去5日超100%且盘后一度超5%"
+HALT_OR_5D_AH_THS_TODAY_50 = "今日盘中一度涨超50%且盘后一度超10%"
+HALT_OR_5D_AH_THS_TODAY_100_OR_HALT = (
+    "今日盘中一度涨超100%或涨停且盘后一度超5%"
+)
+
+# Tonghuashun subgroups for regular-halt50-fade-board (board rule stays one).
+REGULAR_HALT50_FADE_THS_HALT = "盘中熔断回落的股票"
+REGULAR_HALT50_FADE_THS_50 = "盘中50%回落的股票"
+
+# Tonghuashun subgroups for regular-halt50-rebound (alert rule stays one).
+REGULAR_HALT50_REBOUND_THS_HALT = "盘中熔断回升的股票"
+REGULAR_HALT50_REBOUND_THS_50 = "盘中50%回升的股票"
+
+
+def halt_or_5d_ah_ths_groups() -> tuple[str, ...]:
+    """All 同花顺 subgroups for the AH halt-or-5d singles rule."""
+    return (
+        HALT_OR_5D_AH_THS_PAST_50,
+        HALT_OR_5D_AH_THS_PAST_100,
+        HALT_OR_5D_AH_THS_TODAY_50,
+        HALT_OR_5D_AH_THS_TODAY_100_OR_HALT,
+    )
+
+
+def regular_halt50_fade_ths_groups() -> tuple[str, ...]:
+    """同花顺 subgroups for the regular halt/50% fade board."""
+    return (REGULAR_HALT50_FADE_THS_HALT, REGULAR_HALT50_FADE_THS_50)
+
+
+def regular_halt50_rebound_ths_groups() -> tuple[str, ...]:
+    """同花顺 subgroups for the regular halt/50% rebound singles rule."""
+    return (REGULAR_HALT50_REBOUND_THS_HALT, REGULAR_HALT50_REBOUND_THS_50)
+
+
+def regular_halt50_rebound_ths_group(
+    symbol: str, *, halted: set[str] | frozenset[str]
+) -> str:
+    """Halt group if upward-halt today; otherwise 50% group."""
+    key = symbol.strip().upper()
+    if key in halted:
+        return REGULAR_HALT50_REBOUND_THS_HALT
+    return REGULAR_HALT50_REBOUND_THS_50
+
+
+def halt_or_5d_ths_group(
+    rule: Rule,
+    quote: Quote,
+    *,
+    today_floors: set[float] | frozenset[float] | None = None,
+) -> str | None:
+    """Tonghuashun group for afterhours-halt-or-5d-boost by trigger leg.
+
+    Priority when several legs match:
+    past 100% → past 50% → today 100% or halt → today 50%.
+    """
+    if rule.id != "afterhours-halt-or-5d-boost":
+        return None
+    today_hit = {float(item) for item in (today_floors or ())}
+    floors = {float(item) for item in (quote.recent_day_gain_floors or [])}
+    if not floors and quote.recent_day_spike is True:
+        # Fall back like matched_day_gain_tier when only the spike flag is set.
+        for tier in day_gain_tiers_for(rule):
+            floors.add(float(tier.min_recent_day_change))
+    marks = [
+        value
+        for value in (quote.change_pct, quote.session_high_pct)
+        if value is not None
+    ]
+    session_gain = max(marks) if marks else None
+    if session_gain is None:
+        return None
+
+    past_100 = 100.0 in floors and 100.0 not in today_hit and session_gain > 5
+    past_50 = 50.0 in floors and 50.0 not in today_hit and session_gain > 10
+    today_100 = 100.0 in today_hit and session_gain > 5
+    today_50 = 50.0 in today_hit and session_gain > 10
+    halt_leg = (
+        quote.session_circuit_breaker is True
+        and session_gain > float(rule.condition.value)
+    )
+
+    if past_100:
+        return HALT_OR_5D_AH_THS_PAST_100
+    if past_50:
+        return HALT_OR_5D_AH_THS_PAST_50
+    if today_100 or halt_leg:
+        return HALT_OR_5D_AH_THS_TODAY_100_OR_HALT
+    if today_50:
+        return HALT_OR_5D_AH_THS_TODAY_50
+    return None
+
+
 def load_rules(path: Path) -> RulesConfig:
     if not path.exists():
         raise FileNotFoundError(

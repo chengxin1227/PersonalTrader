@@ -935,7 +935,13 @@ def test_fade_leaders_rank_by_giveback():
 
 
 def test_peak_fade_board_is_not_a_single_fade_rule():
-    from monitor.engine import _is_peak_fade_board, _is_peak_fade_rule, _sorts_ths_by_peak_fade
+    from monitor.engine import (
+        MonitorEngine,
+        _is_peak_fade_board,
+        _is_peak_fade_rule,
+        _sorts_ths_by_peak_fade,
+    )
+    from monitor.rules import regular_halt50_fade_ths_groups
 
     rule = Rule(
         id="regular-halt50-fade-board",
@@ -954,13 +960,44 @@ def test_peak_fade_board_is_not_a_single_fade_rule():
     assert _is_peak_fade_board(rule)
     assert not _is_peak_fade_rule(rule)
     assert _sorts_ths_by_peak_fade(rule)
+    assert MonitorEngine._ths_group_names_for_rule(rule) == list(
+        regular_halt50_fade_ths_groups()
+    )
+
+
+def test_partition_halt50_fade_symbols(tmp_path):
+    from datetime import datetime, timezone
+
+    from monitor.engine import MonitorEngine
+    from monitor.session import now_et
+    from monitor.store import Store
+
+    store = Store(tmp_path)
+    day = now_et().date().isoformat()
+    seen = datetime(2026, 11, 25, 15, 0, tzinfo=timezone.utc)
+    store.note_spike(day, "upward_halt", "HALT", seen)
+    store.note_spike(day, "upward_halt", "BOTH", seen)
+    engine = MonitorEngine.__new__(MonitorEngine)
+    engine.store = store
+    halt_syms, fifty_syms = engine._partition_halt50_fade_symbols(
+        ["HALT", "FIFTY", "BOTH", "ONLY50"]
+    )
+    assert halt_syms == ["HALT", "BOTH"]
+    assert fifty_syms == ["FIFTY", "ONLY50"]
 
 
 def test_peak_rebound_rule_classifier():
     from monitor.engine import (
+        MonitorEngine,
         _is_peak_fade_board,
         _is_peak_fade_rule,
         _is_peak_rebound_rule,
+    )
+    from monitor.rules import (
+        REGULAR_HALT50_REBOUND_THS_50,
+        REGULAR_HALT50_REBOUND_THS_HALT,
+        regular_halt50_rebound_ths_group,
+        regular_halt50_rebound_ths_groups,
     )
 
     rule = Rule(
@@ -979,6 +1016,21 @@ def test_peak_rebound_rule_classifier():
     assert _is_peak_rebound_rule(rule)
     assert not _is_peak_fade_rule(rule)
     assert not _is_peak_fade_board(rule)
+    assert MonitorEngine._ths_group_names_for_rule(rule) == list(
+        regular_halt50_rebound_ths_groups()
+    )
+    assert (
+        regular_halt50_rebound_ths_group("HALT", halted={"HALT", "BOTH"})
+        == REGULAR_HALT50_REBOUND_THS_HALT
+    )
+    assert (
+        regular_halt50_rebound_ths_group("BOTH", halted={"HALT", "BOTH"})
+        == REGULAR_HALT50_REBOUND_THS_HALT
+    )
+    assert (
+        regular_halt50_rebound_ths_group("FIFTY", halted={"HALT", "BOTH"})
+        == REGULAR_HALT50_REBOUND_THS_50
+    )
 
     ah = Rule(
         id="afterhours-50-rebound",
@@ -1157,11 +1209,13 @@ def test_near_peak_rule_classifier():
 
 def test_halt_or_5d_boost_uses_ths_rule_group():
     from monitor.engine import (
+        MonitorEngine,
         _is_halt_or_day_rule,
         _skips_ths_rule_group,
         _sorts_ths_by_peak_fade,
     )
     from monitor.models import DayGainTier
+    from monitor.rules import halt_or_5d_ah_ths_groups
 
     rule = Rule(
         id="regular-halt-or-5d-boost",
@@ -1197,6 +1251,88 @@ def test_halt_or_5d_boost_uses_ths_rule_group():
         ),
     )
     assert not _skips_ths_rule_group(board)
+    ah = Rule(
+        id="afterhours-halt-or-5d-boost",
+        name="熔断或5日盘后的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.AFTERHOURS_GAIN,
+            value=5,
+            min_regular_touch=50,
+            include_circuit_breaker=True,
+            require_circuit_breaker=True,
+            day_gain_tiers=[
+                DayGainTier(min_recent_day_change=50, value=10),
+                DayGainTier(min_recent_day_change=100, value=5),
+            ],
+            recent_day_count=5,
+            intraday_touch=True,
+        ),
+    )
+    assert MonitorEngine._ths_group_names_for_rule(ah) == list(halt_or_5d_ah_ths_groups())
+    assert MonitorEngine._ths_group_names_for_rule(rule) == [rule.name]
+
+
+def test_halt_or_5d_ths_group_priority():
+    from monitor.models import DayGainTier
+    from monitor.rules import (
+        HALT_OR_5D_AH_THS_PAST_100,
+        HALT_OR_5D_AH_THS_PAST_50,
+        HALT_OR_5D_AH_THS_TODAY_100_OR_HALT,
+        HALT_OR_5D_AH_THS_TODAY_50,
+        halt_or_5d_ths_group,
+    )
+
+    rule = Rule(
+        id="afterhours-halt-or-5d-boost",
+        name="熔断或5日盘后的股票",
+        symbol="*",
+        condition=Condition(
+            type=ConditionType.AFTERHOURS_GAIN,
+            value=5,
+            day_gain_tiers=[
+                DayGainTier(min_recent_day_change=50, value=10),
+                DayGainTier(min_recent_day_change=100, value=5),
+            ],
+            recent_day_count=5,
+        ),
+    )
+    # Past 100
+    q = Quote(symbol="A", change_pct=6.0, recent_day_gain_floors=[100.0])
+    assert halt_or_5d_ths_group(rule, q, today_floors=set()) == HALT_OR_5D_AH_THS_PAST_100
+    # Past 50
+    q = Quote(symbol="B", change_pct=11.0, recent_day_gain_floors=[50.0])
+    assert halt_or_5d_ths_group(rule, q, today_floors=set()) == HALT_OR_5D_AH_THS_PAST_50
+    # Today 50
+    q = Quote(symbol="C", change_pct=11.0, recent_day_gain_floors=[50.0])
+    assert (
+        halt_or_5d_ths_group(rule, q, today_floors={50.0}) == HALT_OR_5D_AH_THS_TODAY_50
+    )
+    # Today 100
+    q = Quote(symbol="D", change_pct=6.0, recent_day_gain_floors=[100.0, 50.0])
+    assert (
+        halt_or_5d_ths_group(rule, q, today_floors={100.0, 50.0})
+        == HALT_OR_5D_AH_THS_TODAY_100_OR_HALT
+    )
+    # Halt only
+    q = Quote(
+        symbol="E",
+        change_pct=6.0,
+        session_circuit_breaker=True,
+        recent_day_gain_floors=[],
+    )
+    assert (
+        halt_or_5d_ths_group(rule, q, today_floors=set())
+        == HALT_OR_5D_AH_THS_TODAY_100_OR_HALT
+    )
+    # Past 100 beats today 50
+    q = Quote(symbol="F", change_pct=12.0, recent_day_gain_floors=[100.0, 50.0])
+    assert (
+        halt_or_5d_ths_group(rule, q, today_floors={50.0}) == HALT_OR_5D_AH_THS_PAST_100
+    )
+    # Premarket rule does not split
+    pm = rule.model_copy(update={"id": "premarket-halt-or-5d-boost"})
+    assert halt_or_5d_ths_group(pm, q, today_floors=set()) is None
 
 
 def test_session50_singles_use_ths_rule_group_and_live_yaml():

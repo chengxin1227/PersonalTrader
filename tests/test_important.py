@@ -25,8 +25,9 @@ def test_rules_yaml_loads_important_block():
     config = load_rules(ROOT / "config" / "rules.yaml")
     assert config.important.ths_group == "今日自选"
     assert config.important.high_priority_rule_ids == []
-    # 18:00 / 19:50 / 03:00 ET check reminders stay high-priority in _deliver_check_reminder.
+    # Timed check reminders (yaml only) stay high-priority in _deliver_check_reminder.
     assert {item.key for item in config.important.reminders} == {
+        "afterhours-halt-or-5d-check",
         "afterhours-2h",
         "afterhours-buy",
         "afterhours-sell",
@@ -40,17 +41,29 @@ def test_rules_yaml_loads_important_block():
     assert config.important.watchlist.reminder_sync == []
     assert config.important.watched_symbols.symbols == []
     keys = [item.key for item in config.important.reminders]
-    assert keys == ["afterhours-2h", "afterhours-buy", "afterhours-sell"]
-    assert [item.at for item in config.important.reminders] == ["18:00", "19:50", "03:00"]
+    assert keys == [
+        "afterhours-halt-or-5d-check",
+        "afterhours-2h",
+        "afterhours-buy",
+        "afterhours-sell",
+    ]
+    assert [item.at for item in config.important.reminders] == [
+        "16:15",
+        "18:00",
+        "19:50",
+        "03:00",
+    ]
     assert [item.label for item in config.important.reminders] == [
+        "熔断或5日盘后",
         "盘后2小时",
         "准备买入",
         "准备卖出",
     ]
+    assert config.important.reminders[0].rule_ids == ["afterhours-halt-or-5d-boost"]
     assert all(
         item.rule_ids
         == ["afterhours-top5", "afterhours-halt50-or-5d50-board"]
-        for item in config.important.reminders
+        for item in config.important.reminders[1:]
     )
     assert all(item.sync_watchlist is False for item in config.important.reminders)
 
@@ -58,17 +71,32 @@ def test_rules_yaml_loads_important_block():
         "afterhours-top5",
         "afterhours-halt-or-5d-boost",
         "afterhours-halt50-or-5d50-board",
+        "afterhours-5d100-board",
         "afterhours-sudden-10",
         "afterhours-50-rebound",
         "regular-top5",
         "regular-halt50-fade-board",
         "regular-halt50-rebound",
+        "regular-5d100-board",
         "regular-near-peak-35",
         "premarket-top5",
         "premarket-halt-or-5d-boost",
+        "premarket-5d100-board",
         "premarket-sudden-10",
         "premarket-50-rebound",
     ]
+    for rule_id in (
+        "afterhours-5d100-board",
+        "regular-5d100-board",
+        "premarket-5d100-board",
+    ):
+        board = next(rule for rule in config.rules if rule.id == rule_id)
+        assert board.name == "过去5日超100%的股票"
+        assert board.board_notify is False
+        assert board.condition.min_recent_day_change == 100
+        assert board.condition.recent_day_count == 5
+        assert board.condition.top_n == 50
+        assert board.condition.board_interval_minutes == 5
     for rule_id, name in (
         ("regular-top5", "今日盘中涨幅最高前5的股票"),
         ("premarket-top5", "今日盘前涨幅最高前5的股票"),
@@ -147,6 +175,10 @@ def test_rules_yaml_loads_important_block():
 def test_important_reminders_merge_into_due_window():
     config = load_rules(ROOT / "config" / "rules.yaml")
     extra = _important_reminders(config.important)
+    due_first = due_check_reminders(datetime(2026, 10, 15, 16, 15, tzinfo=ET), extra=extra)
+    assert [item.key for item in due_first] == ["afterhours-halt-or-5d-check"]
+    assert due_first[0].label == "熔断或5日盘后"
+    assert due_first[0].rule_ids == ("afterhours-halt-or-5d-boost",)
     due = due_check_reminders(datetime(2026, 10, 15, 19, 50, tzinfo=ET), extra=extra)
     assert [item.key for item in due] == ["afterhours-buy"]
     assert due[0].label == "准备买入"
@@ -155,6 +187,9 @@ def test_important_reminders_merge_into_due_window():
     due_sell = due_check_reminders(datetime(2026, 10, 16, 3, 0, tzinfo=ET), extra=extra)
     assert [item.key for item in due_sell] == ["afterhours-sell"]
     assert due_sell[0].label == "准备卖出"
+    # Hardcoded 15:45 / 09:15 reminders removed.
+    assert due_check_reminders(datetime(2026, 10, 15, 15, 45, tzinfo=ET), extra=extra) == []
+    assert due_check_reminders(datetime(2026, 10, 15, 9, 15, tzinfo=ET), extra=extra) == []
 
 
 def _sudden(session: str, rule_id: str) -> Rule:

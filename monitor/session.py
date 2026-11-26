@@ -109,20 +109,8 @@ class CheckReminder:
         self.label = label
 
 
-CHECK_REMINDERS = (
-    CheckReminder(
-        "regular-close-15",
-        time(15, 45),
-        ("afterhours-halt-or-5d-boost", "regular-sudden-10"),
-        "盘中收盘前15分钟",
-    ),
-    CheckReminder(
-        "premarket-end-15",
-        time(9, 15),
-        ("premarket-sudden-10",),
-        "盘前结束前15分钟",
-    ),
-)
+# Built-in schedule empty — timed check reminders come from config/rules.yaml.
+CHECK_REMINDERS: tuple[CheckReminder, ...] = ()
 
 
 def afterhours_open_window(

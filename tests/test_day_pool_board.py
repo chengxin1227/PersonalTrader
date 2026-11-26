@@ -122,7 +122,7 @@ def test_day_pool_session_leaders_sort_by_session_gain(tmp_path):
                 return_value=["2026-11-11", "2026-11-10", "2026-11-09", "2026-11-08", "2026-11-07"],
             ):
                 leaders = await engine._day_pool_session_leaders(rule, 10_000)
-        # BBB is red (−3%) and CCC fails volume; only AAA clears >0% + volume.
-        assert [quote.symbol for quote in leaders] == ["AAA"]
+        # value=0 keeps the full pool ranked high→low; CCC fails volume, DDD has no price.
+        assert [quote.symbol for quote in leaders] == ["AAA", "BBB"]
 
     asyncio.run(run())

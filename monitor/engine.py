@@ -45,7 +45,14 @@ from monitor.rules import (
     fade_leaderboard_line,
     leaderboard_line,
     load_rules,
+    REGULAR_HALT50_FADE_THS_50,
+    REGULAR_HALT50_FADE_THS_HALT,
+    halt_or_5d_ah_ths_groups,
+    halt_or_5d_ths_group,
     halt_or_5d_trigger_label,
+    regular_halt50_fade_ths_groups,
+    regular_halt50_rebound_ths_group,
+    regular_halt50_rebound_ths_groups,
     matched_day_gain_tier,
     peak_leaderboard_line,
     render_message,
@@ -1977,7 +1984,7 @@ class MonitorEngine:
         text = check_reminder_text(label, names)
         routes = getattr(self, "routes", None)
         notify = CHECK_REMINDER_NOTIFY
-        # Check reminders are afterhours-tied (18:00 / 19:50 / 03:00 ET) → 今日盘后自选.
+        # Check reminders are afterhours-tied (16:15 / 18:00 / 19:50 / 03:00 ET) → 今日盘后自选.
         session = et_session_name() or "盘后"
         slack_url = ""
         token = ""
@@ -4013,13 +4020,35 @@ class MonitorEngine:
                 len(leaders),
             )
         if _sorts_ths_by_peak_fade(rule):
-            # Halt/50%: keep the full pool, sort by peak−close fade (no clear/replace).
-            self._add_to_tonghuashun(
-                rule,
-                self._halt_or_day_pool_symbols(rule),
-                board=True,
-                pin_symbols=pin,
-            )
+            # Halt/50% fade board: two THS groups; others keep one pool group.
+            pool = self._halt_or_day_pool_symbols(rule)
+            if rule.id == "regular-halt50-fade-board":
+                halt_syms, fifty_syms = self._partition_halt50_fade_symbols(pool)
+                pin_halt = [symbol for symbol in pin if symbol in set(halt_syms)]
+                pin_fifty = [symbol for symbol in pin if symbol in set(fifty_syms)]
+                if halt_syms:
+                    self._add_to_tonghuashun(
+                        rule,
+                        halt_syms,
+                        board=True,
+                        pin_symbols=pin_halt,
+                        ths_group=REGULAR_HALT50_FADE_THS_HALT,
+                    )
+                if fifty_syms:
+                    self._add_to_tonghuashun(
+                        rule,
+                        fifty_syms,
+                        board=True,
+                        pin_symbols=pin_fifty,
+                        ths_group=REGULAR_HALT50_FADE_THS_50,
+                    )
+            else:
+                self._add_to_tonghuashun(
+                    rule,
+                    pool,
+                    board=True,
+                    pin_symbols=pin,
+                )
         elif _is_ah_touch_board_rule(rule):
             self._add_to_tonghuashun(
                 rule,
@@ -4068,12 +4097,15 @@ class MonitorEngine:
         if not marks:
             return []
         volume = int(min_volume) if min_volume is not None else None
-        # Day-gain pool with live session % above the rule floor (default >0%).
+        # value > 0 filters session gain; value <= 0 keeps the full pool ranked high→low.
+        min_change = (
+            rule.condition.value if rule.condition.value > 0 else None
+        )
         return afterhours_leaders(
             list(marks.values()),
             rule.condition.top_n or 50,
             volume,
-            min_change=rule.condition.value,
+            min_change=min_change,
         )
 
     def _halt_or_day_pool_symbols(self, rule: Rule) -> list[str]:
@@ -4096,6 +4128,27 @@ class MonitorEngine:
         if rule.condition.include_circuit_breaker or rule.condition.require_circuit_breaker:
             symbols.update(self.store.session_symbols(day, "upward_halt"))
         return sorted(symbols)
+
+    def _partition_halt50_fade_symbols(
+        self, symbols: list[str]
+    ) -> tuple[list[str], list[str]]:
+        """Split fade-board pool: upward halt vs 50%-only (halt wins if both)."""
+        day = now_et().date().isoformat()
+        halted = {
+            symbol.strip().upper()
+            for symbol in self.store.session_symbols(day, "upward_halt")
+        }
+        halt_syms: list[str] = []
+        fifty_syms: list[str] = []
+        for symbol in symbols:
+            key = symbol.strip().upper()
+            if not key:
+                continue
+            if key in halted:
+                halt_syms.append(key)
+            else:
+                fifty_syms.append(key)
+        return halt_syms, fifty_syms
 
     def _ah_touch_pool_symbols(self, rule: Rule) -> list[str]:
         """Symbols that once cleared the after-hours touch threshold today."""
@@ -4699,23 +4752,46 @@ class MonitorEngine:
                 return True
         return False
 
-    def _halt_or_5d_trigger_label(self, rule: Rule, quote: Quote) -> str | None:
-        """Which OR-leg fired for *-halt-or-5d-boost (Pushover title + reason)."""
-        if not rule.id.endswith("-halt-or-5d-boost"):
-            return None
+    def _halt_or_5d_today_floors(self, rule: Rule, quote: Quote) -> set[float]:
         today = now_et().date().isoformat()
         floors = _day_gain_floors(rule)
         symbol = quote.symbol.upper()
-        today_floors = {
+        return {
             minimum
             for minimum in floors
             if self.store.saw_day_gain(symbol, minimum, [today])
         }
+
+    def _halt_or_5d_trigger_label(self, rule: Rule, quote: Quote) -> str | None:
+        """Which OR-leg fired for *-halt-or-5d-boost (Pushover title + reason)."""
+        if not rule.id.endswith("-halt-or-5d-boost"):
+            return None
         return halt_or_5d_trigger_label(
             rule,
             quote,
-            today_floors=today_floors,
+            today_floors=self._halt_or_5d_today_floors(rule, quote),
         )
+
+    def _halt_or_5d_ths_group(self, rule: Rule, quote: Quote) -> str | None:
+        """Tonghuashun subgroup for afterhours-halt-or-5d-boost."""
+        return halt_or_5d_ths_group(
+            rule,
+            quote,
+            today_floors=self._halt_or_5d_today_floors(rule, quote),
+        )
+
+    @staticmethod
+    def _ths_group_names_for_rule(rule: Rule) -> list[str]:
+        """Rule → 同花顺 group name(s). Some rules expand to trigger subgroups."""
+        if rule.id == "afterhours-halt-or-5d-boost":
+            return list(halt_or_5d_ah_ths_groups())
+        if rule.id == "regular-halt50-fade-board":
+            return list(regular_halt50_fade_ths_groups())
+        if rule.id == "regular-halt50-rebound":
+            return list(regular_halt50_rebound_ths_groups())
+        if rule.name:
+            return [rule.name]
+        return []
 
     async def _fire_alert(
         self,
@@ -4896,14 +4972,11 @@ class MonitorEngine:
             return
         self.ths.set_important_group(config.important.ths_group)
         day = now_et().date().isoformat()
-        names = [
-            rule.name
-            for rule in config.rules
-            if rule.enabled
-            and rule.name
-            and not _is_symbol_close_rule(rule)
-            and not _skips_ths_rule_group(rule)
-        ]
+        names: list[str] = []
+        for rule in config.rules:
+            if not rule.enabled or _is_symbol_close_rule(rule) or _skips_ths_rule_group(rule):
+                continue
+            names.extend(self._ths_group_names_for_rule(rule))
         session = self._ths_active_session()
         need_structure = not self._ths_groups_synced
         need_session_clear = bool(session) and self._ths_cleared_session_day.get(session) != day
@@ -4921,15 +4994,15 @@ class MonitorEngine:
                             result.get("deleted") or [],
                         )
                 if need_session_clear and session is not None:
-                    session_names = [
-                        rule.name
-                        for rule in config.rules
-                        if rule.enabled
-                        and rule.name
-                        and (rule.group or rule.condition_session) == session
-                        and not _is_symbol_close_rule(rule)
-                        and not _skips_ths_rule_group(rule)
-                    ]
+                    session_names: list[str] = []
+                    for rule in config.rules:
+                        if not rule.enabled:
+                            continue
+                        if (rule.group or rule.condition_session) != session:
+                            continue
+                        if _is_symbol_close_rule(rule) or _skips_ths_rule_group(rule):
+                            continue
+                        session_names.extend(self._ths_group_names_for_rule(rule))
                     shared_names = _shared_rule_group_names(config)
                     cleared = await self.ths.clear_session_day(
                         session, day, session_names, shared_rule_names=shared_names
@@ -4954,6 +5027,7 @@ class MonitorEngine:
         board: bool = False,
         important_symbols: list[str] | None = None,
         pin_symbols: list[str] | None = None,
+        ths_group: str | None = None,
     ) -> None:
         if not self.ths.configured:
             return
@@ -4964,7 +5038,8 @@ class MonitorEngine:
                 for symbol in (pin_symbols or [])
                 if symbol and str(symbol).strip()
             )
-            if order and self._ths_last_board_order.get(rule.id) == order:
+            order_key = f"{rule.id}:{ths_group or rule.name}"
+            if order and self._ths_last_board_order.get(order_key) == order:
                 return
         task = asyncio.create_task(
             self._tonghuashun_sync(
@@ -4973,6 +5048,7 @@ class MonitorEngine:
                 board=board,
                 important_symbols=important_symbols,
                 pin_symbols=pin_symbols,
+                ths_group=ths_group,
             )
         )
         self._ths_tasks.add(task)
@@ -4986,13 +5062,42 @@ class MonitorEngine:
         board: bool = False,
         important_symbols: list[str] | None = None,
         pin_symbols: list[str] | None = None,
+        ths_group: str | None = None,
     ) -> None:
-        group = rule.name
+        group = ths_group or rule.name
         day = now_et().date().isoformat()
         session = rule.group or rule.condition_session or self._ths_active_session() or "盘中"
         symbols = [
             item.symbol if isinstance(item, Quote) else str(item).upper() for item in quotes
         ]
+        # AH halt-or-5d singles → one of four trigger subgroups (not the umbrella name).
+        if (
+            not board
+            and ths_group is None
+            and rule.id == "afterhours-halt-or-5d-boost"
+            and quotes
+            and isinstance(quotes[0], Quote)
+        ):
+            subgroup = self._halt_or_5d_ths_group(rule, quotes[0])
+            if subgroup:
+                group = subgroup
+        # Regular halt/50% rebound singles → halt vs 50% subgroup (halt wins if both).
+        elif (
+            not board
+            and ths_group is None
+            and rule.id == "regular-halt50-rebound"
+            and quotes
+        ):
+            symbol = (
+                quotes[0].symbol
+                if isinstance(quotes[0], Quote)
+                else str(quotes[0])
+            )
+            halted = {
+                item.strip().upper()
+                for item in self.store.session_symbols(day, "upward_halt")
+            }
+            group = regular_halt50_rebound_ths_group(symbol, halted=halted)
         pin = (
             [symbol.strip().upper() for symbol in pin_symbols if symbol and str(symbol).strip()]
             if pin_symbols is not None
@@ -5125,7 +5230,7 @@ class MonitorEngine:
                     tag_symbols=pin if not replace_board else ordered,
                 )
                 if board and _sorts_ths_by_peak_fade(rule):
-                    self._ths_last_board_order[rule.id] = tuple(pin)
+                    self._ths_last_board_order[f"{rule.id}:{group}"] = tuple(pin)
                 if want_important and session_target:
                     await self.ths.add_important(session_target, session)
                 # Mirror into 今日盘x分组. Record-only boards (board_notify false, e.g. fade

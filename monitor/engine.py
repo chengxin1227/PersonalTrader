@@ -918,6 +918,17 @@ class MonitorEngine:
             try:
                 config = self.load_config(force=True)
                 interval = config.poll_interval_seconds
+                if not is_trading_day(self.market):
+                    if not idle_logged:
+                        wait = seconds_until_extended_open()
+                        nxt = now_et() + timedelta(seconds=wait)
+                        logger.info(
+                            "Exchange holiday or weekend. Next session %s ET",
+                            nxt.strftime("%a %Y-%m-%d %H:%M"),
+                        )
+                        idle_logged = True
+                    await asyncio.sleep(min(60.0, max(1.0, seconds_until_extended_open())))
+                    continue
                 await self._maybe_sync_tonghuashun_groups(config)
                 if self.moomoo is not None and not extended_session_open():
                     if not idle_logged:
@@ -955,6 +966,9 @@ class MonitorEngine:
             try:
                 config = self.load_config()
                 interval = config.background_scan_interval_seconds
+                if not is_trading_day(self.market):
+                    await asyncio.sleep(min(60.0, max(1.0, seconds_until_extended_open())))
+                    continue
                 if not is_afterhours():
                     await asyncio.sleep(30)
                     continue
@@ -990,6 +1004,9 @@ class MonitorEngine:
             try:
                 config = self.load_config()
                 interval = config.background_scan_interval_seconds
+                if not is_trading_day(self.market):
+                    await asyncio.sleep(min(60.0, max(1.0, seconds_until_extended_open())))
+                    continue
                 if not extended_session_open():
                     await asyncio.sleep(30)
                     continue
@@ -1042,6 +1059,9 @@ class MonitorEngine:
             try:
                 config = self.load_config()
                 interval = config.background_scan_interval_seconds
+                if not is_trading_day(self.market):
+                    await asyncio.sleep(min(60.0, max(1.0, seconds_until_extended_open())))
+                    continue
                 if not extended_session_open():
                     await asyncio.sleep(30)
                     continue
@@ -1086,6 +1106,9 @@ class MonitorEngine:
         while self._running:
             try:
                 config = self.load_config()
+                if not is_trading_day(self.market):
+                    await asyncio.sleep(min(60.0, max(1.0, seconds_until_extended_open())))
+                    continue
                 await self._maybe_send_check_reminders(config)
                 await self._run_watched_symbols(config)
                 rules = [

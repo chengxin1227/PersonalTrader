@@ -44,6 +44,8 @@ def test_premarket_window():
     assert not is_premarket(datetime(2026, 9, 23, 9, 30, tzinfo=ET))
     assert not is_premarket(datetime(2026, 9, 23, 15, 0, tzinfo=ET))
     assert not is_premarket(datetime(2026, 9, 26, 6, 0, tzinfo=ET))  # Saturday
+    # Thanksgiving 2026 is a Thursday — not a session day.
+    assert not is_premarket(datetime(2026, 11, 26, 6, 0, tzinfo=ET))
 
 
 def test_regular_session_window():
@@ -52,6 +54,7 @@ def test_regular_session_window():
     assert not is_regular_session(datetime(2026, 9, 23, 9, 29, tzinfo=ET))
     assert not is_regular_session(datetime(2026, 9, 23, 16, 0, tzinfo=ET))
     assert not is_regular_session(datetime(2026, 9, 26, 12, 0, tzinfo=ET))
+    assert not is_regular_session(datetime(2026, 11, 26, 12, 0, tzinfo=ET))  # Thanksgiving
 
 
 def test_afterhours_stable_window_is_the_first_five_minutes():
@@ -242,6 +245,7 @@ def test_afterhours_window():
     assert not is_afterhours(datetime(2026, 9, 23, 15, 59, tzinfo=ET))
     assert not is_afterhours(datetime(2026, 9, 23, 20, 0, tzinfo=ET))
     assert not is_afterhours(datetime(2026, 9, 26, 17, 0, tzinfo=ET))
+    assert not is_afterhours(datetime(2026, 11, 26, 17, 0, tzinfo=ET))  # Thanksgiving
 
 
 def test_seconds_until_session_end_matches_each_window():
@@ -303,6 +307,25 @@ def test_trading_day_uses_next_open():
         next_open=datetime(2026, 11, 27, 9, 30, tzinfo=ET),
     )
     assert not is_trading_day(holiday, thanksgiving)
+
+
+def test_trading_day_holiday_without_next_open():
+    """Moomoo clocks omit next_open; calendar still marks Thanksgiving closed."""
+    thanksgiving = datetime(2026, 11, 26, 10, 0, tzinfo=ET)
+    moomoo_clock = MarketClock(is_open=False, next_open=None)
+    assert not is_trading_day(moomoo_clock, thanksgiving)
+    assert not is_trading_day(None, thanksgiving)
+    # Day after Thanksgiving 2026 is early-close, still a trading day.
+    early_close = datetime(2026, 11, 27, 10, 0, tzinfo=ET)
+    assert is_trading_day(moomoo_clock, early_close)
+
+
+def test_seconds_until_extended_open_skips_holidays():
+    # Thanksgiving 2026 10:00 ET → next extended open is Fri Nov 27 04:00 ET.
+    thanksgiving = datetime(2026, 11, 26, 10, 0, tzinfo=ET)
+    wait = seconds_until_extended_open(thanksgiving)
+    target = datetime(2026, 11, 27, 4, 0, tzinfo=ET)
+    assert wait == pytest.approx((target - thanksgiving).total_seconds())
 
 
 def test_session_board_slot_five_minute_interval():

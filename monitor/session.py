@@ -14,6 +14,64 @@ AFTERHOURS_END = time(20, 0)
 REGULAR_START = time(9, 30)
 REGULAR_END = time(16, 0)
 
+# NYSE/Nasdaq full-close days (early-close days are intentionally omitted).
+US_EQUITY_HOLIDAYS: frozenset[date] = frozenset(
+    {
+        # 2025
+        date(2025, 1, 1),
+        date(2025, 1, 20),
+        date(2025, 2, 17),
+        date(2025, 4, 18),
+        date(2025, 5, 26),
+        date(2025, 6, 19),
+        date(2025, 7, 4),
+        date(2025, 9, 1),
+        date(2025, 11, 27),
+        date(2025, 12, 25),
+        # 2026
+        date(2026, 1, 1),
+        date(2026, 1, 19),
+        date(2026, 2, 16),
+        date(2026, 4, 3),
+        date(2026, 5, 25),
+        date(2026, 6, 19),
+        date(2026, 7, 3),
+        date(2026, 9, 7),
+        date(2026, 11, 26),
+        date(2026, 12, 25),
+        # 2027
+        date(2027, 1, 1),
+        date(2027, 1, 18),
+        date(2027, 2, 15),
+        date(2027, 3, 26),
+        date(2027, 5, 31),
+        date(2027, 6, 18),
+        date(2027, 7, 5),
+        date(2027, 9, 6),
+        date(2027, 11, 25),
+        date(2027, 12, 24),
+        # 2028
+        date(2028, 1, 17),
+        date(2028, 2, 21),
+        date(2028, 4, 14),
+        date(2028, 5, 29),
+        date(2028, 6, 19),
+        date(2028, 7, 4),
+        date(2028, 9, 4),
+        date(2028, 11, 23),
+        date(2028, 12, 25),
+    }
+)
+
+
+def is_us_equity_holiday(day: date) -> bool:
+    """True on NYSE/Nasdaq full-close holidays (not early-close days)."""
+    return day in US_EQUITY_HOLIDAYS
+
+
+def _is_session_calendar_day(day: date) -> bool:
+    return day.weekday() < 5 and not is_us_equity_holiday(day)
+
 
 def now_et(moment: datetime | None = None) -> datetime:
     current = moment or datetime.now(tz=ET)
@@ -36,14 +94,14 @@ def format_nz_clock(moment: datetime | None = None) -> str:
 
 def is_premarket(moment: datetime | None = None) -> bool:
     current = now_et(moment)
-    if current.weekday() >= 5:
+    if not _is_session_calendar_day(current.date()):
         return False
     return PREMARKET_START <= current.time() < PREMARKET_END
 
 
 def is_afterhours(moment: datetime | None = None) -> bool:
     current = now_et(moment)
-    if current.weekday() >= 5:
+    if not _is_session_calendar_day(current.date()):
         return False
     return AFTERHOURS_START <= current.time() < AFTERHOURS_END
 
@@ -267,7 +325,7 @@ def last_hour_phase(
     two hours start at 7:30. After-hours two hours start at 18:00.
     """
     current = now_et(moment)
-    if current.weekday() >= 5:
+    if not _is_session_calendar_day(current.date()):
         return None
     bounds = {
         "regular": (REGULAR_START, REGULAR_END),
@@ -292,7 +350,7 @@ def last_hour_phase(
 
 def is_regular_session(moment: datetime | None = None) -> bool:
     current = now_et(moment)
-    if current.weekday() >= 5:
+    if not _is_session_calendar_day(current.date()):
         return False
     return REGULAR_START <= current.time() < REGULAR_END
 
@@ -332,13 +390,17 @@ def extended_session_open(moment: datetime | None = None) -> bool:
 
 
 def seconds_until_extended_open(moment: datetime | None = None) -> float:
-    """Seconds until the next pre-market or after-hours window. Zero when one is open."""
+    """Seconds until the next pre-market or after-hours window. Zero when one is open.
+
+    Skips weekends and full-close exchange holidays.
+    """
     current = now_et(moment)
     if extended_session_open(current):
         return 0.0
-    for day_offset in range(0, 8):
+    # Look far enough to clear long holiday weekends (e.g. Fri holiday + weekend).
+    for day_offset in range(0, 14):
         day = (current + timedelta(days=day_offset)).date()
-        if day.weekday() >= 5:
+        if not _is_session_calendar_day(day):
             continue
         for start in (PREMARKET_START, AFTERHOURS_START):
             stamp = datetime.combine(day, start, tzinfo=ET)
@@ -364,11 +426,14 @@ def is_trading_day(clock: MarketClock | None, moment: datetime | None = None) ->
     current = now_et(moment)
     if current.weekday() >= 5:
         return False
+    if is_us_equity_holiday(current.date()):
+        return False
     if clock is None:
         return True
     if clock.is_open:
         return True
     if clock.next_open is None:
+        # Moomoo clock omits next_open; calendar already ruled out holidays.
         return True
     return clock.next_open.astimezone(ET).date() == current.date()
 

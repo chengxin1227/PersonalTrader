@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from monitor.engine import MonitorEngine
@@ -19,6 +19,11 @@ def _holiday_clock() -> MarketClock:
         is_open=False,
         next_open=datetime(2026, 11, 27, 9, 30, tzinfo=ET),
     )
+
+
+def _moomoo_holiday_clock() -> MarketClock:
+    """Moomoo-style clock: closed, no next_open."""
+    return MarketClock(is_open=False, next_open=None)
 
 
 def test_holiday_skips_check_reminders(tmp_path):
@@ -102,3 +107,43 @@ def test_holiday_skips_leaderboard(tmp_path):
 
     asyncio.run(run())
     assert called is False
+
+
+def test_rest_poll_loop_idles_on_holiday(tmp_path):
+    """Thanksgiving weekday: no THS sync, poll, or reminders."""
+    engine = MonitorEngine.__new__(MonitorEngine)
+    engine.market = _moomoo_holiday_clock()
+    engine.moomoo = object()
+    engine._running = True
+    engine.store = Store(tmp_path)
+    engine.load_config = MagicMock(
+        return_value=type("Cfg", (), {"poll_interval_seconds": 15})()
+    )
+    engine._maybe_sync_tonghuashun_groups = AsyncMock()
+    engine._maybe_send_check_reminders = AsyncMock()
+    engine._run_watched_symbols = AsyncMock()
+    engine.poll_once = AsyncMock(return_value=[])
+
+    thanksgiving = datetime(2026, 11, 26, 10, 0, tzinfo=ET)
+    sleep_calls = 0
+
+    async def fake_sleep(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        engine._running = False
+
+    async def run() -> None:
+        with (
+            patch("monitor.engine.now_et", return_value=thanksgiving),
+            patch("monitor.engine.is_trading_day", return_value=False),
+            patch("monitor.engine.seconds_until_extended_open", return_value=64_800.0),
+            patch("monitor.engine.asyncio.sleep", side_effect=fake_sleep),
+        ):
+            await engine._rest_poll_loop(idle_logged=False)
+
+    asyncio.run(run())
+    assert sleep_calls == 1
+    engine._maybe_sync_tonghuashun_groups.assert_not_called()
+    engine._maybe_send_check_reminders.assert_not_called()
+    engine._run_watched_symbols.assert_not_called()
+    engine.poll_once.assert_not_called()
